@@ -1,0 +1,68 @@
+name: Windows Package Smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-package-smoke.yml"
+      - ".github/workflows/release.yml"
+      - "native/resource-monitor/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "scripts/build-desktop-artifact.ts"
+
+concurrency:
+  group: windows-package-smoke-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package unsigned Windows x64 installer
+    runs-on: blacksmith-32vcpu-windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/desktop...
+              - --filter=t3...
+              - --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@v4
+        with:
+          path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
+          key: resource-monitor-x86_64-pc-windows-msvc-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build and validate Windows package
+        shell: pwsh
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+        run: >-
+          node scripts/build-desktop-artifact.ts
+          --platform win
+          --target nsis
+          --arch x64
+          --build-version 0.0.0-ci.${{ github.run_id }}
+          --output-dir release/windows-package-smoke
