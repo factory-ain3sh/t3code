@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -55,6 +56,28 @@ const makeTestAdapter = (binaryPath: string, options?: Parameters<typeof makeDro
 
 const eventsForThread = (events: ReadonlyArray<ProviderRuntimeEvent>, threadId: ThreadId) =>
   events.filter((event) => String(event.threadId) === String(threadId));
+
+async function waitForFile(filePath: string) {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const watcher = NodeFS.watch(NodePath.dirname(filePath), (_eventType, filename) => {
+      if (String(filename) !== NodePath.basename(filePath)) return;
+      void NodeFSP.access(filePath).then(finish, () => {});
+    });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      watcher.close();
+      resolve();
+    };
+    watcher.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    void NodeFSP.access(filePath).then(finish, () => {});
+  });
+}
 
 it("counts cache creation as processed spend but not live context", () => {
   const usage = {
@@ -251,9 +274,17 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         makeMockDroidWrapper({ T3_DROID_MOCK_FAIL_INIT: "1" }),
       );
       let readDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({ threadLockCount: -1, interruptedTurnCount: -1 });
+        Effect.succeed({
+          threadLockCount: -1,
+          threadLockReferenceCount: -1,
+          interruptedTurnCount: -1,
+        });
       let readFailingDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({ threadLockCount: -1, interruptedTurnCount: -1 });
+        Effect.succeed({
+          threadLockCount: -1,
+          threadLockReferenceCount: -1,
+          interruptedTurnCount: -1,
+        });
       const adapter = yield* makeTestAdapter(wrapperPath, {
         registerDebugStateReader: (read) => {
           readDebugState = read;
@@ -286,6 +317,93 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         }),
       );
       assert.equal((yield* readFailingDebugState(failedThreadId)).threadLockCount, 0);
+    }),
+  );
+
+  it.effect("waits for every same-thread start before stopAll returns", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-concurrent-start-stop-all");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-start-race-")),
+      );
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_START_RACE_DIR: coordinationDir }),
+      );
+      let readDebugState = (_threadId: ThreadId) =>
+        Effect.succeed({
+          threadLockCount: -1,
+          threadLockReferenceCount: -1,
+          interruptedTurnCount: -1,
+        });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        registerDebugStateReader: (read) => {
+          readDebugState = read;
+        },
+      });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const heldTurn = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "mock hold thread lock",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => waitForFile(NodePath.join(coordinationDir, "thread-lock-held")));
+
+      const invalidStart = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("claude"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      const replacementStart = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("droid"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Effect.yieldNow;
+      assert.equal((yield* readDebugState(threadId)).threadLockReferenceCount, 3);
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-thread-lock"), ""),
+      );
+      const invalidStartError = yield* Fiber.join(invalidStart);
+      assert.equal(invalidStartError._tag, "ProviderAdapterValidationError");
+      yield* Effect.promise(() =>
+        waitForFile(NodePath.join(coordinationDir, "replacement-init-started")),
+      );
+
+      const stopAllCompleted = yield* Deferred.make<void>();
+      const stopAllFiber = yield* adapter.stopAll().pipe(
+        Effect.tap(() => Deferred.succeed(stopAllCompleted, undefined)),
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      assert.isFalse(
+        yield* Deferred.isDone(stopAllCompleted),
+        "stopAll returned while a same-thread start was still initializing",
+      );
+
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-replacement-init"), ""),
+      );
+      yield* Fiber.join(replacementStart);
+      yield* Fiber.join(stopAllFiber);
+      yield* Fiber.join(heldTurn);
+
+      assert.isFalse(yield* adapter.hasSession(threadId));
     }),
   );
 
@@ -661,7 +779,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         makeMockDroidWrapper({ T3_DROID_MOCK_HANG_TURN: "1" }),
       );
       let readDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({ threadLockCount: -1, interruptedTurnCount: -1 });
+        Effect.succeed({
+          threadLockCount: -1,
+          threadLockReferenceCount: -1,
+          interruptedTurnCount: -1,
+        });
       const adapter = yield* makeTestAdapter(wrapperPath, {
         registerDebugStateReader: (read) => {
           readDebugState = read;

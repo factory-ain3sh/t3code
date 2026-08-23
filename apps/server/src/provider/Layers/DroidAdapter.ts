@@ -81,6 +81,7 @@ export interface DroidAdapterLiveOptions {
   readonly registerDebugStateReader?: (
     read: (threadId: ThreadId) => Effect.Effect<{
       readonly threadLockCount: number;
+      readonly threadLockReferenceCount: number;
       readonly interruptedTurnCount: number;
     }>,
   ) => void;
@@ -389,12 +390,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     // stopAll coordination: reject new starts while closing, and remember
     // threads whose startSession is still in flight (not yet in `sessions`).
     let closing = false;
-    const startingThreads = new Set<ThreadId>();
+    const startingThreads = new Map<ThreadId, number>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<ThreadId, ThreadLockEntry>());
     options?.registerDebugStateReader?.((threadId) =>
       SynchronizedRef.get(threadLocksRef).pipe(
         Effect.map((locks) => ({
           threadLockCount: locks.size,
+          threadLockReferenceCount: locks.get(threadId)?.references ?? 0,
           interruptedTurnCount: sessions.get(threadId)?.interruptedTurnIds.size ?? 0,
         })),
       ),
@@ -1150,9 +1152,18 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             }),
           );
         }
-        startingThreads.add(input.threadId);
+        startingThreads.set(input.threadId, (startingThreads.get(input.threadId) ?? 0) + 1);
         return startSessionLocked(input).pipe(
-          Effect.ensuring(Effect.sync(() => startingThreads.delete(input.threadId))),
+          Effect.ensuring(
+            Effect.sync(() => {
+              const references = startingThreads.get(input.threadId);
+              if (references === undefined || references === 1) {
+                startingThreads.delete(input.threadId);
+              } else {
+                startingThreads.set(input.threadId, references - 1);
+              }
+            }),
+          ),
         );
       });
 
@@ -1794,7 +1805,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     const stopAll: DroidAdapterShape["stopAll"] = () =>
       Effect.suspend(() => {
         closing = true;
-        const threadIds = new Set([...sessions.keys(), ...startingThreads]);
+        const threadIds = new Set([...sessions.keys(), ...startingThreads.keys()]);
         return Effect.forEach(
           threadIds,
           (threadId) =>

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 
 const emitToolCall = process.env.T3_DROID_MOCK_EMIT_TOOL_CALL === "1";
@@ -13,6 +16,7 @@ const loadSteeringMessages = process.env.T3_DROID_MOCK_LOAD_STEERING_MESSAGES ==
 const exitMidTurn = process.env.T3_DROID_MOCK_EXIT_MID_TURN === "1";
 const emitUnknownNotification = process.env.T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION === "1";
 const omitUsageNotification = process.env.T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION === "1";
+const startRaceDir = process.env.T3_DROID_MOCK_START_RACE_DIR;
 
 const initializedSessionId = "mock-session-1";
 const knownLoadSessionId = "mock-session-known";
@@ -158,6 +162,28 @@ function emitTurnCompleted(reason: string, turnId: string): void {
     newState: "idle",
   });
   activeTurn = undefined;
+}
+
+async function waitForFile(filePath: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const watcher = NodeFS.watch(NodePath.dirname(filePath), (_eventType, filename) => {
+      if (String(filename) !== NodePath.basename(filePath)) return;
+      void NodeFSP.access(filePath).then(finish, () => {});
+    });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      watcher.close();
+      resolve();
+    };
+    watcher.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    void NodeFSP.access(filePath).then(finish, () => {});
+  });
 }
 
 async function runTurn(params: {
@@ -466,6 +492,18 @@ async function handleRequest(message: {
       if (failInit) {
         fail(message.id, -32603, "Mock initialization failure");
       } else {
+        if (startRaceDir) {
+          const firstInitPath = NodePath.join(startRaceDir, "first-init");
+          try {
+            await NodeFSP.writeFile(firstInitPath, "", { flag: "wx" });
+          } catch (error) {
+            if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") {
+              throw error;
+            }
+            await NodeFSP.writeFile(NodePath.join(startRaceDir, "replacement-init-started"), "");
+            await waitForFile(NodePath.join(startRaceDir, "release-replacement-init"));
+          }
+        }
         previousSessionId = undefined;
         currentSessionId = initializedSessionId;
         respond(message.id, initializeResult());
@@ -552,6 +590,10 @@ async function handleRequest(message: {
       ) {
         fail(message.id, -32602, "add_user_message requires messageId and text");
         return;
+      }
+      if (startRaceDir && params.text === "mock hold thread lock") {
+        await NodeFSP.writeFile(NodePath.join(startRaceDir, "thread-lock-held"), "");
+        await waitForFile(NodePath.join(startRaceDir, "release-thread-lock"));
       }
       respond(message.id, {});
       if (
