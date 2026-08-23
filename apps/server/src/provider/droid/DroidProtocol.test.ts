@@ -2,16 +2,22 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import {
-  DroidLoadSessionParams,
+  DroidExecuteRewindResult,
+  DroidInitializeSessionResult,
   DroidLoadSessionResult,
+  DroidModelInfo,
   DroidPermissionRequest,
   DroidSessionNotification,
+  DroidSkillInfo,
 } from "./DroidProtocol.ts";
 
 const decodeNotification = Schema.decodeUnknownSync(DroidSessionNotification);
 const decodePermissionRequest = Schema.decodeUnknownSync(DroidPermissionRequest);
+const decodeInitializeSessionResult = Schema.decodeUnknownSync(DroidInitializeSessionResult);
 const decodeLoadSessionResult = Schema.decodeUnknownSync(DroidLoadSessionResult);
-const encodeLoadSessionParams = Schema.encodeUnknownSync(DroidLoadSessionParams);
+const decodeExecuteRewindResult = Schema.decodeUnknownSync(DroidExecuteRewindResult);
+const decodeModelInfo = Schema.decodeUnknownSync(DroidModelInfo);
+const decodeSkillInfo = Schema.decodeUnknownSync(DroidSkillInfo);
 
 const usage = {
   inputTokens: 10,
@@ -143,18 +149,23 @@ describe("DroidSessionNotification", () => {
   }
 
   it("decodes unknown notification types into the forward-compatible fallback", () => {
-    const fixture = {
+    const decoded = decodeNotification({
       type: "future_notification",
       newField: { nested: true },
-    };
-    const decoded = decodeNotification(fixture);
+    });
 
     assert.equal(decoded.type, "__unknown__");
-    assert.property(decoded, "payload");
-    if ("payload" in decoded) {
-      assert.deepStrictEqual(decoded.payload, fixture);
-      assert.equal(decoded.notificationType, "future_notification");
-    }
+    assert.deepStrictEqual(decoded, { type: "__unknown__" });
+  });
+
+  it("decodes ignored notifications from their discriminator alone", () => {
+    assert.deepStrictEqual(
+      decodeNotification({
+        type: "settings_updated",
+        settings: "reshaped-by-a-newer-cli",
+      }),
+      { type: "settings_updated" },
+    );
   });
 
   it("tolerates and strips extra fields from known notifications", () => {
@@ -187,7 +198,6 @@ describe("DroidSessionNotification", () => {
     assert.equal(decoded.type, "tool_progress_update");
     if (decoded.type === "tool_progress_update") {
       assert.deepStrictEqual(decoded.update, {
-        type: "status",
         status: "running",
         text: "Inspecting the repository",
         subagentSessionId: "child-1",
@@ -211,7 +221,6 @@ describe("DroidSessionNotification", () => {
     assert.equal(decoded.type, "tool_progress_update");
     if (decoded.type === "tool_progress_update") {
       assert.deepStrictEqual(decoded.update, {
-        type: "message",
         details: "Still running",
         valueSnippet: "line 42",
       });
@@ -281,42 +290,24 @@ describe("DroidSessionNotification", () => {
   });
 });
 
-describe("DroidLoadSessionParams", () => {
-  it("encodes MCP server overrides with header name/value pairs", () => {
-    const encoded = encodeLoadSessionParams({
-      sessionId: "session-1",
-      mcpServers: [
-        {
-          type: "http",
-          name: "t3-code",
-          url: "https://example.com/mcp",
-          headers: [{ name: "Authorization", value: "Bearer token" }],
-        },
-      ],
-    });
-
-    assert.deepStrictEqual(encoded, {
-      sessionId: "session-1",
-      mcpServers: [
-        {
-          type: "http",
-          name: "t3-code",
-          url: "https://example.com/mcp",
-          headers: [{ name: "Authorization", value: "Bearer token" }],
-        },
-      ],
-    });
+describe("DroidInitializeSessionResult", () => {
+  it("decodes only the session id consumed by the adapter", () => {
+    assert.deepStrictEqual(
+      decodeInitializeSessionResult({
+        sessionId: "session-1",
+        session: "reshaped-by-a-newer-cli",
+        settings: null,
+      }),
+      { sessionId: "session-1" },
+    );
   });
 });
 
 describe("DroidLoadSessionResult", () => {
-  it("decodes resumed-session lastCallTokenUsage", () => {
+  it("decodes only resumed-session usage consumed by the adapter", () => {
     const decoded = decodeLoadSessionResult({
-      session: { messages: [] },
-      settings: {
-        modelId: "mock-fast",
-        reasoningEffort: "medium",
-      },
+      session: "reshaped-by-a-newer-cli",
+      settings: null,
       lastCallTokenUsage: {
         inputTokens: 21,
         cacheReadTokens: 5,
@@ -332,86 +323,86 @@ describe("DroidLoadSessionResult", () => {
   });
 });
 
+describe("DroidExecuteRewindResult", () => {
+  it("decodes only the successor session id consumed by the adapter", () => {
+    assert.deepStrictEqual(
+      decodeExecuteRewindResult({
+        newSessionId: "session-rewound",
+        restoredCount: "reshaped-by-a-newer-cli",
+      }),
+      { newSessionId: "session-rewound" },
+    );
+  });
+});
+
 describe("DroidPermissionRequest", () => {
-  const detailsFixtures = [
-    {
-      type: "edit",
-      filePath: "/repo/src/app.ts",
-      fileName: "app.ts",
-      oldContent: "const oldValue = 1;",
-      newContent: "const newValue = 2;",
-    },
-    {
-      type: "create",
-      filePath: "/repo/src/new.ts",
-      fileName: "new.ts",
-      content: "export const created = true;",
-    },
-    {
-      type: "apply_patch",
-      filePath: "/repo/src/app.ts",
-      fileName: "app.ts",
-      patchContent: "*** Begin Patch",
-      oldContent: "old",
-      newContent: "new",
-      files: [
+  it("decodes the canonical option and only permission detail fields the adapter consumes", () => {
+    const decoded = decodePermissionRequest({
+      toolUses: [
         {
-          filePath: "/repo/src/app.ts",
-          fileName: "app.ts",
-          operation: "update",
-          moveTo: "/repo/src/renamed.ts",
-          oldContent: "old",
-          newContent: "new",
+          toolUse: {
+            type: "tool_use",
+            id: "tool-exec",
+            input: { command: "echo hello" },
+            name: "Execute",
+          },
+          confirmationType: "exec",
+          details: {
+            type: "exec",
+            fullCommand: "echo hello",
+            command: "echo",
+            extractedCommands: "reshaped-by-a-newer-cli",
+            impactLevel: { future: true },
+          },
         },
       ],
-    },
-    {
-      type: "exit_spec_mode",
-      plan: "# Implementation plan",
-      title: "Implement the feature",
-    },
-    {
-      type: "propose_mission",
-      proposal: "Split the work across three agents.",
-      title: "Parallel implementation",
-    },
-    {
-      type: "sandbox_violation",
-      violatingToolName: "Execute",
-      target: "/etc/passwd",
-      operationType: "read",
-      violationType: "filesystem-read",
-      reason: "The target is outside the workspace.",
-      violationReason: "not-allowed",
-      isOrgDeny: false,
-    },
-  ] as const;
+      options: [{ label: "Allow once", value: "proceed_once" }],
+      associatedSessionIds: "reshaped-by-a-newer-cli",
+    });
 
-  for (const details of detailsFixtures) {
-    it(`preserves ${details.type} safety details and the raw params`, () => {
-      const raw = {
+    assert.deepStrictEqual(
+      {
+        toolUses: decoded.toolUses,
+        options: decoded.options,
+      },
+      {
         toolUses: [
           {
             toolUse: {
-              type: "tool_use",
-              id: `tool-${details.type}`,
-              input: { path: "/repo/src/app.ts" },
-              name: "ExampleTool",
+              id: "tool-exec",
+              input: { command: "echo hello" },
+              name: "Execute",
             },
-            confirmationType: details.type,
-            details,
+            confirmationType: "exec",
+            details: {
+              type: "exec",
+              fullCommand: "echo hello",
+              command: "echo",
+            },
           },
         ],
-        options: [{ label: "Allow once", value: "proceed_once" }],
-        associatedSessionIds: ["child-session"],
-        upstreamExtension: { remainsAvailable: true },
-      };
+        options: [{ label: "Allow once", outcome: "proceed_once" }],
+      },
+    );
+  });
+});
 
-      const decoded = decodePermissionRequest(raw);
+describe("Droid inventory entries", () => {
+  it("requires the model metadata guaranteed by list_models", () => {
+    assert.throws(() =>
+      decodeModelInfo({
+        id: "mock-fast",
+        displayName: "Mock Fast",
+      }),
+    );
+  });
 
-      assert.deepStrictEqual(decoded.toolUses[0]?.details, details);
-      assert.equal(decoded.options[0]?.outcome, "proceed_once");
-      assert.deepStrictEqual(decoded.raw, raw);
-    });
-  }
+  it("requires the skill location guaranteed by list_skills", () => {
+    assert.throws(() =>
+      decodeSkillInfo({
+        name: "verify",
+        filePath: "/skills/verify/SKILL.md",
+      }),
+    );
+  });
 });

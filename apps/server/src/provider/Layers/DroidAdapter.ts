@@ -227,7 +227,7 @@ export function selectDroidPermissionOutcome(
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
   const outcomes = options
-    .map((option) => option.outcome?.trim())
+    .map((option) => option.outcome.trim())
     .filter((outcome): outcome is string => Boolean(outcome));
   const preference =
     decision === "acceptForSession"
@@ -365,7 +365,6 @@ function settlePendingUserInputsAsCancelled(
   );
 }
 
-const decodePermissionRequest = Schema.decodeUnknownEffect(DroidPermissionRequest);
 const decodeAskUserRequest = Schema.decodeUnknownEffect(DroidAskUserRequest);
 const decodeInitializeResult = Schema.decodeUnknownEffect(DroidInitializeSessionResult);
 const decodeLoadResult = Schema.decodeUnknownEffect(DroidLoadSessionResult);
@@ -980,20 +979,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       ctx.toolUseNames.set(toolUse.id, toolUse.name);
     };
 
-    const handlePermissionRequest = (ctx: DroidSessionContext, request: DroidServerRequest) =>
+    const handlePermissionRequest = (
+      ctx: DroidSessionContext,
+      request: Extract<DroidServerRequest, { method: "droid.request_permission" }>,
+    ) =>
       Effect.gen(function* () {
-        const params = yield* decodePermissionRequest(request.params).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "droid.request_permission",
-                detail: "Failed to decode Droid permission request.",
-                cause,
-              }),
-          ),
-        );
-        yield* logNative(ctx.threadId, "droid.request_permission", request.params);
+        const params = request.params;
+        yield* logNative(ctx.threadId, "droid.request_permission", params.raw);
         const primaryToolUse = params.toolUses[0];
         if (primaryToolUse) rememberToolUse(ctx, primaryToolUse.toolUse);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
@@ -1013,14 +1005,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             requestType,
             detail:
               droidPermissionDetail(params) ??
-              encodeJsonStringForDiagnostics(request.params)?.slice(0, 2000) ??
+              encodeJsonStringForDiagnostics(params.raw)?.slice(0, 2000) ??
               "[unserializable params]",
-            args: request.params,
+            args: params.raw,
           },
           raw: {
             source: "droid.jsonrpc.request",
             method: "droid.request_permission",
-            payload: request.params,
+            payload: params.raw,
           },
         });
         const resolved = yield* Deferred.await(decision);
@@ -1746,16 +1738,17 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               forkTitle: "T3 Code checkpoint revert",
             }),
           ).pipe(
-            Effect.catchTag("SchemaError", (cause) =>
-              Effect.fail(
-                new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "droid.execute_rewind",
-                  detail: "Failed to decode Droid rewind result.",
-                  cause,
-                }),
-              ),
-            ),
+            Effect.catchTags({
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "droid.execute_rewind",
+                    detail: "Failed to decode Droid rewind result.",
+                    cause,
+                  }),
+                ),
+            }),
           );
           // execute_rewind preserves the current session; the live process
           // must load the fork to continue on the rewound conversation.

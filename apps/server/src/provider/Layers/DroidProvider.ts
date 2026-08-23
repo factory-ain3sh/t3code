@@ -21,7 +21,14 @@ import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { DroidCommandInfo, DroidModelInfo, DroidSkillInfo } from "../droid/DroidProtocol.ts";
+import {
+  type DroidCommandInfo,
+  DroidListCommandsResult,
+  DroidListModelsResult,
+  DroidListSkillsResult,
+  type DroidModelInfo,
+  type DroidSkillInfo,
+} from "../droid/DroidProtocol.ts";
 import { makeDroidRpcClient } from "../droid/DroidRpcClient.ts";
 import {
   buildSelectOptionDescriptor,
@@ -80,7 +87,7 @@ function droidModelsFromSettings(
 }
 
 function reasoningEffortCapabilities(model: DroidModelInfo): ModelCapabilities {
-  const efforts = model.supportedReasoningEfforts ?? [];
+  const efforts = model.supportedReasoningEfforts;
   if (efforts.length === 0) return EMPTY_CAPABILITIES;
   return createModelCapabilities({
     optionDescriptors: [
@@ -116,8 +123,8 @@ export function buildDroidDiscoveredModels(
       seen.add(slug);
       return {
         slug,
-        name: model.displayName?.trim() || slug,
-        ...(model.shortDisplayName?.trim() ? { shortName: model.shortDisplayName.trim() } : {}),
+        name: model.displayName.trim() || slug,
+        shortName: model.shortDisplayName.trim(),
         isCustom: false,
         ...(slug === DROID_DEFAULT_MODEL ? { isDefault: true } : {}),
         capabilities: reasoningEffortCapabilities(model),
@@ -167,12 +174,12 @@ export function buildDroidSkills(
     const description = skill.description?.trim();
     // SkillLocation is `project | personal | builtin | automation`; the first two
     // are already understood by the client's skill-source resolver.
-    const scope = skill.location?.trim();
+    const scope = skill.location.trim();
     providerSkills.push({
       name,
       path,
       enabled: skill.enabled !== false,
-      ...(scope ? { scope } : {}),
+      scope,
       ...(description ? { description, shortDescription: description } : {}),
     });
   }
@@ -232,25 +239,19 @@ const discoverDroidInventory = (
       env: environment,
     });
 
-    const [models, commands, skills] = yield* Effect.all(
+    const [modelResult, commandResult, skillResult] = yield* Effect.all(
       [
-        rpc
-          .request("droid.list_models", {})
-          .pipe(Effect.flatMap((result) => decodeInventory(result, "models", decodeModelInfo))),
-        rpc
-          .request("droid.list_commands", {})
-          .pipe(Effect.flatMap((result) => decodeInventory(result, "commands", decodeCommandInfo))),
-        rpc
-          .request("droid.list_skills", {})
-          .pipe(Effect.flatMap((result) => decodeInventory(result, "skills", decodeSkillInfo))),
+        rpc.request("droid.list_models", {}).pipe(Effect.flatMap(decodeListModelsResult)),
+        rpc.request("droid.list_commands", {}).pipe(Effect.flatMap(decodeListCommandsResult)),
+        rpc.request("droid.list_skills", {}).pipe(Effect.flatMap(decodeListSkillsResult)),
       ],
       { concurrency: "unbounded" },
     );
 
     return {
-      models: buildDroidDiscoveredModels(models),
-      slashCommands: buildDroidSlashCommands(commands),
-      skills: buildDroidSkills(skills),
+      models: buildDroidDiscoveredModels(modelResult.models),
+      slashCommands: buildDroidSlashCommands(commandResult.commands),
+      skills: buildDroidSkills(skillResult.skills),
     };
   }).pipe(Effect.scoped);
 
@@ -462,22 +463,9 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
   });
 });
 
-const decodeModelInfo = Schema.decodeUnknownEffect(DroidModelInfo);
-const decodeCommandInfo = Schema.decodeUnknownEffect(DroidCommandInfo);
-const decodeSkillInfo = Schema.decodeUnknownEffect(DroidSkillInfo);
-
-/** Undecodable entries are skipped, not fatal: droid's inventory metadata drifts. */
-const decodeInventory = <A, E, R>(
-  result: unknown,
-  key: string,
-  decode: (value: unknown) => Effect.Effect<A, E, R>,
-): Effect.Effect<ReadonlyArray<A>, never, R> =>
-  Effect.gen(function* () {
-    const entries = (result as Record<string, unknown> | undefined)?.[key];
-    if (!Array.isArray(entries)) return [];
-    const decoded = yield* Effect.forEach(entries, (entry) => decode(entry).pipe(Effect.option));
-    return decoded.filter(Option.isSome).map((entry) => entry.value);
-  });
+const decodeListModelsResult = Schema.decodeUnknownEffect(DroidListModelsResult);
+const decodeListCommandsResult = Schema.decodeUnknownEffect(DroidListCommandsResult);
+const decodeListSkillsResult = Schema.decodeUnknownEffect(DroidListSkillsResult);
 
 export const enrichDroidSnapshot = (input: {
   readonly snapshot: ServerProvider;

@@ -656,7 +656,7 @@ async function handleRequest(message: {
           {
             name: "mock-skill",
             description: "A mock skill",
-            location: "user",
+            location: "personal",
             filePath: "/mock/SKILL.md",
             enabled: true,
           },

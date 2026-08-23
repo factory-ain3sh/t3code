@@ -246,12 +246,22 @@ it.effect("correlates RPCs, decodes notifications, handles server requests, and 
     assert.equal(permission.value.sessionId, undefined);
     if (permission.value.method === "droid.request_permission") {
       assert.equal(permission.value.params.options[0]?.outcome, "proceed_once");
+      // The parsed view is projected down to the fields the adapter summarises, so `raw` is
+      // what lets it forward droid's original request as the approval event's args.
+      const rawToolUse = (
+        permission.value.params.raw as {
+          toolUses: readonly {
+            toolUse: { type?: unknown };
+            details: { impactLevel?: unknown; riskLevelReason?: unknown };
+          }[];
+        }
+      ).toolUses[0];
+      assert.equal(rawToolUse?.toolUse.type, "tool_use");
+      assert.equal(rawToolUse?.details.impactLevel, "low");
+      assert.equal(rawToolUse?.details.riskLevelReason, "The mock command only prints text.");
       assert.deepStrictEqual(
-        (permission.value.params.raw as { toolUses?: unknown }).toolUses,
-        permission.value.params.toolUses.map((toolUse) => ({
-          ...toolUse,
-          details: toolUse.details,
-        })),
+        Object.keys(permission.value.params.toolUses[0]?.toolUse ?? {}).sort(),
+        ["id", "input", "name"],
       );
     }
     yield* permission.value.respond({ selectedOption: "proceed_once" });

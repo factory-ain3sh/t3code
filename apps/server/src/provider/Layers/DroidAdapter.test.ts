@@ -477,6 +477,30 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(String(opened.turnId), String(sentTurn.turnId));
       assert.equal(opened.payload.requestType, "exec_command_approval");
       assert.equal(opened.payload.detail, "echo mock");
+      assert.deepInclude(opened.payload.args, {
+        toolUses: [
+          {
+            toolUse: {
+              type: "tool_use",
+              id: `permission-tool-${String(sentTurn.turnId)}`,
+              input: { command: "echo mock" },
+              name: "Execute",
+            },
+            confirmationType: "exec",
+            details: {
+              type: "exec",
+              fullCommand: "echo mock",
+              command: "echo",
+              impactLevel: "low",
+              riskLevelReason: "The mock command only prints text.",
+            },
+          },
+        ],
+        options: [
+          { label: "Allow once", value: "proceed_once" },
+          { label: "Deny", value: "cancel" },
+        ],
+      });
       assert.equal(opened.raw?.method, "droid.request_permission");
 
       yield* adapter.respondToRequest(

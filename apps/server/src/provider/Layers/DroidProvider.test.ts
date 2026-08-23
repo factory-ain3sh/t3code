@@ -20,7 +20,7 @@ const decodeModelInfo = Schema.decodeUnknownSync(DroidModelInfoSchema);
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 
 const makeInventoryProbeBinary = Effect.fn("makeInventoryProbeBinary")(function* (
-  mode: "concurrent" | "commands-error",
+  mode: "concurrent" | "commands-error" | "malformed-model",
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -51,7 +51,15 @@ function resultFor(method) {
         models: [
           {
             id: mode === "concurrent" ? "concurrent-" + releasedRequestCount : "discovered-model",
-            displayName: "Discovered Model"
+            displayName: "Discovered Model",
+            ...(mode === "malformed-model"
+              ? {}
+              : {
+                  shortDisplayName: "Discovered",
+                  modelProvider: "factory",
+                  supportedReasoningEfforts: ["low", "medium", "high"],
+                  defaultReasoningEffort: "medium"
+                })
           }
         ]
       };
@@ -80,7 +88,7 @@ function respond(request) {
 }
 
 function handle(request) {
-  if (mode === "commands-error") {
+  if (mode !== "concurrent") {
     respond(request);
     return;
   }
@@ -110,16 +118,46 @@ input.once("close", () => process.exit(0));
 describe("buildDroidDiscoveredModels", () => {
   it("keeps enabled models, dedupes ids, and falls back to the id for a display name", () => {
     const models: ReadonlyArray<DroidModelInfo> = [
-      { id: "claude-opus-5", displayName: "Claude Opus 5" },
-      { id: "claude-opus-5", displayName: "Duplicate" },
-      { id: " gpt-5-6-luna ", displayName: "  " },
-      { id: "retired-model", displayName: "Retired", disabled: true },
+      {
+        id: "claude-opus-5",
+        displayName: "Claude Opus 5",
+        shortDisplayName: "Opus 5",
+        modelProvider: "anthropic",
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "none",
+      },
+      {
+        id: "claude-opus-5",
+        displayName: "Duplicate",
+        shortDisplayName: "Duplicate",
+        modelProvider: "anthropic",
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "none",
+      },
+      {
+        id: " gpt-5-6-luna ",
+        displayName: "  ",
+        shortDisplayName: "Luna",
+        modelProvider: "openai",
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "none",
+      },
+      {
+        id: "retired-model",
+        displayName: "Retired",
+        shortDisplayName: "Retired",
+        modelProvider: "anthropic",
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "none",
+        disabled: true,
+      },
     ];
 
     assert.deepEqual(buildDroidDiscoveredModels(models), [
       {
         slug: "claude-opus-5",
         name: "Claude Opus 5",
+        shortName: "Opus 5",
         isCustom: false,
         isDefault: true,
         capabilities: { optionDescriptors: [] },
@@ -127,6 +165,7 @@ describe("buildDroidDiscoveredModels", () => {
       {
         slug: "gpt-5-6-luna",
         name: "gpt-5-6-luna",
+        shortName: "Luna",
         isCustom: false,
         capabilities: { optionDescriptors: [] },
       },
@@ -135,8 +174,22 @@ describe("buildDroidDiscoveredModels", () => {
 
   it("marks Droid's configured default independently of discovery order", () => {
     const models = buildDroidDiscoveredModels([
-      { id: "gpt-5-6-luna", displayName: "GPT-5.6 Luna" },
-      { id: "claude-opus-5", displayName: "Claude Opus 5" },
+      {
+        id: "gpt-5-6-luna",
+        displayName: "GPT-5.6 Luna",
+        shortDisplayName: "Luna",
+        modelProvider: "openai",
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "none",
+      },
+      {
+        id: "claude-opus-5",
+        displayName: "Claude Opus 5",
+        shortDisplayName: "Opus 5",
+        modelProvider: "anthropic",
+        supportedReasoningEfforts: [],
+        defaultReasoningEffort: "none",
+      },
     ]);
 
     assert.equal(models[0]?.isDefault, undefined);
@@ -148,7 +201,10 @@ describe("buildDroidDiscoveredModels", () => {
     const model = decodeModelInfo({
       id: "custom:factory://kimi-k3",
       displayName: "factory://kimi-k3",
+      shortDisplayName: "Kimi K3",
       modelProvider: "generic-chat-completion-api",
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: "none",
       isCustom: true,
       noImageSupport: false,
       disabled: false,
@@ -158,6 +214,7 @@ describe("buildDroidDiscoveredModels", () => {
       {
         slug: "custom:factory://kimi-k3",
         name: "factory://kimi-k3",
+        shortName: "Kimi K3",
         // T3 renders `isCustom` rows from its own custom-model config, so a true
         // here would hide the model from the provider's Models section.
         isCustom: false,
@@ -171,6 +228,8 @@ describe("buildDroidDiscoveredModels", () => {
       {
         id: "gpt-5-6-luna",
         displayName: "GPT-5.6 Luna",
+        shortDisplayName: "Luna",
+        modelProvider: "openai",
         supportedReasoningEfforts: ["low", "high"],
         defaultReasoningEffort: "high",
       },
@@ -198,7 +257,7 @@ describe("buildDroidSlashCommands", () => {
       { name: "deploy", description: "  " },
       { name: "review", description: "Shadowed duplicate" },
       { name: "  ", description: "Nameless" },
-      { name: "release", description: "Cut a release", argumentHint: "   ", isExecutable: true },
+      { name: "release", description: "Cut a release", argumentHint: "   " },
     ];
 
     assert.deepEqual(buildDroidSlashCommands(commands), [
@@ -253,9 +312,18 @@ describe("buildDroidSkills", () => {
   });
 
   it("treats a skill with no explicit invocability as user-invocable", () => {
-    const skills = buildDroidSkills([{ name: "spec", filePath: "/skills/spec/SKILL.md" }]);
+    const skills = buildDroidSkills([
+      { name: "spec", location: "personal", filePath: "/skills/spec/SKILL.md" },
+    ]);
 
-    assert.deepEqual(skills, [{ name: "spec", path: "/skills/spec/SKILL.md", enabled: true }]);
+    assert.deepEqual(skills, [
+      {
+        name: "spec",
+        path: "/skills/spec/SKILL.md",
+        enabled: true,
+        scope: "personal",
+      },
+    ]);
   });
 });
 
@@ -378,6 +446,30 @@ it.layer(NodeServices.layer)("checkDroidProviderStatus", (it) => {
           snapshot.message,
           "Droid inventory discovery failed. Using fallback models; slash commands and skills are unavailable.",
         );
+      }),
+    ),
+  );
+
+  it.effect("warns and uses the complete fallback when inventory decoding fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const binaryPath = yield* makeInventoryProbeBinary("malformed-model");
+        const snapshot = yield* checkDroidProviderStatus(
+          decodeDroidSettings({
+            enabled: true,
+            binaryPath,
+            customModels: ["custom:test-model"],
+          }),
+          { FACTORY_API_KEY: "test-key", PATH: process.env.PATH },
+        );
+
+        assert.equal(snapshot.status, "warning");
+        assert.deepEqual(
+          snapshot.models.map((model) => model.slug),
+          ["claude-opus-5", "claude-sonnet-5", "custom:test-model"],
+        );
+        assert.deepEqual(snapshot.slashCommands, []);
+        assert.deepEqual(snapshot.skills, []);
       }),
     ),
   );
