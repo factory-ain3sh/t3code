@@ -347,6 +347,7 @@ describe("buildThreadListV2Items", () => {
 
     expect(layout.items.map((item) => item.thread.id)).toEqual(["active", "pinned-merged"]);
     expect(layout.items.map((item) => item.variant)).toEqual(["card", "slim"]);
+    expect(layout.items[1]?.thread.pinnedAt).toBe("2026-06-01T12:00:00.000Z");
     expect(layout.settledCount).toBe(1);
   });
 
