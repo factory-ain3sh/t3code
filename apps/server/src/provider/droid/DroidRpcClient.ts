@@ -27,6 +27,7 @@ import {
 const defaultRequestTimeoutMs = 30_000;
 const gracefulShutdownTimeout = Duration.seconds(2);
 const timedOutRequestRetentionLimit = 256;
+const diagnosticTextLimit = 2000;
 
 export interface DroidRpcSpawnInput {
   readonly command: string;
@@ -91,13 +92,6 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
   }
 }
 
-export interface DroidRpcDiagnostic {
-  readonly level: "warning";
-  readonly message: string;
-  readonly line?: string;
-  readonly cause?: unknown;
-}
-
 interface DroidServerRequestBase {
   readonly id: string;
   readonly sessionId: string | undefined;
@@ -130,14 +124,13 @@ export interface DroidRpcClient {
   ) => Effect.Effect<unknown, DroidRpcError>;
   readonly notifications: Stream.Stream<DroidNotificationEnvelope>;
   readonly serverRequests: Stream.Stream<DroidServerRequest>;
-  readonly diagnostics: Stream.Stream<DroidRpcDiagnostic>;
   readonly exits: Effect.Effect<DroidProcessExit>;
   readonly shutdown: Effect.Effect<void>;
 }
 
-export interface ParsedJsonRpcMessage {
+interface ParsedJsonRpcMessage {
   readonly jsonrpc: "2.0";
-  readonly type?: "request" | "response" | "notification";
+  readonly type: "request" | "response" | "notification";
   readonly id?: string | number | null;
   readonly method?: string;
   readonly params?: unknown;
@@ -146,11 +139,11 @@ export interface ParsedJsonRpcMessage {
   readonly [key: string]: unknown;
 }
 
-export type ParseJsonRpcLineResult =
+type ParseJsonRpcLineResult =
   | { readonly _tag: "Message"; readonly message: ParsedJsonRpcMessage }
   | { readonly _tag: "Invalid"; readonly error: string };
 
-export function parseJsonRpcLine(line: string): ParseJsonRpcLineResult {
+function parseJsonRpcLine(line: string): ParseJsonRpcLineResult {
   try {
     const parsed: unknown = JSON.parse(line);
     if (!Predicate.isObject(parsed) || Array.isArray(parsed)) {
@@ -159,19 +152,18 @@ export function parseJsonRpcLine(line: string): ParseJsonRpcLineResult {
     if (parsed.jsonrpc !== "2.0") {
       return { _tag: "Invalid", error: 'JSON-RPC line must include jsonrpc: "2.0"' };
     }
-    if (
-      parsed.type !== undefined &&
-      parsed.type !== "request" &&
-      parsed.type !== "response" &&
-      parsed.type !== "notification"
-    ) {
-      return { _tag: "Invalid", error: "JSON-RPC line has an invalid type discriminator" };
+    if (parsed.type !== "request" && parsed.type !== "response" && parsed.type !== "notification") {
+      return {
+        _tag: "Invalid",
+        error: "JSON-RPC line must include a valid type discriminator",
+      };
     }
     return {
       _tag: "Message",
       message: {
         ...parsed,
         jsonrpc: "2.0",
+        type: parsed.type,
       },
     };
   } catch (cause) {
@@ -180,31 +172,6 @@ export function parseJsonRpcLine(line: string): ParseJsonRpcLineResult {
       error: cause instanceof Error ? cause.message : String(cause),
     };
   }
-}
-
-export interface NdjsonChunkSplitter {
-  readonly push: (chunk: string) => ReadonlyArray<string>;
-  readonly end: () => ReadonlyArray<string>;
-}
-
-export function splitNdjsonChunks(): NdjsonChunkSplitter {
-  let pending = "";
-
-  const normalize = (line: string) => (line.endsWith("\r") ? line.slice(0, -1) : line);
-
-  return {
-    push: (chunk) => {
-      pending += chunk;
-      const parts = pending.split("\n");
-      pending = parts.pop() ?? "";
-      return parts.map(normalize).filter((line) => line.trim().length > 0);
-    },
-    end: () => {
-      const tail = normalize(pending);
-      pending = "";
-      return tail.trim().length > 0 ? [tail] : [];
-    },
-  };
 }
 
 interface PendingRequest {
@@ -307,7 +274,6 @@ export const makeDroidRpcClient = (
       Cause.Done<void>
     >();
     const serverRequestPubSub = yield* Queue.unbounded<DroidServerRequest, Cause.Done<void>>();
-    const diagnosticPubSub = yield* Queue.sliding<DroidRpcDiagnostic, Cause.Done<void>>(256);
     const lifecycle = yield* SynchronizedRef.make<DroidRpcLifecycle>({
       _tag: "Running",
       pending: new Map(),
@@ -315,11 +281,21 @@ export const makeDroidRpcClient = (
     const nextRequestId = yield* Ref.make(0);
     const exitDeferred = yield* Deferred.make<DroidProcessExit>();
 
-    const publishDiagnostic = (diagnostic: DroidRpcDiagnostic) =>
-      Effect.logWarning(diagnostic.message, {
-        ...(diagnostic.line === undefined ? {} : { line: diagnostic.line }),
-        ...(diagnostic.cause === undefined ? {} : { cause: diagnostic.cause }),
-      }).pipe(Effect.andThen(Queue.offer(diagnosticPubSub, diagnostic)), Effect.asVoid);
+    const publishDiagnostic = (
+      message: string,
+      options?: {
+        readonly line?: string;
+        readonly cause?: unknown;
+      },
+    ) =>
+      Effect.logWarning(message.slice(0, diagnosticTextLimit), {
+        ...(options?.line === undefined
+          ? {}
+          : { line: options.line.slice(0, diagnosticTextLimit) }),
+        ...(options?.cause === undefined
+          ? {}
+          : { cause: String(options.cause).slice(0, diagnosticTextLimit) }),
+      });
 
     const spawnCommand = yield* resolveSpawnCommand(
       input.command,
@@ -390,10 +366,7 @@ export const makeDroidRpcClient = (
     const resolveResponse = (message: ParsedJsonRpcMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (message.id === undefined || message.id === null) {
-          yield* publishDiagnostic({
-            level: "warning",
-            message: "Ignoring Droid JSON-RPC response without an id",
-          });
+          yield* publishDiagnostic("Ignoring Droid JSON-RPC response without an id");
           return;
         }
         const requestId = String(message.id);
@@ -410,10 +383,7 @@ export const makeDroidRpcClient = (
           return [found, { ...state, pending: next }] as const;
         });
         if (!requestState) {
-          yield* publishDiagnostic({
-            level: "warning",
-            message: `Ignoring response for unknown Droid request ${requestId}`,
-          });
+          yield* publishDiagnostic(`Ignoring response for unknown Droid request ${requestId}`);
           return;
         }
         if (requestState._tag === "TimedOut") {
@@ -422,11 +392,7 @@ export const makeDroidRpcClient = (
             method: requestState.method,
             requestId,
           });
-          yield* publishDiagnostic({
-            level: "warning",
-            message: error.message,
-            cause: error,
-          });
+          yield* publishDiagnostic(error.message, { cause: error });
           return;
         }
         if (message.error !== undefined) {
@@ -478,10 +444,7 @@ export const makeDroidRpcClient = (
     const handleServerRequest = (message: ParsedJsonRpcMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (message.id === undefined || message.id === null || typeof message.method !== "string") {
-          yield* publishDiagnostic({
-            level: "warning",
-            message: "Ignoring malformed server-initiated Droid request",
-          });
+          yield* publishDiagnostic("Ignoring malformed server-initiated Droid request");
           return;
         }
         const id = String(message.id);
@@ -492,9 +455,7 @@ export const makeDroidRpcClient = (
         if (message.method === "droid.request_permission") {
           const decoded = yield* decodePermissionRequest(message.params).pipe(Effect.result);
           if (decoded._tag === "Failure") {
-            yield* publishDiagnostic({
-              level: "warning",
-              message: "Unable to decode droid.request_permission params",
+            yield* publishDiagnostic("Unable to decode droid.request_permission params", {
               cause: decoded.failure,
             });
             yield* sendResponse(id, {
@@ -510,9 +471,7 @@ export const makeDroidRpcClient = (
         if (message.method === "droid.ask_user") {
           const decoded = yield* decodeAskUserRequest(message.params).pipe(Effect.result);
           if (decoded._tag === "Failure") {
-            yield* publishDiagnostic({
-              level: "warning",
-              message: "Unable to decode droid.ask_user params",
+            yield* publishDiagnostic("Unable to decode droid.ask_user params", {
               cause: decoded.failure,
             });
             yield* sendResponse(id, {
@@ -525,10 +484,9 @@ export const makeDroidRpcClient = (
           yield* publishServerRequest(id, sessionId, message.method, decoded.success);
           return;
         }
-        yield* publishDiagnostic({
-          level: "warning",
-          message: `Ignoring unsupported server-initiated Droid request ${message.method}`,
-        });
+        yield* publishDiagnostic(
+          `Ignoring unsupported server-initiated Droid request ${message.method}`,
+        );
         yield* sendResponse(id, {
           _tag: "Failure",
           code: -32601,
@@ -542,17 +500,12 @@ export const makeDroidRpcClient = (
           return;
         }
         if (!Predicate.isObject(message.params)) {
-          yield* publishDiagnostic({
-            level: "warning",
-            message: "Ignoring Droid session notification with invalid params",
-          });
+          yield* publishDiagnostic("Ignoring Droid session notification with invalid params");
           return;
         }
         const decoded = yield* decodeNotification(message.params.notification).pipe(Effect.result);
         if (decoded._tag === "Failure") {
-          yield* publishDiagnostic({
-            level: "warning",
-            message: "Unable to decode Droid session notification",
+          yield* publishDiagnostic("Unable to decode Droid session notification", {
             cause: decoded.failure,
           });
           return;
@@ -566,58 +519,29 @@ export const makeDroidRpcClient = (
       });
 
     const handleMessage = (message: ParsedJsonRpcMessage): Effect.Effect<void> => {
-      const isRequest =
-        message.type === "request" ||
-        (message.type === undefined &&
-          typeof message.method === "string" &&
-          message.id !== undefined);
-      const isNotification =
-        message.type === "notification" ||
-        (message.type === undefined &&
-          typeof message.method === "string" &&
-          message.id === undefined);
-      if (isRequest) {
-        return handleServerRequest(message);
+      switch (message.type) {
+        case "request":
+          return handleServerRequest(message);
+        case "notification":
+          return handleNotification(message);
+        case "response":
+          return resolveResponse(message);
       }
-      if (isNotification) {
-        return handleNotification(message);
-      }
-      return resolveResponse(message);
     };
 
-    const splitter = splitNdjsonChunks();
     const handleLine = (line: string) => {
       const parsed = parseJsonRpcLine(line);
       return parsed._tag === "Invalid"
-        ? publishDiagnostic({
-            level: "warning",
-            message: `Unable to parse Droid JSON-RPC line: ${parsed.error}`,
-            line,
-          })
+        ? publishDiagnostic(`Unable to parse Droid JSON-RPC line: ${parsed.error}`, { line })
         : handleMessage(parsed.message);
     };
 
     const stdoutFiber = yield* child.stdout.pipe(
       Stream.decodeText(),
-      Stream.runForEach((chunk) =>
-        Effect.forEach(splitter.push(chunk), handleLine, {
-          discard: true,
-        }),
-      ),
-      Effect.andThen(
-        Effect.suspend(() =>
-          Effect.forEach(splitter.end(), handleLine, {
-            discard: true,
-          }),
-        ),
-      ),
-      Effect.catch((cause) =>
-        publishDiagnostic({
-          level: "warning",
-          message: "Droid stdout stream failed",
-          cause,
-        }),
-      ),
+      Stream.splitLines,
+      Stream.filter((line) => line.trim().length > 0),
+      Stream.runForEach(handleLine),
+      Effect.catch((cause) => publishDiagnostic("Droid stdout stream failed", { cause })),
       Effect.forkIn(runtimeScope),
     );
 
@@ -626,10 +550,7 @@ export const makeDroidRpcClient = (
       Stream.runForEach((output) =>
         output.trim().length === 0
           ? Effect.void
-          : publishDiagnostic({
-              level: "warning",
-              message: `Droid stderr: ${output.trim()}`,
-            }),
+          : publishDiagnostic(`Droid stderr: ${output.trim()}`),
       ),
       Effect.catch(() => Effect.void),
       Effect.forkIn(runtimeScope),
@@ -710,14 +631,9 @@ export const makeDroidRpcClient = (
           yield* Fiber.await(stdoutFiber);
           yield* Fiber.await(stderrFiber);
           yield* finishProcessExit(exit);
-          yield* Effect.all(
-            [
-              Queue.end(notificationPubSub),
-              Queue.end(serverRequestPubSub),
-              Queue.end(diagnosticPubSub),
-            ],
-            { discard: true },
-          );
+          yield* Effect.all([Queue.end(notificationPubSub), Queue.end(serverRequestPubSub)], {
+            discard: true,
+          });
           yield* Deferred.succeed(exitDeferred, exit);
         }),
       ),
@@ -852,7 +768,6 @@ export const makeDroidRpcClient = (
       request,
       notifications: Stream.fromQueue(notificationPubSub),
       serverRequests: Stream.fromQueue(serverRequestPubSub),
-      diagnostics: Stream.fromQueue(diagnosticPubSub),
       exits,
       shutdown,
     } satisfies DroidRpcClient;
