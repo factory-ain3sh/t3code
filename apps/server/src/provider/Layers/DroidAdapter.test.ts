@@ -31,28 +31,60 @@ const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
 const mockAgentCommand = process.execPath;
-
-async function makeMockDroidWrapper(extraEnv?: Record<string, string>) {
-  const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-jsonrpc-mock-"));
-  const wrapperPath = NodePath.join(dir, "fake-droid.sh");
-  const envExports = Object.entries(extraEnv ?? {})
-    .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
-    .join("\n");
-  const script = `#!/bin/sh
-${envExports}
-exec ${JSON.stringify(mockAgentCommand)} ${JSON.stringify(mockAgentPath)} "$@"
-`;
-  await NodeFSP.writeFile(wrapperPath, script, "utf8");
-  await NodeFSP.chmod(wrapperPath, 0o755);
-  return wrapperPath;
-}
+const mockAgentExec = `exec ${JSON.stringify(mockAgentCommand)} ${JSON.stringify(mockAgentPath)} "$@"`;
 
 const droidAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-droid-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-const makeTestAdapter = (binaryPath: string, options?: Parameters<typeof makeDroidAdapter>[1]) =>
-  makeDroidAdapter(decodeDroidSettings({ binaryPath }), options).pipe(Effect.orDie);
+type DroidTestAdapter = Effect.Success<ReturnType<typeof makeDroidAdapter>>;
+type DroidAdapterOptions = NonNullable<Parameters<typeof makeDroidAdapter>[1]>;
+type DroidDebugStateReader = Parameters<
+  NonNullable<DroidAdapterOptions["registerDebugStateReader"]>
+>[0];
+type DroidStartSessionInput = Parameters<DroidTestAdapter["startSession"]>[0];
+
+const makeDroidScenario = (mockEnv?: Record<string, string>) =>
+  Effect.gen(function* () {
+    const dir = yield* Effect.promise(() =>
+      NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-jsonrpc-mock-")),
+    );
+    const wrapperPath = NodePath.join(dir, "fake-droid.sh");
+    const envExports = Object.entries(mockEnv ?? {})
+      .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
+      .join("\n");
+    const script = `#!/bin/sh
+${envExports}
+${mockAgentExec}
+`;
+    yield* Effect.promise(() => NodeFSP.writeFile(wrapperPath, script, "utf8"));
+    yield* Effect.promise(() => NodeFSP.chmod(wrapperPath, 0o755));
+
+    let debugStateReader: DroidDebugStateReader = () =>
+      Effect.die("Droid debug state reader was not registered");
+    const adapter = yield* makeDroidAdapter(decodeDroidSettings({ binaryPath: wrapperPath }), {
+      registerDebugStateReader: (read) => {
+        debugStateReader = read;
+      },
+    }).pipe(Effect.orDie);
+
+    return {
+      adapter,
+      readDebugState: (threadId: ThreadId) => debugStateReader(threadId),
+    };
+  });
+
+const startDroidSession = (
+  adapter: DroidTestAdapter,
+  threadId: ThreadId,
+  runtimeMode: DroidStartSessionInput["runtimeMode"],
+) =>
+  adapter.startSession({
+    threadId,
+    provider: ProviderDriverKind.make("droid"),
+    cwd: process.cwd(),
+    runtimeMode,
+  });
 
 const eventsForThread = (events: ReadonlyArray<ProviderRuntimeEvent>, threadId: ThreadId) =>
   events.filter((event) => String(event.threadId) === String(threadId));
@@ -109,8 +141,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("maps a Droid turn to ordered reasoning, assistant, usage, and completion events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-turn-lifecycle");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -227,10 +258,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
 
   it.effect("emits terminal usage when no usage notification arrived", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION: "1" });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const threadId = ThreadId.make("droid-usage-terminal-fallback");
       const turnCompleted = yield* Deferred.make<void>();
@@ -246,12 +274,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({ threadId, input: "fallback usage", attachments: [] });
       yield* Deferred.await(turnCompleted);
 
@@ -269,53 +292,18 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
 
   it.effect("reaps thread locks after session teardown and failed startup", () =>
     Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const failingWrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_FAIL_INIT: "1" }),
-      );
-      let readDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({
-          threadLockCount: -1,
-          threadLockReferenceCount: -1,
-          interruptedTurnCount: -1,
-        });
-      let readFailingDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({
-          threadLockCount: -1,
-          threadLockReferenceCount: -1,
-          interruptedTurnCount: -1,
-        });
-      const adapter = yield* makeTestAdapter(wrapperPath, {
-        registerDebugStateReader: (read) => {
-          readDebugState = read;
-        },
-      });
-      const failingAdapter = yield* makeTestAdapter(failingWrapperPath, {
-        registerDebugStateReader: (read) => {
-          readFailingDebugState = read;
-        },
-      });
+      const { adapter, readDebugState } = yield* makeDroidScenario();
+      const { adapter: failingAdapter, readDebugState: readFailingDebugState } =
+        yield* makeDroidScenario({ T3_DROID_MOCK_FAIL_INIT: "1" });
       const threadId = ThreadId.make("droid-thread-lock-reaped");
       const failedThreadId = ThreadId.make("droid-failed-thread-lock-reaped");
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       assert.equal((yield* readDebugState(threadId)).threadLockCount, 1);
       yield* adapter.stopSession(threadId);
       assert.equal((yield* readDebugState(threadId)).threadLockCount, 0);
 
-      yield* Effect.flip(
-        failingAdapter.startSession({
-          threadId: failedThreadId,
-          provider: ProviderDriverKind.make("droid"),
-          cwd: process.cwd(),
-          runtimeMode: "full-access",
-        }),
-      );
+      yield* Effect.flip(startDroidSession(failingAdapter, failedThreadId, "full-access"));
       assert.equal((yield* readFailingDebugState(failedThreadId)).threadLockCount, 0);
     }),
   );
@@ -326,27 +314,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const coordinationDir = yield* Effect.promise(() =>
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-start-race-")),
       );
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_START_RACE_DIR: coordinationDir }),
-      );
-      let readDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({
-          threadLockCount: -1,
-          threadLockReferenceCount: -1,
-          interruptedTurnCount: -1,
-        });
-      const adapter = yield* makeTestAdapter(wrapperPath, {
-        registerDebugStateReader: (read) => {
-          readDebugState = read;
-        },
+      const { adapter, readDebugState } = yield* makeDroidScenario({
+        T3_DROID_MOCK_START_RACE_DIR: coordinationDir,
       });
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
 
       const heldTurn = yield* adapter
         .sendTurn({
@@ -365,14 +337,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           runtimeMode: "full-access",
         })
         .pipe(Effect.flip, Effect.forkChild);
-      const replacementStart = yield* adapter
-        .startSession({
-          threadId,
-          provider: ProviderDriverKind.make("droid"),
-          cwd: process.cwd(),
-          runtimeMode: "full-access",
-        })
-        .pipe(Effect.forkChild);
+      const replacementStart = yield* startDroidSession(adapter, threadId, "full-access").pipe(
+        Effect.forkChild,
+      );
 
       yield* Effect.yieldNow;
       assert.equal((yield* readDebugState(threadId)).threadLockReferenceCount, 3);
@@ -410,8 +377,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("closes incomplete streamed and tool items before terminal settlement", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-incomplete-items");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -427,12 +393,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock incomplete items",
@@ -479,8 +440,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const firstThreadId = ThreadId.make("droid-shared-tool-first");
       const secondThreadId = ThreadId.make("droid-shared-tool-second");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const firstToolStarted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
@@ -507,18 +467,8 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId: firstThreadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
-      yield* adapter.startSession({
-        threadId: secondThreadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, firstThreadId, "full-access");
+      yield* startDroidSession(adapter, secondThreadId, "full-access");
       yield* adapter.sendTurn({
         threadId: firstThreadId,
         input: "mock delayed shared tool",
@@ -556,10 +506,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("round-trips an approved Droid permission and completes the turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-approved");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const requestOpened =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
@@ -579,12 +526,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "approval-required",
-      });
+      yield* startDroidSession(adapter, threadId, "approval-required");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "run the approved command",
@@ -645,10 +587,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("rejects a concurrent duplicate Droid permission response", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-response-race");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" });
       const requestOpened =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
       const requestResolved =
@@ -664,12 +603,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         return Effect.void;
       }).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "approval-required",
-      });
+      yield* startDroidSession(adapter, threadId, "approval-required");
       yield* adapter.sendTurn({
         threadId,
         input: "race permission responses",
@@ -716,10 +650,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("round-trips a denied Droid permission as a cancelled turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-denied");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" });
       const requestOpened =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
       const requestResolved =
@@ -740,12 +671,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         return Effect.void;
       }).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "approval-required",
-      });
+      yield* startDroidSession(adapter, threadId, "approval-required");
       yield* adapter.sendTurn({
         threadId,
         input: "deny the command",
@@ -774,10 +700,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("round-trips Droid ask_user answers and completes the turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-ask-user");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_ASK_USER: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_ASK_USER: "1" });
       const requested =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
       const resolved =
@@ -798,12 +721,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         return Effect.void;
       }).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "ask for scope",
@@ -846,10 +764,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("rejects a concurrent duplicate Droid user-input response", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-user-input-response-race");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_ASK_USER: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_ASK_USER: "1" });
       const requested =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
       const resolved =
@@ -865,12 +780,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         return Effect.void;
       }).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "race user input responses",
@@ -917,19 +827,8 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("interrupts a hanging Droid turn once and drops its late terminal notification", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-interrupt");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_HANG_TURN: "1" }),
-      );
-      let readDebugState = (_threadId: ThreadId) =>
-        Effect.succeed({
-          threadLockCount: -1,
-          threadLockReferenceCount: -1,
-          interruptedTurnCount: -1,
-        });
-      const adapter = yield* makeTestAdapter(wrapperPath, {
-        registerDebugStateReader: (read) => {
-          readDebugState = read;
-        },
+      const { adapter, readDebugState } = yield* makeDroidScenario({
+        T3_DROID_MOCK_HANG_TURN: "1",
       });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const assistantCompleted =
@@ -952,12 +851,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "hang until interrupted",
@@ -1004,8 +898,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("loads a known Droid resume cursor into a ready session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-known");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const sessionStarted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.started" }>>();
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
@@ -1038,10 +931,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("resets a resumed spec session before sending a normal turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-spec-reset");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_LOAD_IN_SPEC_MODE: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_LOAD_IN_SPEC_MODE: "1" });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1091,8 +981,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("rejects an unknown Droid resume cursor with a typed process error", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-unknown");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
 
       const error = yield* Effect.flip(
         adapter.startSession({
@@ -1115,10 +1004,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("fails resume when approval-required settings cannot be reasserted", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-settings-failure");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_FAIL_UPDATE_SETTINGS: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_FAIL_UPDATE_SETTINGS: "1" });
 
       const error = yield* Effect.flip(
         adapter.startSession({
@@ -1141,19 +1027,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("surfaces Droid initialization failure as a typed process error", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-init-failure");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_FAIL_INIT: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_FAIL_INIT: "1" });
 
-      const error = yield* Effect.flip(
-        adapter.startSession({
-          threadId,
-          provider: ProviderDriverKind.make("droid"),
-          cwd: process.cwd(),
-          runtimeMode: "full-access",
-        }),
-      );
+      const error = yield* Effect.flip(startDroidSession(adapter, threadId, "full-access"));
 
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
@@ -1166,10 +1042,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("fails the active turn and emits session.exited when Droid dies", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-process-death");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_EXIT_MID_TURN: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_EXIT_MID_TURN: "1" });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const sessionExited =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
@@ -1185,12 +1058,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "exit during this turn",
@@ -1216,8 +1084,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("rolls back a turn by forking the Droid session and re-anchoring on the fork", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-rollback");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const firstTurnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
       const secondTurnCompleted =
@@ -1233,12 +1100,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           : Effect.void,
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "first turn to roll back",
@@ -1276,8 +1138,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("drops a pre-rewind session straggler after re-anchoring on the fork", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-rewind-straggler");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const firstTurnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1300,12 +1161,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "turn before straggler rewind",
@@ -1348,13 +1204,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("lets interrupt cancellation win a queued completed-terminal race", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-interrupt-completion-race");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({
-          T3_DROID_MOCK_HANG_TURN: "1",
-          T3_DROID_MOCK_INTERRUPT_RACE: "1",
-        }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_HANG_TURN: "1",
+        T3_DROID_MOCK_INTERRUPT_RACE: "1",
+      });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const assistantCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
@@ -1376,12 +1229,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "race completion against interrupt",
@@ -1410,8 +1258,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("adopts a spec-handoff successor after streaming it into the plan turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-spec-handoff");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1427,12 +1274,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock spec handoff",
@@ -1468,8 +1310,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("treats compaction as a no-op and reports the last-call context meter", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-compaction");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1485,12 +1326,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock compaction",
@@ -1533,8 +1369,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("maps child sessions to tasks without leaking child deltas into the main turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-child-session");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1550,12 +1385,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock child session",
@@ -1600,8 +1430,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("stops open Droid child tasks before an explicit session exit", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-child-session-stop");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const taskStarted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "task.started" }>>();
@@ -1621,12 +1450,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "mock hanging child session",
@@ -1653,8 +1477,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("stops open Droid child tasks before an unexpected process exit", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-child-session-process-exit");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const taskStarted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "task.started" }>>();
@@ -1674,12 +1497,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "mock child session then exit",
@@ -1709,8 +1527,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("drops Droid tool progress without an owning subagent session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-taskless-tool-progress");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1726,12 +1543,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "mock taskless progress",
@@ -1752,10 +1564,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("refuses to guess rollback anchors from resumed steering messages", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-rollback");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_LOAD_STEERING_MESSAGES: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_LOAD_STEERING_MESSAGES: "1" });
 
       yield* adapter.startSession({
         threadId,
@@ -1778,8 +1587,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("settles a coalesced steering turn exactly once", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-steering-coalesced");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const steeringReady =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
@@ -1801,12 +1609,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const openingTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock steering original",
@@ -1840,8 +1643,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("keeps a steered turn open when the queued message runs separately", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-steering-separate");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const steeringReady =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
@@ -1869,12 +1671,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       const openingTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock steering original",
@@ -1909,10 +1706,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("ignores unknown Droid notifications and still completes the turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-unknown-notification");
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockDroidWrapper({ T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION: "1",
+      });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
@@ -1928,12 +1724,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
       ).pipe(Effect.forkChild);
 
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
+      yield* startDroidSession(adapter, threadId, "full-access");
       yield* adapter.sendTurn({
         threadId,
         input: "tolerate future notifications",
