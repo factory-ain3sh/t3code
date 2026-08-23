@@ -36,11 +36,21 @@ jobs:
         with:
           node-version-file: package.json
           cache: false
-          run-install: |
-            args:
-              - --filter=@t3tools/desktop...
-              - --filter=t3...
-              - --filter=@t3tools/scripts...
+          run-install: false
+
+      - name: Resolve Windows package cache path
+        id: package_cache_path
+        shell: pwsh
+        run: '"path=$(vp pm cache dir)" >> $env:GITHUB_OUTPUT'
+
+      - name: Cache Windows packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.package_cache_path.outputs.path }}
+          key: windows-release-packages-v1-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
 
       - name: Cache resource monitor
         id: resource_monitor_cache
