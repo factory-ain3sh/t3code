@@ -119,6 +119,8 @@ interface DroidSessionContext {
   readonly persistedPendingTurnMessageIds: Set<string>;
   /** Runtime item ids with an emitted item.started awaiting completion. */
   readonly openItemIds: Set<string>;
+  /** Tool names keyed by provider tool-use id within this Droid session. */
+  readonly toolUseNames: Map<string, string>;
   /** Droid child (subagent) session ids mapped onto t3 task lifecycles. */
   readonly childSessions: Map<string, { readonly description: string }>;
   /**
@@ -308,30 +310,6 @@ export function parseDroidResume(raw: unknown): { sessionId: string } | undefine
   if (raw.schemaVersion !== DROID_RESUME_VERSION) return undefined;
   if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
   return { sessionId: raw.sessionId.trim() };
-}
-
-/**
- * Recover rewind anchors from a loaded session's durable messages. This
- * adapter uses the droid user-message id as the t3 turn id, so resumed
- * threads keep 1:1 rollback anchoring with the turns t3 checkpointed.
- */
-export function droidLoadedTurns(
-  messages: ReadonlyArray<unknown>,
-): Array<{ id: TurnId; items: Array<unknown> }> {
-  const turns: Array<{ id: TurnId; items: Array<unknown> }> = [];
-  for (const message of messages) {
-    if (!isRecord(message)) continue;
-    const role =
-      typeof message.role === "string"
-        ? message.role
-        : typeof message.type === "string"
-          ? message.type
-          : undefined;
-    if (role !== "user" && role !== "user_message") continue;
-    if (typeof message.id !== "string" || !message.id.trim()) continue;
-    turns.push({ id: TurnId.make(message.id), items: [] });
-  }
-  return turns;
 }
 
 function settlePendingApprovalsAsCancelled(
@@ -556,6 +534,46 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         }),
       );
 
+    const completeAllOpenItems = (
+      ctx: DroidSessionContext,
+      turnId: TurnId,
+      outcome: DroidTurnOutcome,
+    ) =>
+      Effect.forEach(
+        Array.from(ctx.openItemIds),
+        (itemId) => {
+          const assistantMessage = itemId.startsWith("msg:");
+          const reasoning = itemId.startsWith("reasoning:");
+          const toolName = assistantMessage || reasoning ? undefined : ctx.toolUseNames.get(itemId);
+          return Effect.gen(function* () {
+            yield* offerRuntimeEvent({
+              type: "item.completed",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              turnId,
+              itemId: RuntimeItemId.make(itemId),
+              payload: {
+                itemType: assistantMessage
+                  ? "assistant_message"
+                  : reasoning
+                    ? "reasoning"
+                    : toolName
+                      ? droidToolLifecycleItemType(toolName)
+                      : "dynamic_tool_call",
+                status:
+                  assistantMessage || reasoning || outcome.state === "completed"
+                    ? "completed"
+                    : "failed",
+                ...(toolName ? { title: toolName } : {}),
+              },
+            });
+            ctx.openItemIds.delete(itemId);
+          });
+        },
+        { discard: true },
+      );
+
     /**
      * Terminal settlement for a turn. Emits exactly one turn.completed; late
      * completions for interrupted or already-settled turns are dropped.
@@ -575,6 +593,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           if (outcome.state === "cancelled") ctx.interruptedTurnIds.delete(turnId);
           return;
         }
+        yield* completeAllOpenItems(ctx, turnId, outcome);
+        ctx.toolUseNames.clear();
         ctx.pendingTurnMessageIds.clear();
         ctx.persistedPendingTurnMessageIds.clear();
         ctx.activeTurnId = undefined;
@@ -788,6 +808,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           case "tool_call": {
             const toolUse = notification.toolUse;
             yield* logNative(ctx.threadId, "droid.tool_call", toolUse);
+            ctx.openItemIds.add(toolUse.id);
             yield* offerRuntimeEvent({
               type: "item.started",
               ...(yield* makeEventStamp()),
@@ -805,7 +826,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             return;
           }
           case "tool_result": {
-            const title = droidToolUseName(ctx, notification.toolUseId);
+            const title = ctx.toolUseNames.get(notification.toolUseId);
+            ctx.openItemIds.delete(notification.toolUseId);
             yield* offerRuntimeEvent({
               type: "item.completed",
               ...(yield* makeEventStamp()),
@@ -819,6 +841,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                 ...(title ? { title } : {}),
               },
             });
+            ctx.toolUseNames.delete(notification.toolUseId);
             return;
           }
           case "tool_progress_update": {
@@ -899,16 +922,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       });
 
     // tool_result carries no tool name; remember tool_call names per session.
-    const toolUseNames = new Map<string, string>();
-    const rememberToolUse = (toolUse: DroidToolUse) => {
-      toolUseNames.set(toolUse.id, toolUse.name);
-      if (toolUseNames.size > 512) {
-        const first = toolUseNames.keys().next().value;
-        if (first !== undefined) toolUseNames.delete(first);
-      }
+    const rememberToolUse = (ctx: DroidSessionContext, toolUse: DroidToolUse) => {
+      ctx.toolUseNames.set(toolUse.id, toolUse.name);
     };
-    const droidToolUseName = (_ctx: DroidSessionContext, toolUseId: string) =>
-      toolUseNames.get(toolUseId);
 
     const handlePermissionRequest = (ctx: DroidSessionContext, request: DroidServerRequest) =>
       Effect.gen(function* () {
@@ -925,7 +941,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         );
         yield* logNative(ctx.threadId, "droid.request_permission", request.params);
         const primaryToolUse = params.toolUses[0];
-        if (primaryToolUse) rememberToolUse(primaryToolUse.toolUse);
+        if (primaryToolUse) rememberToolUse(ctx, primaryToolUse.toolUse);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
@@ -1218,15 +1234,16 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           const droidSessionId =
             initialized.kind === "loaded" ? initialized.sessionId : initialized.result.sessionId;
 
-          // A loaded session keeps its persisted settings; re-assert the
-          // t3-side mode and any requested model so resume behaves like the
-          // thread the user left.
+          // A loaded session keeps its persisted settings; re-assert t3's
+          // autonomy, reset interaction to ordinary auto mode, and apply any
+          // requested model so the first resumed turn uses the requested mode.
           if (initialized.kind === "loaded") {
             yield* requestSession("droid.update_session_settings", {
               autonomyLevel,
+              interactionMode: "auto",
               ...(requestedModelId ? { modelId: requestedModelId } : {}),
               ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
-            }).pipe(Effect.ignore);
+            });
           }
 
           const now = yield* nowIso;
@@ -1254,15 +1271,17 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             rpc,
             pendingApprovals: new Map(),
             pendingUserInputs: new Map(),
-            turns:
-              initialized.kind === "loaded"
-                ? droidLoadedTurns(initialized.result.session.messages)
-                : [],
+            // Durable Droid user messages do not identify which ones were
+            // steers coalesced into an earlier t3 turn. Only turns opened by
+            // this process are safe rewind anchors; resumed rollback fails
+            // loudly rather than guessing at a user-message boundary.
+            turns: [],
             activeTurnId: undefined,
             interruptedTurnIds: new Set(),
             pendingTurnMessageIds: new Set(),
             persistedPendingTurnMessageIds: new Set(),
             openItemIds: new Set(),
+            toolUseNames: new Map(),
             childSessions: new Map(),
             specSuccessorSessionId: undefined,
             lastCallTokenUsage:
@@ -1302,7 +1321,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   }
                   ctx.specSuccessorSessionId = envelope.sessionId;
                 }
-                if (notification.type === "tool_call") rememberToolUse(notification.toolUse);
+                if (notification.type === "tool_call") rememberToolUse(ctx, notification.toolUse);
                 yield* handleNotification(ctx, notification);
               }),
             ),

@@ -8,11 +8,13 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
   DroidRpcError,
+  DroidRpcSpawnError,
   makeDroidRpcClient,
   parseJsonRpcLine,
   splitNdjsonChunks,
@@ -20,6 +22,7 @@ import {
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
+const isDroidRpcError = Schema.is(DroidRpcError);
 
 const within = <A>(effect: Effect.Effect<A>, message: string | (() => string)) =>
   effect.pipe(
@@ -57,7 +60,55 @@ describe("DroidRpcClient helpers", () => {
     assert.equal(valid._tag, "Message");
     assert.equal(invalid._tag, "Invalid");
   });
+
+  it("derives transport messages from structured error attributes", () => {
+    const spawnError = new DroidRpcSpawnError({
+      command: "droid",
+      cause: new Error("ENOENT"),
+    });
+    const timeoutError = new DroidRpcError({
+      kind: "timeout",
+      method: "droid.list_models",
+      requestId: "7",
+      timeoutMs: 25,
+    });
+
+    assert.equal(spawnError.message, "Failed to spawn Droid process for command: droid");
+    assert.equal(timeoutError.message, "Droid request droid.list_models timed out after 25ms");
+  });
 });
+
+it.effect("handles a final response without a trailing newline", () =>
+  Effect.gen(function* () {
+    const script = `
+      let pending = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (chunk) => {
+        pending += chunk;
+        const line = pending.split("\\n")[0];
+        if (!line) return;
+        const request = JSON.parse(line);
+        process.stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          type: "response",
+          id: request.id,
+          result: { complete: true }
+        }), () => process.exit(0));
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const result = yield* client.request("droid.list_models", {}, { timeoutMs: 5_000 });
+    assert.deepStrictEqual(result, { complete: true });
+
+    const exit = yield* within(client.exits, "process exit was not detected");
+    assert.equal(exit.code, 0);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
 
 it.effect("correlates RPCs, decodes notifications, handles server requests, and detects exit", () =>
   Effect.gen(function* () {
@@ -335,15 +386,78 @@ it.effect("diagnoses a response that arrives after its request timed out", () =>
     );
     assert.isTrue(Option.isSome(diagnostic));
     if (Option.isSome(diagnostic)) {
-      assert.instanceOf(diagnostic.value.cause, DroidRpcError);
-      if (diagnostic.value.cause instanceof DroidRpcError) {
-        assert.equal(diagnostic.value.cause.kind, "duplicate-response");
-        assert.equal(diagnostic.value.cause.requestId, "1");
+      const cause = diagnostic.value.cause;
+      if (!isDroidRpcError(cause)) {
+        assert.fail("late-response diagnostic did not include a DroidRpcError");
       }
+      assert.equal(cause.kind, "duplicate-response");
+      assert.equal(cause.requestId, "1");
     }
 
     yield* within(client.shutdown, "client shutdown did not complete");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect(
+  "bounds timed-out request retention without losing recent late-response diagnostics",
+  () =>
+    Effect.gen(function* () {
+      const requestCount = 257;
+      const script = `
+      const requests = [];
+      let pending = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (chunk) => {
+        pending += chunk;
+        const lines = pending.split("\\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          if (line) requests.push(JSON.parse(line));
+        }
+        if (requests.length !== ${requestCount}) return;
+        setTimeout(() => {
+          for (const request of [requests[0], requests[requests.length - 1]]) {
+            process.stdout.write(JSON.stringify({
+              jsonrpc: "2.0",
+              type: "response",
+              id: request.id,
+              result: { late: true }
+            }) + "\\n");
+          }
+        }, 250);
+      });
+      process.stdin.resume();
+    `;
+      const client = yield* makeDroidRpcClient({
+        command: process.execPath,
+        args: ["-e", script],
+      });
+
+      const results = yield* Effect.all(
+        Array.from({ length: requestCount }, () =>
+          Effect.result(client.request("droid.list_models", {}, { timeoutMs: 100 })),
+        ),
+        { concurrency: "unbounded" },
+      );
+      assert.isTrue(
+        results.every((result) => result._tag === "Failure" && result.failure.kind === "timeout"),
+      );
+
+      const diagnostics = yield* within(
+        Stream.runCollect(Stream.take(client.diagnostics, 2)),
+        "late-response diagnostics did not arrive",
+      );
+      assert.lengthOf(diagnostics, 2);
+      assert.equal(diagnostics[0]?.message, "Ignoring response for unknown Droid request 1");
+      const retainedCause = diagnostics[1]?.cause;
+      if (!isDroidRpcError(retainedCause)) {
+        assert.fail("retained late-response diagnostic did not include a DroidRpcError");
+      }
+      assert.equal(retainedCause.kind, "duplicate-response");
+      assert.equal(retainedCause.requestId, String(requestCount));
+
+      yield* within(client.shutdown, "client shutdown did not complete");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 
 it.effect("keeps only the latest 256 undrained diagnostics", () =>

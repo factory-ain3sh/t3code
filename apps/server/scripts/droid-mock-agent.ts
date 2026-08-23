@@ -7,6 +7,9 @@ const requestPermission = process.env.T3_DROID_MOCK_REQUEST_PERMISSION === "1";
 const askUser = process.env.T3_DROID_MOCK_ASK_USER === "1";
 const hangTurn = process.env.T3_DROID_MOCK_HANG_TURN === "1";
 const failInit = process.env.T3_DROID_MOCK_FAIL_INIT === "1";
+const failUpdateSettings = process.env.T3_DROID_MOCK_FAIL_UPDATE_SETTINGS === "1";
+const loadInSpecMode = process.env.T3_DROID_MOCK_LOAD_IN_SPEC_MODE === "1";
+const loadSteeringMessages = process.env.T3_DROID_MOCK_LOAD_STEERING_MESSAGES === "1";
 const exitMidTurn = process.env.T3_DROID_MOCK_EXIT_MID_TURN === "1";
 const emitUnknownNotification = process.env.T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION === "1";
 
@@ -265,6 +268,79 @@ async function runTurn(params: {
     });
   }
 
+  if (params.text === "mock report interaction mode") {
+    notify({
+      type: "thinking_text_complete",
+      messageId: `assistant-${turnId}`,
+      blockIndex: 0,
+      durationMs: 5,
+    });
+    notify({
+      type: "assistant_text_delta",
+      messageId: `assistant-${turnId}`,
+      blockIndex: 1,
+      textDelta: currentSettings.interactionMode,
+    });
+    notify({
+      type: "assistant_text_complete",
+      messageId: `assistant-${turnId}`,
+      blockIndex: 1,
+    });
+    emitTurnCompleted("completed", turnId);
+    return;
+  }
+
+  if (params.text === "mock incomplete items") {
+    notify({
+      type: "assistant_text_delta",
+      messageId: `assistant-${turnId}`,
+      blockIndex: 1,
+      textDelta: "terminal without item completions",
+    });
+    notify({
+      type: "tool_call",
+      toolUse: {
+        type: "tool_use",
+        id: `incomplete-tool-${turnId}`,
+        input: { command: "echo incomplete" },
+        name: "Execute",
+      },
+    });
+    emitTurnCompleted("completed", turnId);
+    return;
+  }
+
+  if (params.text === "mock delayed shared tool") {
+    notify({
+      type: "tool_call",
+      toolUse: {
+        type: "tool_use",
+        id: "shared-tool-use",
+        input: { path: "README.md" },
+        name: "Read",
+      },
+    });
+    return;
+  }
+
+  if (params.text === "mock shared tool execute") {
+    notify({
+      type: "tool_call",
+      toolUse: {
+        type: "tool_use",
+        id: "shared-tool-use",
+        input: { command: "echo shared" },
+        name: "Execute",
+      },
+    });
+    notify({
+      type: "tool_result",
+      messageId: `assistant-${turnId}`,
+      toolUseId: "shared-tool-use",
+      content: [{ type: "text", text: "shared command output" }],
+    });
+  }
+
   if (params.text === "mock steering original") {
     notify({
       type: "tool_call",
@@ -412,27 +488,49 @@ async function handleRequest(message: {
       }
       previousSessionId = currentSessionId;
       currentSessionId = message.params.sessionId;
+      if (loadInSpecMode) {
+        currentSettings = { ...currentSettings, interactionMode: "spec" };
+      }
       if (currentSessionId === rewoundSessionId) {
         emitPostLoadStraggler = true;
       }
       respond(message.id, {
         session: {
           title: "Loaded mock session",
-          messages: [
-            {
-              id: "loaded-user-1",
-              role: "user",
-              content: [{ type: "text", text: "loaded prompt" }],
-            },
-            {
-              id: "loaded-assistant-1",
-              role: "assistant",
-              content: [{ type: "text", text: "loaded response" }],
-            },
-          ],
+          messages: loadSteeringMessages
+            ? [
+                {
+                  id: "loaded-opening-user",
+                  role: "user",
+                  content: [{ type: "text", text: "loaded opening prompt" }],
+                },
+                {
+                  id: "loaded-steer-user",
+                  role: "user",
+                  content: [{ type: "text", text: "loaded steer" }],
+                },
+                {
+                  id: "loaded-assistant-1",
+                  role: "assistant",
+                  content: [{ type: "text", text: "loaded response" }],
+                },
+              ]
+            : [
+                {
+                  id: "loaded-user-1",
+                  role: "user",
+                  content: [{ type: "text", text: "loaded prompt" }],
+                },
+                {
+                  id: "loaded-assistant-1",
+                  role: "assistant",
+                  content: [{ type: "text", text: "loaded response" }],
+                },
+              ],
         },
         settings: {
           ...currentSettings,
+          ...(failUpdateSettings ? { autonomyLevel: "high" } : {}),
           availableAutonomyLevels: ["off", "low", "medium", "high"],
         },
         availableModels: models,
@@ -453,6 +551,29 @@ async function handleRequest(message: {
         return;
       }
       respond(message.id, {});
+      if (
+        params.text === "mock release shared tool" &&
+        activeTurn !== undefined &&
+        !activeTurn.completed
+      ) {
+        const openingTurnId = activeTurn.turnId;
+        notify({
+          type: "create_message",
+          message: {
+            id: params.messageId,
+            role: "user",
+            content: [{ type: "text", text: params.text }],
+          },
+        });
+        notify({
+          type: "tool_result",
+          messageId: `assistant-${openingTurnId}`,
+          toolUseId: "shared-tool-use",
+          content: [{ type: "text", text: "shared file contents" }],
+        });
+        emitTurnCompleted("completed", openingTurnId);
+        return;
+      }
       if (
         params.text === "mock steering coalesced" &&
         activeTurn !== undefined &&
@@ -507,6 +628,10 @@ async function handleRequest(message: {
       respond(message.id, {});
       return;
     case "droid.update_session_settings":
+      if (failUpdateSettings) {
+        fail(message.id, -32603, "Mock settings update failure");
+        return;
+      }
       if (typeof message.params === "object" && message.params !== null) {
         currentSettings = { ...currentSettings, ...message.params };
       }

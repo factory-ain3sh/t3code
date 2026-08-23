@@ -30,6 +30,7 @@ describe("buildDroidDiscoveredModels", () => {
         slug: "claude-opus-5",
         name: "Claude Opus 5",
         isCustom: false,
+        isDefault: true,
         capabilities: { optionDescriptors: [] },
       },
       {
@@ -39,6 +40,16 @@ describe("buildDroidDiscoveredModels", () => {
         capabilities: { optionDescriptors: [] },
       },
     ]);
+  });
+
+  it("marks Droid's configured default independently of discovery order", () => {
+    const models = buildDroidDiscoveredModels([
+      { id: "gpt-5-6-luna", displayName: "GPT-5.6 Luna" },
+      { id: "claude-opus-5", displayName: "Claude Opus 5" },
+    ]);
+
+    assert.equal(models[0]?.isDefault, undefined);
+    assert.equal(models[1]?.isDefault, true);
   });
 
   it("surfaces Droid's own custom models as ordinary probe models", () => {

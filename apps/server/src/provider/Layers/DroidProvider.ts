@@ -52,12 +52,13 @@ const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
 
 const VERSION_PROBE_TIMEOUT_MS = 4_000;
 const INVENTORY_DISCOVERY_TIMEOUT_MS = 15_000;
+const DROID_DEFAULT_MODEL = "claude-opus-5";
 
 export const DROID_LOGIN_MESSAGE = "Run `droid` in a terminal to sign in to Factory.";
 
 const DROID_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
-    slug: "claude-opus-5",
+    slug: DROID_DEFAULT_MODEL,
     name: "Claude Opus 5",
     isCustom: false,
     isDefault: true,
@@ -118,6 +119,7 @@ export function buildDroidDiscoveredModels(
         name: model.displayName?.trim() || slug,
         ...(model.shortDisplayName?.trim() ? { shortName: model.shortDisplayName.trim() } : {}),
         isCustom: false,
+        ...(slug === DROID_DEFAULT_MODEL ? { isDefault: true } : {}),
         capabilities: reasoningEffortCapabilities(model),
       };
     })

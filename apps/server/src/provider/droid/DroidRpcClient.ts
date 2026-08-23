@@ -1,5 +1,4 @@
 import * as Cause from "effect/Cause";
-import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -27,6 +26,7 @@ import {
 
 const defaultRequestTimeoutMs = 30_000;
 const gracefulShutdownTimeout = Duration.seconds(2);
+const timedOutRequestRetentionLimit = 256;
 
 export interface DroidRpcSpawnInput {
   readonly command: string;
@@ -41,20 +41,55 @@ export interface DroidProcessExit {
   readonly description: string;
 }
 
-export class DroidRpcSpawnError extends Data.TaggedError("DroidRpcSpawnError")<{
-  readonly command: string;
-  readonly cause: unknown;
-}> {}
+export class DroidRpcSpawnError extends Schema.TaggedErrorClass<DroidRpcSpawnError>()(
+  "DroidRpcSpawnError",
+  {
+    command: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message() {
+    return `Failed to spawn Droid process for command: ${this.command}`;
+  }
+}
 
-export class DroidRpcError extends Data.TaggedError("DroidRpcError")<{
-  readonly kind: "encode" | "write" | "timeout" | "rpc" | "process-exit" | "duplicate-response";
-  readonly message: string;
-  readonly method?: string;
-  readonly requestId?: string;
-  readonly code?: number;
-  readonly data?: unknown;
-  readonly cause?: unknown;
-}> {}
+export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("DroidRpcError", {
+  kind: Schema.Literals([
+    "encode",
+    "write",
+    "timeout",
+    "rpc",
+    "process-exit",
+    "duplicate-response",
+  ]),
+  method: Schema.optionalKey(Schema.String),
+  requestId: Schema.optionalKey(Schema.String),
+  code: Schema.optionalKey(Schema.Number),
+  data: Schema.optionalKey(Schema.Unknown),
+  cause: Schema.optionalKey(Schema.Defect()),
+  rpcMessage: Schema.optionalKey(Schema.String),
+  timeoutMs: Schema.optionalKey(Schema.Number),
+  exitDescription: Schema.optionalKey(Schema.String),
+}) {
+  override get message() {
+    switch (this.kind) {
+      case "encode":
+        return "Failed to encode Droid JSON-RPC message";
+      case "write":
+        return "Failed to write to Droid process stdin because it is closed";
+      case "timeout":
+        return `Droid request ${this.method} timed out after ${this.timeoutMs}ms`;
+      case "rpc":
+        return this.rpcMessage ?? "Droid returned an invalid JSON-RPC error response";
+      case "process-exit":
+        return this.requestId === undefined
+          ? `Cannot start Droid request ${this.method}: ${this.exitDescription}`
+          : `Droid process exited while ${this.method} was pending`;
+      case "duplicate-response":
+        return `Droid request ${this.method} responded after timing out`;
+    }
+  }
+}
 
 export interface DroidRpcDiagnostic {
   readonly level: "warning";
@@ -185,6 +220,38 @@ interface TimedOutRequest {
 
 type RequestState = PendingRequest | TimedOutRequest;
 
+function markRequestTimedOut(
+  pending: ReadonlyMap<string, RequestState>,
+  requestId: string,
+  method: string,
+): ReadonlyMap<string, RequestState> {
+  const next = new Map(pending);
+  next.delete(requestId);
+  next.set(requestId, { _tag: "TimedOut", method });
+
+  let timedOutCount = 0;
+  for (const request of next.values()) {
+    if (request._tag === "TimedOut") {
+      timedOutCount += 1;
+    }
+  }
+  if (timedOutCount <= timedOutRequestRetentionLimit) {
+    return next;
+  }
+
+  for (const [retainedRequestId, request] of next) {
+    if (request._tag !== "TimedOut") {
+      continue;
+    }
+    next.delete(retainedRequestId);
+    timedOutCount -= 1;
+    if (timedOutCount <= timedOutRequestRetentionLimit) {
+      break;
+    }
+  }
+  return next;
+}
+
 type DroidRpcLifecycle =
   | {
       readonly _tag: "Running";
@@ -209,7 +276,7 @@ function jsonRpcErrorFromMessage(error: unknown, method: string, requestId: stri
   if (Predicate.isObject(error) && typeof error.message === "string") {
     return new DroidRpcError({
       kind: "rpc",
-      message: error.message,
+      rpcMessage: error.message,
       method,
       requestId,
       ...(typeof error.code === "number" ? { code: error.code } : {}),
@@ -218,7 +285,6 @@ function jsonRpcErrorFromMessage(error: unknown, method: string, requestId: stri
   }
   return new DroidRpcError({
     kind: "rpc",
-    message: "Droid returned an invalid JSON-RPC error response",
     method,
     requestId,
     data: error,
@@ -290,7 +356,6 @@ export const makeDroidRpcClient = (
           (cause) =>
             new DroidRpcError({
               kind: "encode",
-              message: "Failed to encode Droid JSON-RPC message",
               cause,
             }),
         ),
@@ -301,7 +366,6 @@ export const makeDroidRpcClient = (
             : Effect.fail(
                 new DroidRpcError({
                   kind: "write",
-                  message: "Failed to write to Droid process stdin because it is closed",
                 }),
               ),
         ),
@@ -355,7 +419,6 @@ export const makeDroidRpcClient = (
         if (requestState._tag === "TimedOut") {
           const error = new DroidRpcError({
             kind: "duplicate-response",
-            message: `Droid request ${requestState.method} responded after timing out`,
             method: requestState.method,
             requestId,
           });
@@ -542,9 +605,11 @@ export const makeDroidRpcClient = (
         }),
       ),
       Effect.andThen(
-        Effect.forEach(splitter.end(), handleLine, {
-          discard: true,
-        }),
+        Effect.suspend(() =>
+          Effect.forEach(splitter.end(), handleLine, {
+            discard: true,
+          }),
+        ),
       ),
       Effect.catch((cause) =>
         publishDiagnostic({
@@ -577,12 +642,9 @@ export const makeDroidRpcClient = (
     ): DroidRpcError =>
       new DroidRpcError({
         kind: "process-exit",
-        message:
-          requestId === undefined
-            ? `Cannot start Droid request ${method}: ${exit.description}`
-            : `Droid process exited while ${method} was pending`,
         method,
         ...(requestId === undefined ? {} : { requestId }),
+        ...(requestId === undefined ? { exitDescription: exit.description } : {}),
         data: exit,
       });
 
@@ -704,18 +766,22 @@ export const makeDroidRpcClient = (
                     ) {
                       return [false, state] as const;
                     }
-                    const next = new Map(state.pending);
-                    next.set(requestId, { _tag: "TimedOut", method });
-                    return [true, { ...state, pending: next }] as const;
+                    return [
+                      true,
+                      {
+                        ...state,
+                        pending: markRequestTimedOut(state.pending, requestId, method),
+                      },
+                    ] as const;
                   }).pipe(
                     Effect.flatMap((markedTimedOut) =>
                       markedTimedOut
                         ? Effect.fail(
                             new DroidRpcError({
                               kind: "timeout",
-                              message: `Droid request ${method} timed out after ${timeoutMs}ms`,
                               method,
                               requestId,
+                              timeoutMs,
                             }),
                           )
                         : Deferred.await(deferred),

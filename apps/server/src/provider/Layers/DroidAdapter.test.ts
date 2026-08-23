@@ -172,6 +172,152 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("closes incomplete streamed and tool items before terminal settlement", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-incomplete-items");
+      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock incomplete items",
+        attachments: [],
+      });
+      const terminal = yield* Deferred.await(turnCompleted);
+      const turnEvents = eventsForThread(runtimeEvents, threadId).filter(
+        (event) => event.turnId !== undefined && String(event.turnId) === String(sentTurn.turnId),
+      );
+      const terminalIndex = turnEvents.findIndex((event) => event === terminal);
+      const started = turnEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.started" }> =>
+          event.type === "item.started",
+      );
+      const completed = turnEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed",
+      );
+
+      assert.deepEqual(
+        started.map((event) => [String(event.itemId), event.payload.itemType]),
+        [
+          [`reasoning:assistant-${String(sentTurn.turnId)}`, "reasoning"],
+          [`msg:assistant-${String(sentTurn.turnId)}`, "assistant_message"],
+          [`incomplete-tool-${String(sentTurn.turnId)}`, "command_execution"],
+        ],
+      );
+      assert.deepEqual(
+        completed.map((event) => [String(event.itemId), event.payload.itemType]),
+        started.map((event) => [String(event.itemId), event.payload.itemType]),
+      );
+      assert.isTrue(
+        completed.every(
+          (event) => turnEvents.findIndex((candidate) => candidate === event) < terminalIndex,
+        ),
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps tool-use names isolated between concurrent Droid sessions", () =>
+    Effect.gen(function* () {
+      const firstThreadId = ThreadId.make("droid-shared-tool-first");
+      const secondThreadId = ThreadId.make("droid-shared-tool-second");
+      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const firstToolStarted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
+      const firstTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const secondTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "item.started" &&
+              String(event.threadId) === String(firstThreadId) &&
+              String(event.itemId) === "shared-tool-use"
+              ? Deferred.succeed(firstToolStarted, event).pipe(Effect.asVoid)
+              : event.type === "turn.completed" && String(event.threadId) === String(firstThreadId)
+                ? Deferred.succeed(firstTurnCompleted, event).pipe(Effect.asVoid)
+                : event.type === "turn.completed" &&
+                    String(event.threadId) === String(secondThreadId)
+                  ? Deferred.succeed(secondTurnCompleted, event).pipe(Effect.asVoid)
+                  : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: firstThreadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.startSession({
+        threadId: secondThreadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: firstThreadId,
+        input: "mock delayed shared tool",
+        attachments: [],
+      });
+      yield* Deferred.await(firstToolStarted);
+
+      yield* adapter.sendTurn({
+        threadId: secondThreadId,
+        input: "mock shared tool execute",
+        attachments: [],
+      });
+      yield* Deferred.await(secondTurnCompleted);
+
+      yield* adapter.sendTurn({
+        threadId: firstThreadId,
+        input: "mock release shared tool",
+        attachments: [],
+      });
+      yield* Deferred.await(firstTurnCompleted);
+
+      const firstToolCompleted = eventsForThread(runtimeEvents, firstThreadId).find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed" && String(event.itemId) === "shared-tool-use",
+      );
+      assert.equal(firstToolCompleted?.payload.itemType, "dynamic_tool_call");
+      assert.equal(firstToolCompleted?.payload.title, "Read");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(firstThreadId);
+      yield* adapter.stopSession(secondThreadId);
+    }),
+  );
+
   it.effect("round-trips an approved Droid permission and completes the turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-approved");
@@ -477,6 +623,59 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("resets a resumed spec session before sending a normal turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-resume-spec-reset");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_LOAD_IN_SPEC_MODE: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+      });
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock report interaction mode",
+        attachments: [],
+      });
+      yield* Deferred.await(turnCompleted);
+
+      const assistantText = eventsForThread(runtimeEvents, threadId)
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" &&
+            event.turnId !== undefined &&
+            String(event.turnId) === String(sentTurn.turnId) &&
+            event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta)
+        .join("");
+      assert.equal(assistantText, "auto");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("rejects an unknown Droid resume cursor with a typed process error", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-unknown");
@@ -496,6 +695,32 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
         assert.include(error.detail, "Mock session not found");
+      }
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("fails resume when approval-required settings cannot be reasserted", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-resume-settings-failure");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_FAIL_UPDATE_SETTINGS: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      const error = yield* Effect.flip(
+        adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("droid"),
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+        }),
+      );
+
+      assert.equal(error._tag, "ProviderAdapterProcessError");
+      if (error._tag === "ProviderAdapterProcessError") {
+        assert.include(error.detail, "Mock settings update failure");
       }
       assert.isFalse(yield* adapter.hasSession(threadId));
     }),
@@ -1003,10 +1228,12 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
-  it.effect("rebuilds rollback anchors from a freshly resumed Droid session", () =>
+  it.effect("refuses to guess rollback anchors from resumed steering messages", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-rollback");
-      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_LOAD_STEERING_MESSAGES: "1" }),
+      );
       const adapter = yield* makeTestAdapter(wrapperPath);
 
       yield* adapter.startSession({
@@ -1016,14 +1243,12 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         runtimeMode: "full-access",
         resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
       });
-      const snapshot = yield* adapter.rollbackThread(threadId, 1);
-      const sessions = yield* adapter.listSessions();
+      const error = yield* Effect.flip(adapter.rollbackThread(threadId, 1));
 
-      assert.deepEqual(snapshot.turns, []);
-      assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 1,
-        sessionId: "mock-session-rewound",
-      });
+      assert.equal(error._tag, "ProviderAdapterRequestError");
+      if (error._tag === "ProviderAdapterRequestError") {
+        assert.include(error.detail, "only 0 tracked in this session");
+      }
 
       yield* adapter.stopSession(threadId);
     }),
