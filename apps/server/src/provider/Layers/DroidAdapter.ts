@@ -24,7 +24,6 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
-import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -78,6 +77,18 @@ export interface DroidAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly instanceId?: ProviderInstanceId;
+  /** Test-only visibility into adapter-owned collections. */
+  readonly registerDebugStateReader?: (
+    read: (threadId: ThreadId) => Effect.Effect<{
+      readonly threadLockCount: number;
+      readonly interruptedTurnCount: number;
+    }>,
+  ) => void;
+}
+
+interface ThreadLockEntry {
+  readonly semaphore: Semaphore.Semaphore;
+  readonly references: number;
 }
 
 interface PendingApproval {
@@ -131,6 +142,7 @@ interface DroidSessionContext {
   specSuccessorSessionId: string | undefined;
   /** Live-context meter from the most recent session_token_usage_changed. */
   lastCallTokenUsage: DroidLastCallTokenUsage | undefined;
+  lastEmittedTokenUsage: ThreadTokenUsageSnapshot | undefined;
   currentModelId: string | undefined;
   currentReasoningEffort: string | undefined;
   currentInteractionMode: "auto" | "spec";
@@ -245,13 +257,14 @@ export function droidTokenUsageSnapshot(
   const inputTokens = usage.inputTokens ?? 0;
   const cachedInputTokens = usage.cacheReadTokens ?? 0;
   const outputTokens = usage.outputTokens ?? 0;
-  const totalProcessedTokens = inputTokens + cachedInputTokens + outputTokens;
+  const usedTokens = inputTokens + cachedInputTokens + outputTokens;
+  const totalProcessedTokens = usedTokens + (usage.cacheCreationTokens ?? 0);
   const lastUsedTokens =
     lastCall === undefined
       ? undefined
       : lastCall.inputTokens + lastCall.cacheReadTokens + (lastCall.outputTokens ?? 0);
   return {
-    usedTokens: lastUsedTokens ?? totalProcessedTokens,
+    usedTokens: lastUsedTokens ?? usedTokens,
     totalProcessedTokens,
     inputTokens,
     cachedInputTokens,
@@ -267,6 +280,26 @@ export function droidTokenUsageSnapshot(
       : {}),
     compactsAutomatically: true,
   };
+}
+
+function droidTokenUsageSnapshotsEqual(
+  left: ThreadTokenUsageSnapshot | undefined,
+  right: ThreadTokenUsageSnapshot,
+): boolean {
+  return (
+    left !== undefined &&
+    left.usedTokens === right.usedTokens &&
+    left.totalProcessedTokens === right.totalProcessedTokens &&
+    left.inputTokens === right.inputTokens &&
+    left.cachedInputTokens === right.cachedInputTokens &&
+    left.outputTokens === right.outputTokens &&
+    left.reasoningOutputTokens === right.reasoningOutputTokens &&
+    left.lastUsedTokens === right.lastUsedTokens &&
+    left.lastInputTokens === right.lastInputTokens &&
+    left.lastCachedInputTokens === right.lastCachedInputTokens &&
+    left.lastOutputTokens === right.lastOutputTokens &&
+    left.compactsAutomatically === right.compactsAutomatically
+  );
 }
 
 type DroidTurnOutcome =
@@ -358,7 +391,15 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     // threads whose startSession is still in flight (not yet in `sessions`).
     let closing = false;
     const startingThreads = new Set<ThreadId>();
-    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
+    const threadLocksRef = yield* SynchronizedRef.make(new Map<ThreadId, ThreadLockEntry>());
+    options?.registerDebugStateReader?.((threadId) =>
+      SynchronizedRef.get(threadLocksRef).pipe(
+        Effect.map((locks) => ({
+          threadLockCount: locks.size,
+          interruptedTurnCount: sessions.get(threadId)?.interruptedTurnIds.size ?? 0,
+        })),
+      ),
+    );
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -379,26 +420,42 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
 
-    const getThreadSemaphore = (threadId: string) =>
+    const acquireThreadSemaphore = (threadId: ThreadId) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
-        const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
-          current.get(threadId),
+        const existing = current.get(threadId);
+        if (existing !== undefined) {
+          const next = new Map(current);
+          next.set(threadId, { ...existing, references: existing.references + 1 });
+          return Effect.succeed([existing.semaphore, next] as const);
+        }
+        return Semaphore.make(1).pipe(
+          Effect.map((semaphore) => {
+            const next = new Map(current);
+            next.set(threadId, { semaphore, references: 1 });
+            return [semaphore, next] as const;
+          }),
         );
-        return Option.match(existing, {
-          onNone: () =>
-            Semaphore.make(1).pipe(
-              Effect.map((semaphore) => {
-                const next = new Map(current);
-                next.set(threadId, semaphore);
-                return [semaphore, next] as const;
-              }),
-            ),
-          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
-        });
       });
 
-    const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
-      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
+    const releaseThreadSemaphore = (threadId: ThreadId) =>
+      SynchronizedRef.update(threadLocksRef, (current) => {
+        const existing = current.get(threadId);
+        if (existing === undefined) return current;
+        const next = new Map(current);
+        if (existing.references === 1 && !sessions.has(threadId)) {
+          next.delete(threadId);
+        } else {
+          next.set(threadId, { ...existing, references: existing.references - 1 });
+        }
+        return next;
+      });
+
+    const withThreadLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+      Effect.acquireUseRelease(
+        acquireThreadSemaphore(threadId),
+        (semaphore) => semaphore.withPermit(effect),
+        () => releaseThreadSemaphore(threadId),
+      );
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
       Effect.gen(function* () {
@@ -487,7 +544,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         readonly itemType: "assistant_message" | "reasoning";
         readonly streamKind: "assistant_text" | "reasoning_text";
         readonly delta: string;
-        readonly rawPayload: unknown;
       },
     ) =>
       Effect.gen(function* () {
@@ -511,11 +567,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           turnId,
           itemId: RuntimeItemId.make(input.itemId),
           payload: { streamKind: input.streamKind, delta: input.delta },
-          raw: {
-            source: "droid.jsonrpc.notification",
-            method: "droid.session_notification",
-            payload: input.rawPayload,
-          },
         });
       });
 
@@ -524,15 +575,20 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       usage: DroidTokenUsage,
       lastCall?: DroidLastCallTokenUsage,
     ) =>
-      Effect.flatMap(makeEventStamp(), (stamp) =>
-        offerRuntimeEvent({
+      Effect.gen(function* () {
+        const snapshot = droidTokenUsageSnapshot(usage, lastCall);
+        if (droidTokenUsageSnapshotsEqual(ctx.lastEmittedTokenUsage, snapshot)) {
+          return;
+        }
+        yield* offerRuntimeEvent({
           type: "thread.token-usage.updated",
-          ...stamp,
+          ...(yield* makeEventStamp()),
           provider: PROVIDER,
           threadId: ctx.threadId,
-          payload: { usage: droidTokenUsageSnapshot(usage, lastCall) },
-        }),
-      );
+          payload: { usage: snapshot },
+        });
+        ctx.lastEmittedTokenUsage = snapshot;
+      });
 
     const completeAllOpenItems = (
       ctx: DroidSessionContext,
@@ -622,6 +678,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         Effect.gen(function* () {
           const live = sessions.get(ctx.threadId);
           if (!live || live.stopped || live.droidSessionId !== ctx.droidSessionId) return;
+          const turnId = live.activeTurnId ?? live.session.activeTurnId;
           yield* emitTokenUsage(
             live,
             notification.cumulativeTokenUsage ?? notification.tokenUsage,
@@ -660,7 +717,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             live.pendingTurnMessageIds.clear();
             live.persistedPendingTurnMessageIds.clear();
           }
-          const turnId = live.activeTurnId ?? live.session.activeTurnId;
           if (turnId === undefined) return;
           yield* settleTurn(live, turnId, droidTurnOutcomeForReason(notification.reason));
         }),
@@ -777,7 +833,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               itemType: "assistant_message",
               streamKind: "assistant_text",
               delta: notification.textDelta,
-              rawPayload: undefined,
             });
             return;
           case "assistant_text_complete":
@@ -794,7 +849,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               itemType: "reasoning",
               streamKind: "reasoning_text",
               delta: notification.textDelta,
-              rawPayload: undefined,
             });
             return;
           case "thinking_text_complete":
@@ -1286,6 +1340,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             specSuccessorSessionId: undefined,
             lastCallTokenUsage:
               initialized.kind === "loaded" ? initialized.result.lastCallTokenUsage : undefined,
+            lastEmittedTokenUsage: undefined,
             currentModelId: requestedModelId,
             currentReasoningEffort: requestedEffort,
             currentInteractionMode: "auto",
@@ -1510,6 +1565,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           };
 
           if (steeringTurnId === undefined) {
+            ctx.lastEmittedTokenUsage = undefined;
             // Track the turn here, not from create_message notifications, so
             // rewind anchoring stays 1:1 with t3's turn count.
             ctx.turns.push({ id: turnId, items: [] });
@@ -1596,12 +1652,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             yield* Effect.ignore(requestViaRpc(ctx, "droid.interrupt_session", {}));
             if (interruptedTurnId !== undefined) {
               // Settle immediately; the late cancelled completion notification
-              // is dropped via interruptedTurnIds.
+              // is dropped by settleTurn's cleared-active-turn guard.
               yield* settleTurn(ctx, interruptedTurnId, {
                 state: "cancelled",
                 stopReason: "cancelled",
               });
-              ctx.interruptedTurnIds.add(interruptedTurnId);
+              ctx.interruptedTurnIds.delete(interruptedTurnId);
             }
           }),
         );

@@ -23,7 +23,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
-import { makeDroidAdapter } from "./DroidAdapter.ts";
+import { droidTokenUsageSnapshot, makeDroidAdapter } from "./DroidAdapter.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 
@@ -50,11 +50,37 @@ const droidAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-droid-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-const makeTestAdapter = (binaryPath: string) =>
-  makeDroidAdapter(decodeDroidSettings({ binaryPath })).pipe(Effect.orDie);
+const makeTestAdapter = (binaryPath: string, options?: Parameters<typeof makeDroidAdapter>[1]) =>
+  makeDroidAdapter(decodeDroidSettings({ binaryPath }), options).pipe(Effect.orDie);
 
 const eventsForThread = (events: ReadonlyArray<ProviderRuntimeEvent>, threadId: ThreadId) =>
   events.filter((event) => String(event.threadId) === String(threadId));
+
+it("counts cache creation as processed spend but not live context", () => {
+  const usage = {
+    inputTokens: 20,
+    outputTokens: 8,
+    cacheCreationTokens: 6,
+    cacheReadTokens: 4,
+    thinkingTokens: 3,
+  };
+  assert.deepInclude(droidTokenUsageSnapshot(usage), {
+    usedTokens: 32,
+    totalProcessedTokens: 38,
+  });
+  assert.deepInclude(
+    droidTokenUsageSnapshot(usage, {
+      inputTokens: 7,
+      cacheReadTokens: 2,
+      outputTokens: 3,
+    }),
+    {
+      usedTokens: 12,
+      totalProcessedTokens: 38,
+      lastUsedTokens: 12,
+    },
+  );
+});
 
 it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("maps a Droid turn to ordered reasoning, assistant, usage, and completion events", () =>
@@ -121,19 +147,19 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           "turn.completed",
         ],
       );
+      const contentDeltas = turnEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+          event.type === "content.delta",
+      );
       assert.deepEqual(
-        turnEvents
-          .filter(
-            (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
-              event.type === "content.delta",
-          )
-          .map((event) => [event.payload.streamKind, event.payload.delta]),
+        contentDeltas.map((event) => [event.payload.streamKind, event.payload.delta]),
         [
           ["reasoning_text", "Mock thinking"],
           ["assistant_text", "hello from "],
           ["assistant_text", "droid mock"],
         ],
       );
+      assert.isTrue(contentDeltas.every((event) => event.raw === undefined));
       const startedItems = turnEvents.filter(
         (event): event is Extract<ProviderRuntimeEvent, { type: "item.started" }> =>
           event.type === "item.started",
@@ -149,9 +175,13 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
           event.type === "thread.token-usage.updated",
       );
+      assert.lengthOf(
+        threadEvents.filter((event) => event.type === "thread.token-usage.updated"),
+        1,
+      );
       assert.deepEqual(usage?.payload.usage, {
         usedTokens: 12,
-        totalProcessedTokens: 32,
+        totalProcessedTokens: 33,
         inputTokens: 20,
         cachedInputTokens: 4,
         outputTokens: 8,
@@ -169,6 +199,93 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("emits terminal usage when no usage notification arrived", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const threadId = ThreadId.make("droid-usage-terminal-fallback");
+      const turnCompleted = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "fallback usage", attachments: [] });
+      yield* Deferred.await(turnCompleted);
+
+      assert.lengthOf(
+        eventsForThread(runtimeEvents, threadId).filter(
+          (event) => event.type === "thread.token-usage.updated",
+        ),
+        1,
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("reaps thread locks after session teardown and failed startup", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const failingWrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_FAIL_INIT: "1" }),
+      );
+      let readDebugState = (_threadId: ThreadId) =>
+        Effect.succeed({ threadLockCount: -1, interruptedTurnCount: -1 });
+      let readFailingDebugState = (_threadId: ThreadId) =>
+        Effect.succeed({ threadLockCount: -1, interruptedTurnCount: -1 });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        registerDebugStateReader: (read) => {
+          readDebugState = read;
+        },
+      });
+      const failingAdapter = yield* makeTestAdapter(failingWrapperPath, {
+        registerDebugStateReader: (read) => {
+          readFailingDebugState = read;
+        },
+      });
+      const threadId = ThreadId.make("droid-thread-lock-reaped");
+      const failedThreadId = ThreadId.make("droid-failed-thread-lock-reaped");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      assert.equal((yield* readDebugState(threadId)).threadLockCount, 1);
+      yield* adapter.stopSession(threadId);
+      assert.equal((yield* readDebugState(threadId)).threadLockCount, 0);
+
+      yield* Effect.flip(
+        failingAdapter.startSession({
+          threadId: failedThreadId,
+          provider: ProviderDriverKind.make("droid"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        }),
+      );
+      assert.equal((yield* readFailingDebugState(failedThreadId)).threadLockCount, 0);
     }),
   );
 
@@ -519,7 +636,13 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const wrapperPath = yield* Effect.promise(() =>
         makeMockDroidWrapper({ T3_DROID_MOCK_HANG_TURN: "1" }),
       );
-      const adapter = yield* makeTestAdapter(wrapperPath);
+      let readDebugState = (_threadId: ThreadId) =>
+        Effect.succeed({ threadLockCount: -1, interruptedTurnCount: -1 });
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        registerDebugStateReader: (read) => {
+          readDebugState = read;
+        },
+      });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const assistantCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
@@ -560,6 +683,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(String(terminal.turnId), String(sentTurn.turnId));
       assert.equal(terminal.payload.state, "cancelled");
       assert.equal(terminal.payload.stopReason, "cancelled");
+      assert.equal((yield* readDebugState(threadId)).interruptedTurnCount, 0);
       assert.lengthOf(
         threadEvents.filter(
           (event) =>
@@ -1105,7 +1229,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       assert.deepInclude(compactedUsage?.payload.usage, {
         usedTokens: 8,
-        totalProcessedTokens: 32,
+        totalProcessedTokens: 33,
         lastUsedTokens: 8,
         lastInputTokens: 5,
         lastCachedInputTokens: 1,

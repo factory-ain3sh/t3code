@@ -12,6 +12,7 @@ const loadInSpecMode = process.env.T3_DROID_MOCK_LOAD_IN_SPEC_MODE === "1";
 const loadSteeringMessages = process.env.T3_DROID_MOCK_LOAD_STEERING_MESSAGES === "1";
 const exitMidTurn = process.env.T3_DROID_MOCK_EXIT_MID_TURN === "1";
 const emitUnknownNotification = process.env.T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION === "1";
+const omitUsageNotification = process.env.T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION === "1";
 
 const initializedSessionId = "mock-session-1";
 const knownLoadSessionId = "mock-session-known";
@@ -138,17 +139,19 @@ function emitTurnCompleted(reason: string, turnId: string): void {
     return;
   }
   activeTurn.completed = true;
-  notify({
-    type: "session_token_usage_changed",
-    sessionId: currentSessionId,
-    tokenUsage,
-    inclusiveTokenUsage: tokenUsage,
-    lastCallTokenUsage: {
-      inputTokens: 7,
-      cacheReadTokens: 2,
-      outputTokens: 3,
-    },
-  });
+  if (!omitUsageNotification) {
+    notify({
+      type: "session_token_usage_changed",
+      sessionId: currentSessionId,
+      tokenUsage,
+      inclusiveTokenUsage: tokenUsage,
+      lastCallTokenUsage: {
+        inputTokens: 7,
+        cacheReadTokens: 2,
+        outputTokens: 3,
+      },
+    });
+  }
   emitTerminalForSession(currentSessionId, reason, turnId);
   notify({
     type: "droid_working_state_changed",
@@ -623,10 +626,6 @@ async function handleRequest(message: {
       }
       respond(message.id, {});
       return;
-    case "droid.close_session":
-    case "droid.resolve_queued_user_message":
-      respond(message.id, {});
-      return;
     case "droid.update_session_settings":
       if (failUpdateSettings) {
         fail(message.id, -32603, "Mock settings update failure");
@@ -663,13 +662,6 @@ async function handleRequest(message: {
           },
         ],
         projectAvailable: true,
-      });
-      return;
-    case "droid.get_rewind_info":
-      respond(message.id, {
-        availableFiles: [{ filePath: "README.md", contentHash: "mock-hash", size: 12 }],
-        createdFiles: [{ filePath: "new.txt" }],
-        evictedFiles: [],
       });
       return;
     case "droid.execute_rewind":
@@ -736,11 +728,7 @@ input.on("line", (line) => {
   if (line.trim().length === 0) {
     return;
   }
-  try {
-    handleMessage(JSON.parse(line));
-  } catch {
-    // Invalid client lines are ignored by the mock.
-  }
+  handleMessage(JSON.parse(line));
 });
 
 input.once("close", () => {
