@@ -96,9 +96,9 @@ final class WebSocketRPCRaceTests: XCTestCase {
         await client.stop()
     }
 
-    func testSubscriptionOverflowReconnectsWithoutAcknowledgingDroppedEvents() async {
+    func testSubscriptionOverflowReconnectsWithoutAcknowledgingOrReplayingDroppedEvents() async throws {
         let overflowing = OverflowingSubscriptionConnection()
-        let recovered = BlockingReceiveConnection()
+        let recovered = AutoReplyConnection()
         let connector = SequencedConnector(connections: [overflowing, recovered])
         let client = WebSocketRPCClient(
             connector: connector,
@@ -110,9 +110,28 @@ final class WebSocketRPCRaceTests: XCTestCase {
         let stream = await client.subscribe("thread.events", as: JSONValue.self)
         await connector.waitUntilConnectionCount(2)
 
+        var iterator = stream.makeAsyncIterator()
+        let firstValue = try await iterator.next()
+        let secondValue = try await iterator.next()
+        XCTAssertEqual(firstValue, .string("first"))
+        XCTAssertEqual(secondValue, .string("second"))
+        do {
+            _ = try await iterator.next()
+            XCTFail("An overflowing subscription must finish with its protocol error.")
+        } catch let error as RPCError {
+            guard case .protocolViolation = error else {
+                await client.stop()
+                return XCTFail("Unexpected RPC error: \(error)")
+            }
+        }
+
         let acknowledgementCount = await overflowing.acknowledgementCount()
         XCTAssertEqual(acknowledgementCount, 0)
-        _ = stream
+
+        let response = try await client.request("server.afterOverflow", as: JSONValue.self)
+        XCTAssertEqual(response, .object([:]))
+        let recoveredRequestCount = await recovered.sentRequestCount()
+        XCTAssertEqual(recoveredRequestCount, 1, "A failed stream must not resubscribe.")
         await client.stop()
     }
 

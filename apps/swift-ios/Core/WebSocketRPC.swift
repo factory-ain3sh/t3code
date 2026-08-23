@@ -606,9 +606,13 @@ public actor WebSocketRPCClient {
                 case .enqueued:
                     continue
                 case .dropped:
-                    throw RPCError.protocolViolation(
+                    let error = RPCError.protocolViolation(
                         "The live stream exceeded its buffered event limit."
                     )
+                    subscriptionByRequestID.removeValue(forKey: requestID)
+                    subscriptions.removeValue(forKey: subscriptionID)
+                    subscription.finish(error)
+                    throw error
                 case .terminated:
                     await removeSubscription(subscriptionID)
                     return

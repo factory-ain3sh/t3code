@@ -20,6 +20,12 @@ public protocol CredentialStore: Sendable {
     ) async throws -> Bool
 }
 
+protocol KeychainCredentialBackend: Sendable {
+    func credential(for environmentID: String) throws -> EnvironmentCredential?
+    func setCredential(_ credential: EnvironmentCredential, for environmentID: String) throws
+    func removeCredential(for environmentID: String) throws
+}
+
 public enum CredentialStoreError: LocalizedError, Sendable {
     case keychain(OSStatus)
     case invalidData
@@ -37,8 +43,10 @@ public enum CredentialStoreError: LocalizedError, Sendable {
 /// Access tokens are deliberately isolated from the environment catalog so
 /// catalog exports and backups never contain authentication material.
 public actor KeychainCredentialStore: CredentialStore {
+    private static let keychainLock = NSLock()
     private let service: String
     private let accessibility: CFString
+    private let backend: (any KeychainCredentialBackend)?
 
     public init(
         service: String = "codes.t3.swift-ios.environment-credentials",
@@ -46,9 +54,78 @@ public actor KeychainCredentialStore: CredentialStore {
     ) {
         self.service = service
         self.accessibility = accessibility
+        backend = nil
+    }
+
+    init(
+        service: String,
+        backend: any KeychainCredentialBackend,
+        accessibility: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    ) {
+        self.service = service
+        self.accessibility = accessibility
+        self.backend = backend
     }
 
     public func credential(for environmentID: String) throws -> EnvironmentCredential? {
+        try Self.keychainLock.withLock {
+            try readCredential(for: environmentID)
+        }
+    }
+
+    public func setCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) throws {
+        try Self.keychainLock.withLock {
+            try writeCredential(credential, for: environmentID)
+        }
+    }
+
+    public func removeCredential(for environmentID: String) throws {
+        try Self.keychainLock.withLock {
+            try deleteCredential(for: environmentID)
+        }
+    }
+
+    public func swapCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) throws -> EnvironmentCredential? {
+        try Self.keychainLock.withLock {
+            let previousCredential = try readCredential(for: environmentID)
+            try writeCredential(credential, for: environmentID)
+            return previousCredential
+        }
+    }
+
+    public func replaceCredential(
+        _ credential: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) throws -> Bool {
+        try Self.keychainLock.withLock {
+            guard try readCredential(for: environmentID) == expected else { return false }
+            try writeCredential(credential, for: environmentID)
+            return true
+        }
+    }
+
+    public func removeCredential(
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) throws -> Bool {
+        try Self.keychainLock.withLock {
+            guard try readCredential(for: environmentID) == expected else { return false }
+            try deleteCredential(for: environmentID)
+            return true
+        }
+    }
+
+    private func readCredential(for environmentID: String) throws -> EnvironmentCredential? {
+        if let backend {
+            return try backend.credential(for: environmentID)
+        }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -68,10 +145,14 @@ public actor KeychainCredentialStore: CredentialStore {
         }
     }
 
-    public func setCredential(
+    private func writeCredential(
         _ credential: EnvironmentCredential,
         for environmentID: String
     ) throws {
+        if let backend {
+            try backend.setCredential(credential, for: environmentID)
+            return
+        }
         let data = try JSONEncoder.t3.encode(credential)
         let lookup: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -93,7 +174,11 @@ public actor KeychainCredentialStore: CredentialStore {
         }
     }
 
-    public func removeCredential(for environmentID: String) throws {
+    private func deleteCredential(for environmentID: String) throws {
+        if let backend {
+            try backend.removeCredential(for: environmentID)
+            return
+        }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -103,34 +188,6 @@ public actor KeychainCredentialStore: CredentialStore {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw CredentialStoreError.keychain(status)
         }
-    }
-
-    public func swapCredential(
-        _ credential: EnvironmentCredential,
-        for environmentID: String
-    ) throws -> EnvironmentCredential? {
-        let previousCredential = try self.credential(for: environmentID)
-        try setCredential(credential, for: environmentID)
-        return previousCredential
-    }
-
-    public func replaceCredential(
-        _ credential: EnvironmentCredential,
-        ifMatching expected: EnvironmentCredential,
-        for environmentID: String
-    ) throws -> Bool {
-        guard try self.credential(for: environmentID) == expected else { return false }
-        try setCredential(credential, for: environmentID)
-        return true
-    }
-
-    public func removeCredential(
-        ifMatching expected: EnvironmentCredential,
-        for environmentID: String
-    ) throws -> Bool {
-        guard try credential(for: environmentID) == expected else { return false }
-        try removeCredential(for: environmentID)
-        return true
     }
 }
 

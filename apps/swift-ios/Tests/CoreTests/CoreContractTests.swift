@@ -225,6 +225,41 @@ final class CoreContractTests: XCTestCase {
         XCTAssertEqual(fallback, first.id)
     }
 
+    func testKeychainCredentialUpdatesAreAtomicAcrossStoreInstances() async throws {
+        let service = "codes.t3.swift-ios.credential-tests.\(UUID().uuidString)"
+        let environmentID = "shared-environment"
+        let backend = InMemoryKeychainCredentialBackend()
+        let first = KeychainCredentialStore(service: service, backend: backend)
+        let second = KeychainCredentialStore(service: service, backend: backend)
+
+        do {
+            for index in 0..<12 {
+                let original = EnvironmentCredential(accessToken: "original-\(index)")
+                let replacement = EnvironmentCredential(accessToken: "replacement-\(index)")
+                try await first.setCredential(original, for: environmentID)
+
+                async let replaced = first.replaceCredential(
+                    replacement,
+                    ifMatching: original,
+                    for: environmentID
+                )
+                async let removed = second.removeCredential(
+                    ifMatching: original,
+                    for: environmentID
+                )
+                let (didReplace, didRemove) = try await (replaced, removed)
+
+                XCTAssertNotEqual(didReplace, didRemove)
+                let stored = try await first.credential(for: environmentID)
+                XCTAssertEqual(stored, didReplace ? replacement : nil)
+            }
+            try await first.removeCredential(for: environmentID)
+        } catch {
+            try? await first.removeCredential(for: environmentID)
+            throw error
+        }
+    }
+
     func testRuntimeReplacesCachedClientWhenSavedEndpointChanges() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("t3-swift-runtime-\(UUID().uuidString)", isDirectory: true)
@@ -295,6 +330,24 @@ final class CoreContractTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
         let credential = await credentials.credential(for: environment.id)
         XCTAssertNil(credential)
+    }
+}
+
+private final class InMemoryKeychainCredentialBackend: @unchecked Sendable,
+    KeychainCredentialBackend
+{
+    private var credentials: [String: EnvironmentCredential] = [:]
+
+    func credential(for environmentID: String) -> EnvironmentCredential? {
+        credentials[environmentID]
+    }
+
+    func setCredential(_ credential: EnvironmentCredential, for environmentID: String) {
+        credentials[environmentID] = credential
+    }
+
+    func removeCredential(for environmentID: String) {
+        credentials.removeValue(forKey: environmentID)
     }
 }
 
