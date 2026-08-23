@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { DroidSettings } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -11,10 +12,100 @@ import {
   buildDroidDiscoveredModels,
   buildDroidSkills,
   buildDroidSlashCommands,
+  checkDroidProviderStatus,
   detectDroidAuth,
 } from "./DroidProvider.ts";
 
 const decodeModelInfo = Schema.decodeUnknownSync(DroidModelInfoSchema);
+const decodeDroidSettings = Schema.decodeSync(DroidSettings);
+
+const makeInventoryProbeBinary = Effect.fn("makeInventoryProbeBinary")(function* (
+  mode: "concurrent" | "commands-error",
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = yield* fileSystem.makeTempDirectoryScoped({
+    prefix: "t3-droid-provider-",
+  });
+  const binaryPath = path.join(directory, "droid");
+  const script = `#!/usr/bin/env node
+const readline = require("node:readline");
+
+if (process.argv[2] === "--version") {
+  process.stdout.write("droid 0.200.0\\n");
+  process.exit(0);
+}
+
+const mode = "${mode}";
+const pending = new Map();
+let releasedRequestCount;
+
+function write(message) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", type: "response", ...message }) + "\\n");
+}
+
+function resultFor(method) {
+  switch (method) {
+    case "droid.list_models":
+      return {
+        models: [
+          {
+            id: mode === "concurrent" ? "concurrent-" + releasedRequestCount : "discovered-model",
+            displayName: "Discovered Model"
+          }
+        ]
+      };
+    case "droid.list_commands":
+      return { commands: [{ name: "review", description: "Review changes" }] };
+    case "droid.list_skills":
+      return {
+        skills: [
+          {
+            name: "verify",
+            filePath: "/skills/verify/SKILL.md",
+            location: "personal",
+            enabled: true
+          }
+        ]
+      };
+  }
+}
+
+function respond(request) {
+  if (mode === "commands-error" && request.method === "droid.list_commands") {
+    write({ id: request.id, error: { code: -32603, message: "command inventory failed" } });
+    return;
+  }
+  write({ id: request.id, result: resultFor(request.method) });
+}
+
+function handle(request) {
+  if (mode === "commands-error") {
+    respond(request);
+    return;
+  }
+  if (releasedRequestCount !== undefined) {
+    respond(request);
+    return;
+  }
+  pending.set(request.id, request);
+  if (pending.size === 1) {
+    setImmediate(() => {
+      releasedRequestCount = pending.size;
+      for (const pendingRequest of pending.values()) respond(pendingRequest);
+      pending.clear();
+    });
+  }
+}
+
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on("line", (line) => handle(JSON.parse(line)));
+input.once("close", () => process.exit(0));
+`;
+  yield* fileSystem.writeFileString(binaryPath, script);
+  yield* fileSystem.chmod(binaryPath, 0o755);
+  return binaryPath;
+});
 
 describe("buildDroidDiscoveredModels", () => {
   it("keeps enabled models, dedupes ids, and falls back to the id for a display name", () => {
@@ -207,5 +298,87 @@ it.layer(NodeServices.layer)("detectDroidAuth", (it) => {
 
       assert.deepEqual(auth, { status: "unknown" });
     }),
+  );
+});
+
+it.layer(NodeServices.layer)("checkDroidProviderStatus", (it) => {
+  it.effect("issues the three inventory requests concurrently", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const binaryPath = yield* makeInventoryProbeBinary("concurrent");
+        const snapshot = yield* checkDroidProviderStatus(
+          decodeDroidSettings({ enabled: true, binaryPath }),
+          { FACTORY_API_KEY: "test-key", PATH: process.env.PATH },
+        );
+
+        assert.equal(snapshot.status, "ready");
+        assert.deepEqual(
+          snapshot.models.map((model) => model.slug),
+          ["concurrent-3"],
+        );
+        assert.deepEqual(snapshot.slashCommands, [
+          { name: "review", description: "Review changes" },
+        ]);
+        assert.deepEqual(snapshot.skills, [
+          {
+            name: "verify",
+            path: "/skills/verify/SKILL.md",
+            enabled: true,
+            scope: "personal",
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("points a user with no droid binary at the supported installer", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const binaryPath = "/definitely/not/installed/t3-droid";
+        const snapshot = yield* checkDroidProviderStatus(
+          decodeDroidSettings({ enabled: true, binaryPath }),
+          { PATH: process.env.PATH },
+        );
+
+        assert.equal(snapshot.status, "error");
+        assert.equal(snapshot.installed, false);
+        assert.equal(
+          snapshot.message,
+          [
+            `Droid CLI command \`${binaryPath}\` was not found.`,
+            `Install the Droid CLI, make sure \`${binaryPath}\` is on PATH, then restart T3 Code.`,
+            "See https://docs.factory.ai/cli/getting-started/quickstart.",
+          ].join(" "),
+        );
+      }),
+    ),
+  );
+
+  it.effect("warns and uses the complete fallback when one inventory request fails", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const binaryPath = yield* makeInventoryProbeBinary("commands-error");
+        const snapshot = yield* checkDroidProviderStatus(
+          decodeDroidSettings({
+            enabled: true,
+            binaryPath,
+            customModels: ["custom:test-model"],
+          }),
+          { FACTORY_API_KEY: "test-key", PATH: process.env.PATH },
+        );
+
+        assert.equal(snapshot.status, "warning");
+        assert.deepEqual(
+          snapshot.models.map((model) => model.slug),
+          ["claude-opus-5", "claude-sonnet-5", "custom:test-model"],
+        );
+        assert.deepEqual(snapshot.slashCommands, []);
+        assert.deepEqual(snapshot.skills, []);
+        assert.equal(
+          snapshot.message,
+          "Droid inventory discovery failed. Using fallback models; slash commands and skills are unavailable.",
+        );
+      }),
+    ),
   );
 });

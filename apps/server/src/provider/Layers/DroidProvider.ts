@@ -215,19 +215,6 @@ export const detectDroidAuth = Effect.fn("detectDroidAuth")(function* (
 });
 
 /**
- * Commands and skills are secondary: an older CLI without the handler must cost us
- * the list, not the whole probe (and with it the live model catalog).
- */
-const optionalInventory = <A, E, R>(label: string, effect: Effect.Effect<ReadonlyArray<A>, E, R>) =>
-  effect.pipe(
-    Effect.catchCause((cause) =>
-      Effect.logWarning(`Droid ${label} discovery failed.`, {
-        errorTag: causeErrorTag(cause),
-      }).pipe(Effect.as<ReadonlyArray<A>>([])),
-    ),
-  );
-
-/**
  * One droid process answers every inventory question. Startup is the expensive part,
  * and `list_models`/`list_commands`/`list_skills` are all session-less handlers
  * (factory-mono streamingJsonRpcExecRunner.ts) resolved against this process's cwd,
@@ -245,20 +232,19 @@ const discoverDroidInventory = (
       env: environment,
     });
 
-    const models = yield* rpc
-      .request("droid.list_models", {})
-      .pipe(Effect.flatMap((result) => decodeInventory(result, "models", decodeModelInfo)));
-    const commands = yield* optionalInventory(
-      "slash command",
-      rpc
-        .request("droid.list_commands", {})
-        .pipe(Effect.flatMap((result) => decodeInventory(result, "commands", decodeCommandInfo))),
-    );
-    const skills = yield* optionalInventory(
-      "skill",
-      rpc
-        .request("droid.list_skills", {})
-        .pipe(Effect.flatMap((result) => decodeInventory(result, "skills", decodeSkillInfo))),
+    const [models, commands, skills] = yield* Effect.all(
+      [
+        rpc
+          .request("droid.list_models", {})
+          .pipe(Effect.flatMap((result) => decodeInventory(result, "models", decodeModelInfo))),
+        rpc
+          .request("droid.list_commands", {})
+          .pipe(Effect.flatMap((result) => decodeInventory(result, "commands", decodeCommandInfo))),
+        rpc
+          .request("droid.list_skills", {})
+          .pipe(Effect.flatMap((result) => decodeInventory(result, "skills", decodeSkillInfo))),
+      ],
+      { concurrency: "unbounded" },
     );
 
     return {
@@ -267,6 +253,15 @@ const discoverDroidInventory = (
       skills: buildDroidSkills(skills),
     };
   }).pipe(Effect.scoped);
+
+const droidCliCommandMissingMessage = (droidSettings: DroidSettings) => {
+  const command = droidSettings.binaryPath || "droid";
+  return [
+    `Droid CLI command \`${command}\` was not found.`,
+    `Install the Droid CLI, make sure \`${command}\` is on PATH, then restart T3 Code.`,
+    "See https://docs.factory.ai/cli/getting-started/quickstart.",
+  ].join(" ");
+};
 
 const runDroidVersionCommand = (
   droidSettings: DroidSettings,
@@ -373,7 +368,7 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
         status: "error",
         auth: { status: "unknown" },
         message: isCommandMissingCause(error)
-          ? "Droid CLI (`droid`) is not installed or not on PATH. Install with `npm install -g @factory/cli`."
+          ? droidCliCommandMissingMessage(droidSettings)
           : "Failed to execute Droid CLI health check.",
       },
     });
@@ -427,21 +422,29 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
     Exit.isSuccess(discoveryExit) && Option.isSome(discoveryExit.value)
       ? discoveryExit.value.value
       : undefined;
+  let inventoryWarning: string | undefined;
   if (inventory === undefined) {
     if (Exit.isFailure(discoveryExit)) {
       yield* Effect.logWarning("Droid inventory discovery failed.", {
         errorTag: causeErrorTag(discoveryExit.cause),
       });
+      inventoryWarning =
+        "Droid inventory discovery failed. Using fallback models; slash commands and skills are unavailable.";
     } else {
       yield* Effect.logWarning(
         `Droid inventory discovery timed out after ${INVENTORY_DISCOVERY_TIMEOUT_MS}ms.`,
       );
+      inventoryWarning = `Droid inventory discovery timed out after ${INVENTORY_DISCOVERY_TIMEOUT_MS}ms. Using fallback models; slash commands and skills are unavailable.`;
     }
   }
   const models =
     inventory !== undefined && inventory.models.length > 0
       ? droidModelsFromSettings(droidSettings.customModels, inventory.models)
       : fallbackModels;
+  let message = inventoryWarning;
+  if (auth.status === "unknown") {
+    message = message ? `${message} ${DROID_LOGIN_MESSAGE}` : DROID_LOGIN_MESSAGE;
+  }
 
   return buildServerProvider({
     presentation: DROID_PRESENTATION,
@@ -452,9 +455,9 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
     probe: {
       installed: true,
       version,
-      status: "ready",
+      status: inventoryWarning ? "warning" : "ready",
       auth,
-      ...(auth.status === "unknown" ? { message: DROID_LOGIN_MESSAGE } : {}),
+      ...(message ? { message } : {}),
     },
   });
 });
