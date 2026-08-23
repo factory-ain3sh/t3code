@@ -26,6 +26,8 @@ const RuntimeEventRawSource = Schema.Union([
   Schema.Literal("claude.sdk.permission"),
   Schema.Literal("codex.sdk.thread-event"),
   Schema.Literal("opencode.sdk.event"),
+  Schema.Literal("droid.jsonrpc.notification"),
+  Schema.Literal("droid.jsonrpc.request"),
   Schema.Literal("acp.jsonrpc"),
   Schema.TemplateLiteral(["acp.", Schema.String, ".extension"]),
 ]);
@@ -138,6 +140,7 @@ export const CanonicalRequestType = Schema.Literals([
   "file_change_approval",
   "apply_patch_approval",
   "exec_command_approval",
+  "plan_approval",
   "tool_user_input",
   "dynamic_tool_call",
   "auth_tokens_refresh",

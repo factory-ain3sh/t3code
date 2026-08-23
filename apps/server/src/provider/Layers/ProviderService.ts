@@ -337,6 +337,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
+  // Adapters can change their resume cursor mid-session (droid compaction and
+  // rewind mint successor sessions). Re-persisting the snapshot when a turn
+  // settles keeps the durable binding pointing at the live conversation.
+  const persistSessionSnapshot = (
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+    instanceId: ProviderInstanceId,
+    threadId: ThreadId,
+  ) =>
+    adapter.listSessions().pipe(
+      Effect.flatMap((activeSessions) => {
+        const live = activeSessions.find((session) => session.threadId === threadId);
+        return live
+          ? upsertSessionBinding({ ...live, providerInstanceId: instanceId }, threadId)
+          : Effect.void;
+      }),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.session.snapshot-persist-failed", { threadId, cause }),
+      ),
+    );
+
   const processRuntimeEvent = (
     source: {
       readonly instanceId: ProviderInstanceId;
@@ -394,6 +414,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               provider: adapter.provider,
             },
             event,
+          ).pipe(
+            Effect.andThen(
+              event.type === "turn.completed"
+                ? persistSessionSnapshot(adapter, id, event.threadId)
+                : Effect.void,
+            ),
           ),
         ).pipe(Effect.forkScoped);
       }
@@ -1103,6 +1129,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.rollback_turns": input.numTurns,
       });
       yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
+      // A rollback can re-anchor the provider on a forked session; persist the
+      // adapter's post-rollback snapshot so the resume cursor follows it.
+      yield* persistSessionSnapshot(routed.adapter, routed.instanceId, routed.threadId);
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         turns: input.numTurns,

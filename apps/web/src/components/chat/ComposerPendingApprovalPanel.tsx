@@ -18,13 +18,17 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
       ? "Command approval"
       : approval.requestKind === "file-read"
         ? "File read approval"
-        : "File change approval";
+        : approval.requestKind === "plan"
+          ? "Plan approval"
+          : "File change approval";
   const detailAriaLabel =
     approval.requestKind === "command"
       ? "Command"
       : approval.requestKind === "file-read"
         ? "File to read"
-        : "File change";
+        : approval.requestKind === "plan"
+          ? "Plan"
+          : "File change";
 
   return (
     <div

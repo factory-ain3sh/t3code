@@ -14,7 +14,7 @@ import * as Order from "effect/Order";
 
 export interface PendingApproval {
   readonly requestId: ApprovalRequestId;
-  readonly requestKind: "command" | "file-read" | "file-change";
+  readonly requestKind: "command" | "file-read" | "file-change" | "plan";
   readonly createdAt: string;
   readonly detail?: string;
 }
@@ -147,6 +147,8 @@ function requestKindFromRequestType(requestType: unknown): PendingApproval["requ
     case "file_change_approval":
     case "apply_patch_approval":
       return "file-change";
+    case "plan_approval":
+      return "plan";
     default:
       return null;
   }
@@ -967,7 +969,8 @@ function extractWorkLogRequestKind(
   if (
     payload?.requestKind === "command" ||
     payload?.requestKind === "file-read" ||
-    payload?.requestKind === "file-change"
+    payload?.requestKind === "file-change" ||
+    payload?.requestKind === "plan"
   ) {
     return payload.requestKind;
   }
@@ -1378,7 +1381,8 @@ export function derivePendingApprovals(
     const requestKind =
       payload?.requestKind === "command" ||
       payload?.requestKind === "file-read" ||
-      payload?.requestKind === "file-change"
+      payload?.requestKind === "file-change" ||
+      payload?.requestKind === "plan"
         ? payload.requestKind
         : requestKindFromRequestType(payload?.requestType);
     const detail = typeof payload?.detail === "string" ? payload.detail : undefined;

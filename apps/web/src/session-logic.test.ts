@@ -130,6 +130,32 @@ describe("derivePendingApprovals", () => {
     ]);
   });
 
+  it("maps plan approval requestType payloads into pending approvals", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "approval-open-plan-approval",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "approval.requested",
+        summary: "Plan approval requested",
+        tone: "approval",
+        payload: {
+          requestId: "req-plan-approval",
+          requestType: "plan_approval",
+          detail: "1. Map plan approvals\n2. Render the approval UI",
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toEqual([
+      {
+        requestId: "req-plan-approval",
+        requestKind: "plan",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        detail: "1. Map plan approvals\n2. Render the approval UI",
+      },
+    ]);
+  });
+
   it("derives dynamic tool requests as actionable generic approvals", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

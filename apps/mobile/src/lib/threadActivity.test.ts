@@ -15,6 +15,7 @@ import {
 import {
   buildPendingUserInputAnswers,
   buildThreadFeed,
+  derivePendingApprovals,
   deriveThreadFeedPresentation,
   isPendingUserInputOptionSelected,
   setPendingUserInputCustomAnswer,
@@ -178,6 +179,34 @@ function makeThread(
     settledAt: input.settledAt ?? null,
   };
 }
+
+describe("derivePendingApprovals", () => {
+  it("maps plan approval requestType payloads into pending approvals", () => {
+    const activities = [
+      makeActivity({
+        id: EventId.make("approval-open-plan-approval"),
+        kind: "approval.requested",
+        summary: "Plan approval requested",
+        tone: "approval",
+        createdAt: "2026-04-01T00:00:01.000Z",
+        payload: {
+          requestId: "req-plan-approval",
+          requestType: "plan_approval",
+          detail: "1. Map plan approvals\n2. Render the approval card",
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toEqual([
+      {
+        requestId: "req-plan-approval",
+        requestKind: "plan",
+        createdAt: "2026-04-01T00:00:01.000Z",
+        detail: "1. Map plan approvals\n2. Render the approval card",
+      },
+    ]);
+  });
+});
 
 describe("buildThreadFeed", () => {
   it("keeps older local feedback before newer messages returned by the server", () => {
