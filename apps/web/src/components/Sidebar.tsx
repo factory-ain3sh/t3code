@@ -2043,20 +2043,9 @@ export default function Sidebar() {
         snapshot != null && (thread.worktreePath === null || snapshot.branch === thread.branch)
           ? snapshot.pr
           : null;
-      // Snooze outranks everything, including a pin: "hide until Tuesday"
-      // temporarily suspends "keep on top". The pin survives underneath —
-      // and so does its pinOrderKey, so on wake the thread reappears at
-      // its exact slot in the pinned block. (For unpinned threads
-      // this is also the snooze-beats-auto-settle rule: the wake time is a
-      // stronger statement about when the thread matters again.)
+      // Snooze outranks settlement and pinning until the thread wakes.
       if (supportsSnooze && effectiveSnoozed(thread, { now: preciseNow })) {
         snoozed.push(thread);
-        // A pin otherwise overrides the lifecycle: pinned threads never
-        // auto-settle out of sight. (The decider clears settled state on
-        // pin and the pin on settle, so pin-vs-settled conflicts only
-        // arise from stale or raced writes.)
-      } else if (thread.pinnedAt != null) {
-        pinned.push(thread);
       } else if (
         supportsSettlement &&
         effectiveSettled(thread, {
@@ -2067,6 +2056,8 @@ export default function Sidebar() {
         })
       ) {
         settled.push(thread);
+      } else if (thread.pinnedAt != null) {
+        pinned.push(thread);
       } else {
         active.push(thread);
       }
