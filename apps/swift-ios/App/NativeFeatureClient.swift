@@ -400,6 +400,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func removeEnvironment(id: String) async throws {
         let removesActiveEnvironment = activeEnvironment?.id == id
+        let environment = try await runtime.environments().first { $0.id == id }
+        if environment?.kind == .managedDPoP {
+            try await runtime.revokeCredential(id: id)
+        }
         try await runtime.remove(id: id)
         if removesActiveEnvironment {
             await clearActiveEnvironment(disconnectClient: false)

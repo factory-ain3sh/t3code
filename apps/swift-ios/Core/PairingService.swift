@@ -77,11 +77,13 @@ public actor PairingService {
             expiresAt: Date().addingTimeInterval(access.expiresIn),
             scopes: access.scope.split(separator: " ").map(String.init)
         )
-        let previousCredential = try await credentialStore.credential(for: environment.id)
         // Store the secret first. A catalog record must never point at a
-        // credential that failed to persist. Restore an existing credential if
-        // updating that environment's catalog entry fails.
-        try await credentialStore.setCredential(credential, for: environment.id)
+        // credential that failed to persist. Capture the previous credential in
+        // the same actor operation so a concurrent refresh cannot be lost.
+        let previousCredential = try await credentialStore.swapCredential(
+            credential,
+            for: environment.id
+        )
         do {
             try await environmentStore.upsert(environment)
             if try await environmentStore.activeEnvironmentID() == nil {
@@ -89,12 +91,16 @@ public actor PairingService {
             }
         } catch {
             if let previousCredential {
-                try? await credentialStore.setCredential(
+                _ = try? await credentialStore.replaceCredential(
                     previousCredential,
+                    ifMatching: credential,
                     for: environment.id
                 )
             } else {
-                try? await credentialStore.removeCredential(for: environment.id)
+                _ = try? await credentialStore.removeCredential(
+                    ifMatching: credential,
+                    for: environment.id
+                )
             }
             throw error
         }

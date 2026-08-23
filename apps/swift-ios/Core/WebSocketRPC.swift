@@ -167,6 +167,12 @@ public actor WebSocketRPCClient {
         let resume: @Sendable (Result<JSONValue, Error>) -> Void
     }
 
+    private enum SubscriptionYieldResult: Sendable {
+        case enqueued
+        case dropped
+        case terminated
+    }
+
     private struct Subscription {
         let tag: String
         let payload: JSONValue
@@ -175,7 +181,7 @@ public actor WebSocketRPCClient {
         /// The connection that assigned `requestID`. Request IDs are reissued
         /// after reconnects, so an Interrupt is only valid on this connection.
         var requestConnectionID: UUID?
-        let yield: @Sendable (JSONValue) -> Bool
+        let yield: @Sendable (JSONValue) -> SubscriptionYieldResult
         let finish: @Sendable (Error?) -> Void
     }
 
@@ -279,7 +285,7 @@ public actor WebSocketRPCClient {
         self.connector = connector
         self.connectionWaitTimeout = connectionWaitTimeout
         self.responseTimeout = responseTimeout
-        self.keepaliveInterval = keepaliveInterval
+        self.keepaliveInterval = keepaliveInterval > .zero ? keepaliveInterval : .seconds(5)
         self.subscriptionBufferLimit = max(1, subscriptionBufferLimit)
         self.reconnectBackoff = reconnectBackoff
         self.endpointProvider = endpointProvider
@@ -360,15 +366,17 @@ public actor WebSocketRPCClient {
                     do {
                         switch continuation.yield(try value.decode(type)) {
                         case .enqueued:
-                            return true
-                        case .dropped, .terminated:
-                            return false
+                            return .enqueued
+                        case .dropped:
+                            return .dropped
+                        case .terminated:
+                            return .terminated
                         @unknown default:
-                            return false
+                            return .dropped
                         }
                     } catch {
                         continuation.finish(throwing: error)
-                        return false
+                        return .terminated
                     }
                 },
                 finish: { error in
@@ -594,10 +602,16 @@ public actor WebSocketRPCClient {
                   let subscription = subscriptions[subscriptionID]
             else { return }
             for value in response.values ?? [] {
-                guard subscription.yield(value) else {
+                switch subscription.yield(value) {
+                case .enqueued:
+                    continue
+                case .dropped:
                     throw RPCError.protocolViolation(
                         "The live stream exceeded its buffered event limit."
                     )
+                case .terminated:
+                    await removeSubscription(subscriptionID)
+                    return
                 }
             }
             try await sendControl("Ack", requestID: requestID)

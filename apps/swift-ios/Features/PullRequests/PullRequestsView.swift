@@ -73,7 +73,7 @@ private final class PullRequestsModel {
             )
             guard !Task.isCancelled, loadGeneration == generation else { return }
             environments = result
-            var seenPullRequestIDs = Set<String>()
+            var seenRowIDs = Set<String>()
             allRows = result.flatMap { environment in
                 (environment.result?.entries ?? []).map {
                     FeaturePullRequestRow(
@@ -83,7 +83,7 @@ private final class PullRequestsModel {
                     )
                 }
             }
-            .filter { seenPullRequestIDs.insert($0.entry.id).inserted }
+            .filter { seenRowIDs.insert($0.id).inserted }
             .sorted { $0.entry.updatedAt > $1.entry.updatedAt }
             applyLocalFilters()
         } catch {
@@ -421,17 +421,13 @@ private final class PullRequestDetailModel {
         isLoadingDiff = true
         do {
             var cursor: String?
-            var patch = ""
-            var omittedChanges = false
+            var pagination = PullRequestDiffPagination()
             repeat {
                 let page = try await client.pullRequestDiff(target, cursor: cursor)
-                patch += page.patch
-                omittedChanges = omittedChanges || page.truncated
-                    || !(page.omittedFileStats ?? []).isEmpty
-                cursor = page.nextCursor
+                cursor = pagination.append(page)
             } while cursor != nil
-            diffFiles = PullRequestDiffParser.parse(patch)
-            isDiffIncomplete = omittedChanges
+            diffFiles = PullRequestDiffParser.parse(pagination.patch)
+            isDiffIncomplete = pagination.isIncomplete
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -461,7 +457,8 @@ private final class PullRequestDetailModel {
         await mutate { try await client.commentOnPullRequest(target, body: body) }
     }
 
-    func review(verdict: PullRequestReviewVerdict, body: String) async {
+    func review(verdict: PullRequestReviewVerdict, body: String) async -> Bool {
+        var submitted = false
         await mutate {
             try await client.submitPullRequestReview(
                 target,
@@ -470,7 +467,9 @@ private final class PullRequestDetailModel {
                 comments: reviewDrafts
             )
             reviewDrafts = []
+            submitted = true
         }
+        return submitted
     }
 
     func reply(threadID: String, body: String) async {
@@ -1166,12 +1165,12 @@ private struct PullRequestReviewSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Submit") {
                         Task {
-                            await model.review(verdict: verdict, body: reviewBody)
-                            if model.errorMessage == nil {
+                            if await model.review(verdict: verdict, body: reviewBody) {
                                 dismiss()
                             }
                         }
                     }
+                    .disabled(model.isActing)
                 }
             }
             .onAppear {
@@ -1324,6 +1323,25 @@ private struct PullRequestDiffSelection: Identifiable {
     var id: String { "\(file.id):\(line.id)" }
     let file: PullRequestDiffFile
     let line: PullRequestDiffLine
+}
+
+struct PullRequestDiffPagination {
+    private(set) var patch = ""
+    private(set) var isIncomplete = false
+    private var seenCursors = Set<String>()
+
+    mutating func append(_ page: PullRequestDiffResult) -> String? {
+        patch += page.patch
+        isIncomplete = isIncomplete || page.truncated
+            || !(page.omittedFileStats ?? []).isEmpty
+
+        guard let cursor = page.nextCursor, !cursor.isEmpty else { return nil }
+        guard seenCursors.insert(cursor).inserted else {
+            isIncomplete = true
+            return nil
+        }
+        return cursor
+    }
 }
 
 enum PullRequestDiffParser {

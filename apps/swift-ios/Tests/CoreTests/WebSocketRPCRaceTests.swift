@@ -79,6 +79,23 @@ final class WebSocketRPCRaceTests: XCTestCase {
         await client.stop()
     }
 
+    func testValidInboundTrafficSatisfiesKeepaliveWithoutPong() async {
+        let connection = SubscriptionTrafficConnection(respondsToPingsWithChunks: true)
+        let client = WebSocketRPCClient(
+            connector: SequencedConnector(connections: [connection]),
+            keepaliveInterval: .milliseconds(10),
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+
+        let stream = await client.subscribe("thread.events", as: JSONValue.self)
+        await connection.waitUntilPingCount(3)
+
+        let isConnected = await client.isConnected()
+        XCTAssertTrue(isConnected, "Valid stream traffic proves that the socket is still alive.")
+        _ = stream
+        await client.stop()
+    }
+
     func testSubscriptionOverflowReconnectsWithoutAcknowledgingDroppedEvents() async {
         let overflowing = OverflowingSubscriptionConnection()
         let recovered = BlockingReceiveConnection()
@@ -96,6 +113,28 @@ final class WebSocketRPCRaceTests: XCTestCase {
         let acknowledgementCount = await overflowing.acknowledgementCount()
         XCTAssertEqual(acknowledgementCount, 0)
         _ = stream
+        await client.stop()
+    }
+
+    func testTerminatedSubscriptionDoesNotDisconnectSharedSocket() async throws {
+        let connection = SubscriptionTrafficConnection(sendsInvalidSubscriptionValue: true)
+        let client = WebSocketRPCClient(
+            connector: SequencedConnector(connections: [connection]),
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+
+        let stream = await client.subscribe("thread.events", as: Int.self)
+        var iterator = stream.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            XCTFail("An invalid stream event must terminate its subscription.")
+        } catch is DecodingError {}
+
+        let wasInterrupted = await connection.waitUntilSubscriptionEnded()
+        XCTAssertTrue(wasInterrupted, "The subscription should end without closing the socket.")
+
+        let response = try await client.request("server.afterSubscriptionFailure", as: JSONValue.self)
+        XCTAssertEqual(response, .object(["ok": .bool(true)]))
         await client.stop()
     }
 
@@ -501,6 +540,122 @@ private actor BlockingReceiveConnection: WebSocketConnection {
     func close() {
         continuation?.resume(throwing: CancellationError())
         continuation = nil
+    }
+}
+
+private actor SubscriptionTrafficConnection: WebSocketConnection {
+    private let respondsToPingsWithChunks: Bool
+    private let sendsInvalidSubscriptionValue: Bool
+    private var subscriptionRequestID: Int?
+    private var queuedResponses: [Data] = []
+    private var receiver: CheckedContinuation<Data, Error>?
+    private var pingCount = 0
+    private var pingWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var subscriptionEnded: Bool?
+    private var subscriptionEndWaiters: [CheckedContinuation<Bool, Never>] = []
+
+    init(
+        respondsToPingsWithChunks: Bool = false,
+        sendsInvalidSubscriptionValue: Bool = false
+    ) {
+        self.respondsToPingsWithChunks = respondsToPingsWithChunks
+        self.sendsInvalidSubscriptionValue = sendsInvalidSubscriptionValue
+    }
+
+    func send(_ data: Data) throws {
+        let envelope = try JSONDecoder.t3.decode(JSONValue.self, from: data)
+        switch envelope["_tag"]?.stringValue {
+        case "Request":
+            guard case let .number(rawID)? = envelope["id"],
+                  let requestID = Int(exactly: rawID) else { return }
+            if envelope["tag"]?.stringValue == "thread.events" {
+                subscriptionRequestID = requestID
+                if sendsInvalidSubscriptionValue {
+                    enqueue(try chunk(requestID: requestID, value: .string("not an integer")))
+                }
+            } else {
+                enqueue(try success(requestID: requestID))
+            }
+        case "Ping":
+            pingCount += 1
+            if respondsToPingsWithChunks, let subscriptionRequestID {
+                enqueue(try chunk(requestID: subscriptionRequestID, value: .string("alive")))
+            }
+            let ready = pingWaiters.filter { pingCount >= $0.0 }
+            pingWaiters.removeAll { pingCount >= $0.0 }
+            ready.forEach { $0.1.resume() }
+        case "Interrupt":
+            finishSubscription(interrupted: true)
+        default:
+            break
+        }
+    }
+
+    func receive() async throws -> Data {
+        if !queuedResponses.isEmpty {
+            return queuedResponses.removeFirst()
+        }
+        return try await withCheckedThrowingContinuation { receiver = $0 }
+    }
+
+    func close() {
+        finishSubscription(interrupted: false)
+        receiver?.resume(throwing: CancellationError())
+        receiver = nil
+    }
+
+    func waitUntilPingCount(_ count: Int) async {
+        guard pingCount < count else { return }
+        await withCheckedContinuation { continuation in
+            pingWaiters.append((count, continuation))
+        }
+    }
+
+    func waitUntilSubscriptionEnded() async -> Bool {
+        if let subscriptionEnded { return subscriptionEnded }
+        return await withCheckedContinuation { continuation in
+            subscriptionEndWaiters.append(continuation)
+        }
+    }
+
+    private func finishSubscription(interrupted: Bool) {
+        guard subscriptionEnded == nil else { return }
+        subscriptionEnded = interrupted
+        let waiters = subscriptionEndWaiters
+        subscriptionEndWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: interrupted) }
+    }
+
+    private func enqueue(_ data: Data) {
+        if let receiver {
+            self.receiver = nil
+            receiver.resume(returning: data)
+        } else {
+            queuedResponses.append(data)
+        }
+    }
+
+    private func chunk(requestID: Int, value: JSONValue) throws -> Data {
+        try JSONEncoder.t3.encode(
+            JSONValue.object([
+                "_tag": .string("Chunk"),
+                "requestId": .number(Double(requestID)),
+                "values": .array([value]),
+            ])
+        )
+    }
+
+    private func success(requestID: Int) throws -> Data {
+        try JSONEncoder.t3.encode(
+            JSONValue.object([
+                "_tag": .string("Exit"),
+                "requestId": .number(Double(requestID)),
+                "exit": .object([
+                    "_tag": .string("Success"),
+                    "value": .object(["ok": .bool(true)]),
+                ]),
+            ])
+        )
     }
 }
 

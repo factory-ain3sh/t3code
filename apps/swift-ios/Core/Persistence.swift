@@ -4,12 +4,20 @@ import Security
 public protocol CredentialStore: Sendable {
     func credential(for environmentID: String) async throws -> EnvironmentCredential?
     func setCredential(_ credential: EnvironmentCredential, for environmentID: String) async throws
+    func swapCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) async throws -> EnvironmentCredential?
     func replaceCredential(
         _ credential: EnvironmentCredential,
         ifMatching expected: EnvironmentCredential,
         for environmentID: String
     ) async throws -> Bool
     func removeCredential(for environmentID: String) async throws
+    func removeCredential(
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) async throws -> Bool
 }
 
 public enum CredentialStoreError: LocalizedError, Sendable {
@@ -97,6 +105,15 @@ public actor KeychainCredentialStore: CredentialStore {
         }
     }
 
+    public func swapCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) throws -> EnvironmentCredential? {
+        let previousCredential = try self.credential(for: environmentID)
+        try setCredential(credential, for: environmentID)
+        return previousCredential
+    }
+
     public func replaceCredential(
         _ credential: EnvironmentCredential,
         ifMatching expected: EnvironmentCredential,
@@ -104,6 +121,15 @@ public actor KeychainCredentialStore: CredentialStore {
     ) throws -> Bool {
         guard try self.credential(for: environmentID) == expected else { return false }
         try setCredential(credential, for: environmentID)
+        return true
+    }
+
+    public func removeCredential(
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) throws -> Bool {
+        guard try credential(for: environmentID) == expected else { return false }
+        try removeCredential(for: environmentID)
         return true
     }
 }
@@ -130,6 +156,13 @@ public actor InMemoryCredentialStore: CredentialStore {
         credentials.removeValue(forKey: environmentID)
     }
 
+    public func swapCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) -> EnvironmentCredential? {
+        credentials.updateValue(credential, forKey: environmentID)
+    }
+
     public func replaceCredential(
         _ credential: EnvironmentCredential,
         ifMatching expected: EnvironmentCredential,
@@ -137,6 +170,15 @@ public actor InMemoryCredentialStore: CredentialStore {
     ) -> Bool {
         guard credentials[environmentID] == expected else { return false }
         credentials[environmentID] = credential
+        return true
+    }
+
+    public func removeCredential(
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) -> Bool {
+        guard credentials[environmentID] == expected else { return false }
+        credentials.removeValue(forKey: environmentID)
         return true
     }
 }

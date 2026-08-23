@@ -326,6 +326,16 @@ private actor RemovalOrderCredentialStore: CredentialStore {
         storedCredential = credential
     }
 
+    func swapCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) -> EnvironmentCredential? {
+        guard environmentID == self.environmentID else { return nil }
+        let previousCredential = storedCredential
+        storedCredential = credential
+        return previousCredential
+    }
+
     func replaceCredential(
         _ credential: EnvironmentCredential,
         ifMatching expected: EnvironmentCredential,
@@ -342,5 +352,18 @@ private actor RemovalOrderCredentialStore: CredentialStore {
         catalogContainedEnvironmentOnRemoval = try await environmentStore.load()
             .contains(where: { $0.id == environmentID })
         storedCredential = nil
+    }
+
+    func removeCredential(
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) async throws -> Bool {
+        guard environmentID == self.environmentID,
+              storedCredential == expected else { return false }
+        catalogContainedEnvironmentOnRemoval = try await environmentStore.load()
+            .contains(where: { $0.id == environmentID })
+        guard storedCredential == expected else { return false }
+        storedCredential = nil
+        return true
     }
 }

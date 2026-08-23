@@ -132,11 +132,12 @@ final class PlatformCloudDeliveryCoordinator {
 
     func install(controller: T3ConnectController) {
         self.controller = controller
-        observedAccountID = controller.account?.id
         guard observerTasks.isEmpty else {
+            handleAccountChange(to: controller.account?.id)
             requestRegistration()
             return
         }
+        observedAccountID = controller.account?.id
 
         for name in [Notification.Name.platformDeviceTokenChanged, .platformLiveActivityChanged] {
             observerTasks.append(Task { @MainActor [weak self] in
@@ -148,16 +149,14 @@ final class PlatformCloudDeliveryCoordinator {
             })
         }
         observerTasks.append(Task { @MainActor [weak self] in
-            for await _ in NotificationCenter.default.notifications(named: .t3ConnectSessionChanged) {
+            for await notification in NotificationCenter.default.notifications(
+                named: .t3ConnectSessionChanged
+            ) {
                 guard !Task.isCancelled, let self else { return }
-                let accountID = controller.account?.id
-                if observedAccountID != accountID {
-                    clearSuccessfulRegistrationCache()
-                    pendingActivityTokens.removeAll()
-                    PlatformAgentAwarenessCoordinator.shared
-                        .resetAndResynchronizeLiveActivity()
-                }
-                observedAccountID = accountID
+                guard let controller = self.controller,
+                      let notificationController = notification.object as? T3ConnectController,
+                      notificationController === controller else { continue }
+                handleAccountChange(to: controller.account?.id)
                 refreshActivityTokenObservers()
                 requestRegistration()
             }
@@ -327,6 +326,14 @@ final class PlatformCloudDeliveryCoordinator {
         defaults.removeObject(forKey: deviceFingerprintKey)
         defaults.removeObject(forKey: deviceRegisteredAtKey)
         defaults.removeObject(forKey: activityFingerprintKey)
+    }
+
+    private func handleAccountChange(to accountID: String?) {
+        guard observedAccountID != accountID else { return }
+        clearSuccessfulRegistrationCache()
+        pendingActivityTokens.removeAll()
+        PlatformAgentAwarenessCoordinator.shared.resetAndResynchronizeLiveActivity()
+        observedAccountID = accountID
     }
 
     private func currentRegistration(settings: FeatureSettings) -> T3ConnectDeviceRegistration {

@@ -37,6 +37,7 @@ public final class FeatureRootModel {
     public private(set) var isLoading = true
     public private(set) var isPerformingAction = false
     public private(set) var isManagingConnections = false
+    private(set) var isSigningOutT3Connect = false
     public var errorMessage: String?
 
     let client: any FeatureClient
@@ -141,16 +142,24 @@ public final class FeatureRootModel {
         await stopOutboxDrain()
         await perform {
             try await client.removeEnvironment(id: id)
+            var cleanupError: (any Error)?
             do {
                 try await outboxStore.removeAll(environmentID: id)
                 removePendingSubmissions(environmentID: id)
+            } catch {
+                markPendingSubmissionsForDiscard(environmentID: id)
+                cleanupError = error
+            }
+            do {
                 try await draftStore.removeDrafts(
                     environmentID: id,
                     logicalProjectIDs: logicalProjectIDs
                 )
             } catch {
-                markPendingSubmissionsForDiscard(environmentID: id)
-                errorMessage = "Environment removed, but its queued messages or drafts could not be cleared: \(error.localizedDescription)"
+                cleanupError = cleanupError ?? error
+            }
+            if let cleanupError {
+                errorMessage = "Environment removed, but its queued messages or drafts could not be cleared: \(cleanupError.localizedDescription)"
             }
             install(try await client.initialSnapshot())
             clearDetails()
@@ -160,32 +169,51 @@ public final class FeatureRootModel {
 
     public func signOutT3Connect() async {
         guard let capability = client as? any T3ConnectCapable else { return }
+        isSigningOutT3Connect = true
+        defer { isSigningOutT3Connect = false }
         let removedEnvironmentIDs = snapshot.environments
             .filter { $0.source == .t3Connect }
             .map(\.id)
+        let removedEnvironmentIDSet = Set(removedEnvironmentIDs)
         let groupedProjects = Dictionary(
             grouping: snapshot.projects.filter { $0.repositoryIdentity != nil },
             by: \.environmentID
         )
+        let retainedLogicalProjectIDs = Set<String>(snapshot.projects.compactMap { project in
+            guard project.repositoryIdentity != nil,
+                  !removedEnvironmentIDSet.contains(project.environmentID) else {
+                return nil
+            }
+            return DailyUXCreationContext.logicalProjectID(for: project, in: snapshot)
+        })
         let logicalProjectIDs = removedEnvironmentIDs.reduce(into: [String: Set<String>]()) {
             result, environmentID in
-            result[environmentID] = Set((groupedProjects[environmentID] ?? []).map {
+            let projectIDs = Set((groupedProjects[environmentID] ?? []).map {
                 DailyUXCreationContext.logicalProjectID(for: $0, in: snapshot)
             })
+            result[environmentID] = projectIDs.subtracting(retainedLogicalProjectIDs)
         }
 
         await stopOutboxDrain()
         await capability.signOutT3Connect()
         for environmentID in removedEnvironmentIDs {
+            var cleanupError: (any Error)?
             do {
                 try await outboxStore.removeAll(environmentID: environmentID)
-                removePendingSubmissions(environmentID: environmentID)
+            } catch {
+                cleanupError = error
+            }
+            removePendingSubmissions(environmentID: environmentID)
+            do {
                 try await draftStore.removeDrafts(
                     environmentID: environmentID,
                     logicalProjectIDs: logicalProjectIDs[environmentID] ?? []
                 )
             } catch {
-                errorMessage = "Could not clear saved T3 Connect data: \(error.localizedDescription)"
+                cleanupError = cleanupError ?? error
+            }
+            if let cleanupError {
+                errorMessage = "Could not clear saved T3 Connect data: \(cleanupError.localizedDescription)"
             }
         }
         clearDetails()
@@ -330,7 +358,8 @@ public final class FeatureRootModel {
                 if isEnvironmentConnected(project.environmentID) {
                     scheduleOutboxRetry()
                 }
-                return pendingThreadsByID[threadID]
+                return snapshot.threads.first { $0.id == threadID }
+                    ?? pendingThreadsByID[threadID]
             }
             let discarded = await discardQueuedSubmission(queued)
             if !discarded {
@@ -629,6 +658,12 @@ public final class FeatureRootModel {
                     scheduleOutboxRetry()
                 }
             }
+            if pendingThreadsByID[threadID] == nil,
+               snapshot.threads.contains(where: { $0.id == threadID }) {
+                await perform {
+                    try await client.cancelTurn(threadID: threadID)
+                }
+            }
             scheduleOutboxDrain()
             return
         }
@@ -760,14 +795,17 @@ public final class FeatureRootModel {
                 scheduleOutboxDrain()
             }
         case let .thread(value):
+            pendingThreadsByID.removeValue(forKey: value.id)
             upsert(value)
         case let .threadRemoved(id):
             removeThread(id: id)
             removeDetail(id: id)
         case let .detail(value):
+            pendingThreadsByID.removeValue(forKey: value.thread.id)
             store(value)
             upsert(value.thread)
         case let .detailDelta(value, delta):
+            pendingThreadsByID.removeValue(forKey: value.thread.id)
             store(value, delta: delta)
             upsert(value.thread)
         case let .failure(message):
@@ -825,6 +863,9 @@ public final class FeatureRootModel {
     private func install(_ value: FeatureSnapshot) {
         var value = value
         let authoritativeThreadIDs = Set(value.threads.map(\.id))
+        for id in authoritativeThreadIDs {
+            pendingThreadsByID.removeValue(forKey: id)
+        }
         for pending in pendingThreadsByID.values where !authoritativeThreadIDs.contains(pending.id) {
             value.threads.append(pending)
             if let index = value.projects.firstIndex(where: { $0.id == pending.projectID }) {

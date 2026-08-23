@@ -1273,8 +1273,10 @@ public actor EnvironmentRuntime {
         let previousEnvironment = try await environmentStore.load()
             .first(where: { $0.id == environment.id })
         let previousActiveID = try await environmentStore.activeEnvironmentID()
-        let previousCredential = try await credentialStore.credential(for: environment.id)
-        try await credentialStore.setCredential(credential, for: environment.id)
+        let previousCredential = try await credentialStore.swapCredential(
+            credential,
+            for: environment.id
+        )
         do {
             try await environmentStore.upsert(environment)
             try await environmentStore.setActiveEnvironment(id: environment.id)
@@ -1283,12 +1285,16 @@ public actor EnvironmentRuntime {
             var rollbackErrors: [String] = []
             do {
                 if let previousCredential {
-                    try await credentialStore.setCredential(
+                    _ = try await credentialStore.replaceCredential(
                         previousCredential,
+                        ifMatching: credential,
                         for: environment.id
                     )
                 } else {
-                    try await credentialStore.removeCredential(for: environment.id)
+                    _ = try await credentialStore.removeCredential(
+                        ifMatching: credential,
+                        for: environment.id
+                    )
                 }
             } catch {
                 rollbackErrors.append("credential: \(error.localizedDescription)")

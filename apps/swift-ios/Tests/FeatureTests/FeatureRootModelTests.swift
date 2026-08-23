@@ -310,6 +310,216 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func cancellingARestoredServerThreadAlsoInterruptsItsTurn() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-cancel-restored-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let identity = FeatureSubmissionIdentity(threadID: "created-thread")
+        let threadID = "environment-1::thread::created-thread"
+        let submission = FeatureQueuedSubmission(
+            environmentID: "environment-1",
+            identity: identity,
+            threadID: threadID,
+            text: "Already running on the server",
+            selection: nil,
+            runtimeMode: .fullAccess,
+            interactionMode: .standard,
+            attachments: [],
+            creation: .init(
+                projectID: "project-1",
+                projectName: "Native",
+                workspaceMode: .local,
+                branch: nil,
+                worktreePath: nil,
+                startFromOrigin: false
+            )
+        )
+        try await store.enqueue(submission)
+
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .disconnected),
+            environments: [
+                .init(
+                    id: "environment-1",
+                    name: "Studio",
+                    endpoint: "https://studio.example",
+                    isActive: true,
+                    connectionState: .disconnected
+                ),
+            ],
+            projects: [
+                .init(
+                    id: "project-1",
+                    environmentID: "environment-1",
+                    name: "Native",
+                    path: "/native"
+                ),
+            ],
+            threads: [
+                .init(
+                    id: threadID,
+                    wireID: identity.threadID,
+                    projectID: "project-1",
+                    environmentID: "environment-1",
+                    title: "Already running",
+                    state: .working
+                ),
+            ]
+        )
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: store)
+        await model.start()
+
+        await model.cancelTurn(threadID: threadID)
+
+        #expect(client.cancelTurnCallCount == 1)
+        #expect(try await store.submissions().isEmpty)
+        #expect(model.snapshot.threads.contains(where: { $0.id == threadID }))
+    }
+
+    @Test(arguments: [false, true])
+    func cancellingAnAcknowledgedQueuedThreadInterruptsItsTurn(
+        acknowledgedBySnapshot: Bool
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-cancel-acknowledged-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let identity = FeatureSubmissionIdentity(threadID: "acknowledged-thread")
+        let threadID = "environment-1::thread::acknowledged-thread"
+        try await store.enqueue(
+            FeatureQueuedSubmission(
+                environmentID: "environment-1",
+                identity: identity,
+                threadID: threadID,
+                text: "Accepted before the outbox cleared",
+                selection: nil,
+                runtimeMode: .fullAccess,
+                interactionMode: .standard,
+                attachments: [],
+                creation: .init(
+                    projectID: "project-1",
+                    projectName: "Native",
+                    workspaceMode: .local,
+                    branch: nil,
+                    worktreePath: nil,
+                    startFromOrigin: false
+                )
+            )
+        )
+
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .disconnected),
+            environments: [
+                .init(
+                    id: "environment-1",
+                    name: "Studio",
+                    endpoint: "https://studio.example",
+                    isActive: true,
+                    connectionState: .disconnected
+                ),
+            ],
+            projects: [
+                .init(
+                    id: "project-1",
+                    environmentID: "environment-1",
+                    name: "Native",
+                    path: "/native"
+                ),
+            ]
+        )
+        let acknowledged = FeatureThread(
+            id: threadID,
+            wireID: identity.threadID,
+            projectID: "project-1",
+            environmentID: "environment-1",
+            title: "Accepted on the server",
+            state: .working
+        )
+        if acknowledgedBySnapshot {
+            var snapshot = client.snapshot
+            snapshot.threads = [acknowledged]
+            client.emit(.snapshot(snapshot))
+        } else {
+            client.emit(.thread(acknowledged))
+        }
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: store)
+        await model.start()
+
+        await model.cancelTurn(threadID: threadID)
+
+        #expect(client.cancelTurnCallCount == 1)
+        #expect(try await store.submissions().isEmpty)
+        #expect(model.snapshot.threads == [acknowledged])
+    }
+
+    @Test
+    func retryableCreationFailureReturnsTheAcknowledgedServerThread() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-acknowledged-creation-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .disconnected),
+            environments: [
+                .init(
+                    id: "environment-1",
+                    name: "Studio",
+                    endpoint: "https://studio.example",
+                    isActive: true,
+                    connectionState: .disconnected
+                ),
+            ],
+            projects: [
+                .init(
+                    id: "project-1",
+                    environmentID: "environment-1",
+                    name: "Native",
+                    path: "/native"
+                ),
+            ]
+        )
+        client.startTaskError = URLError(.notConnectedToInternet)
+        let model = FeatureRootModel(client: client, outboxStore: store)
+        await model.reload()
+        client.beforeStartTask = {
+            var acknowledged = try #require(model.snapshot.threads.first)
+            acknowledged.title = "Accepted on the server"
+            acknowledged.state = .working
+            await withCheckedContinuation { continuation in
+                withObservationTracking {
+                    _ = model.snapshot.threads.first(where: { $0.id == acknowledged.id })?.state
+                } onChange: {
+                    continuation.resume()
+                }
+                client.emit(.thread(acknowledged))
+            }
+        }
+        let run = Task { await model.start() }
+
+        let thread = await model.startTask(
+            NewTaskRequest(
+                projectID: "project-1",
+                prompt: "Create this task once",
+                selection: nil,
+                runtimeMode: .fullAccess,
+                interactionMode: .standard
+            )
+        )
+        client.finishEvents()
+        await run.value
+
+        #expect(thread?.title == "Accepted on the server")
+        #expect(thread?.state == .working)
+        #expect(try await store.submissions().count == 1)
+    }
+
+    @Test
     func testPairReloadsConnectedSnapshot() async {
         let client = FeatureClientStub()
         client.snapshot = FeatureSnapshot(connection: .init(state: .disconnected))
@@ -425,6 +635,38 @@ struct FeatureRootModelTests {
     }
 
     @Test
+    func removingAnEnvironmentClearsDraftsWhenOutboxCleanupFails() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-cleanup-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let drafts = FeatureComposerDraftStore(
+            fileURL: directory.appendingPathComponent("drafts.json")
+        )
+        let draftKey = "environment:environment-1:thread:one"
+        try await drafts.setDraft(FeatureComposerDraft(text: "Clear this draft"), for: draftKey)
+        let outbox = FeatureOutboxStore(fileURL: directory)
+
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            environments: [
+                .init(
+                    id: "environment-1",
+                    name: "Studio",
+                    endpoint: "https://studio.example"
+                ),
+            ]
+        )
+        client.snapshotAfterEnvironmentRemoval = FeatureSnapshot()
+        let model = FeatureRootModel(client: client, outboxStore: outbox, draftStore: drafts)
+        await model.reload()
+
+        await model.removeEnvironment("environment-1")
+
+        #expect(try await drafts.draft(for: draftKey) == nil)
+        #expect(model.errorMessage?.contains("queued messages or drafts") == true)
+    }
+
+    @Test
     func signingOutClearsManagedOutboxEntriesAndGroupedDrafts() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("t3-root-sign-out-\(UUID().uuidString)", isDirectory: true)
@@ -487,6 +729,139 @@ struct FeatureRootModelTests {
         #expect(model.snapshot.environments.map(\.id) == ["manual-1"])
         #expect(try await outbox.submissions().isEmpty)
         #expect(try await drafts.draft(for: groupedDraftKey) == nil)
+    }
+
+    @Test
+    func signingOutPreservesGroupedDraftsUsedByDirectEnvironments() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-shared-draft-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let drafts = FeatureComposerDraftStore(
+            fileURL: directory.appendingPathComponent("drafts.json")
+        )
+        let outbox = FeatureOutboxStore(fileURL: directory.appendingPathComponent("outbox.json"))
+        let identity = FeatureRepositoryIdentity(canonicalKey: "github.com/t3/native")
+        let groupedDraftKey = FeatureComposerDraftStore.newTaskKey(
+            logicalProjectID: identity.canonicalKey
+        )
+        let managedDraftKey = "environment:managed-1:thread:one"
+        try await drafts.setDraft(FeatureComposerDraft(text: "Keep shared prompt"), for: groupedDraftKey)
+        try await drafts.setDraft(FeatureComposerDraft(text: "Remove managed prompt"), for: managedDraftKey)
+
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            environments: [
+                .init(
+                    id: "managed-1",
+                    name: "Managed",
+                    endpoint: "https://managed.example",
+                    source: .t3Connect
+                ),
+                .init(
+                    id: "manual-1",
+                    name: "Manual",
+                    endpoint: "https://manual.example"
+                ),
+            ],
+            projects: [
+                .init(
+                    id: "managed-project",
+                    environmentID: "managed-1",
+                    name: "Native",
+                    path: "/managed/native",
+                    repositoryIdentity: identity
+                ),
+                .init(
+                    id: "manual-project",
+                    environmentID: "manual-1",
+                    name: "Native",
+                    path: "/manual/native",
+                    repositoryIdentity: identity
+                ),
+            ]
+        )
+        let model = FeatureRootModel(client: client, outboxStore: outbox, draftStore: drafts)
+        await model.reload()
+
+        await model.signOutT3Connect()
+
+        #expect(try await drafts.draft(for: groupedDraftKey)?.text == "Keep shared prompt")
+        #expect(try await drafts.draft(for: managedDraftKey) == nil)
+        #expect(model.snapshot.projects.map(\.id) == ["manual-project"])
+    }
+
+    @Test
+    func signingOutClearsDraftsWhenOutboxCleanupFails() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-root-sign-out-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let drafts = FeatureComposerDraftStore(
+            fileURL: directory.appendingPathComponent("drafts.json")
+        )
+        let draftKey = "environment:managed-1:thread:one"
+        try await drafts.setDraft(FeatureComposerDraft(text: "Clear this draft"), for: draftKey)
+        let outboxURL = directory.appendingPathComponent("outbox.json")
+        let outbox = FeatureOutboxStore(fileURL: outboxURL)
+        let threadID = "managed-1::thread::queued"
+        try await outbox.enqueue(
+            FeatureQueuedSubmission(
+                environmentID: "managed-1",
+                identity: FeatureSubmissionIdentity(threadID: "queued"),
+                threadID: threadID,
+                text: "Private queued message",
+                selection: nil,
+                runtimeMode: .fullAccess,
+                interactionMode: .standard,
+                attachments: [],
+                creation: .init(
+                    projectID: "managed-project",
+                    projectName: "Native",
+                    workspaceMode: .local,
+                    branch: nil,
+                    worktreePath: nil,
+                    startFromOrigin: false
+                )
+            )
+        )
+
+        let client = FeatureClientStub()
+        client.snapshot = FeatureSnapshot(
+            connection: .init(state: .disconnected),
+            environments: [
+                .init(
+                    id: "managed-1",
+                    name: "Managed",
+                    endpoint: "https://managed.example",
+                    source: .t3Connect,
+                    connectionState: .disconnected
+                ),
+            ],
+            projects: [
+                .init(
+                    id: "managed-project",
+                    environmentID: "managed-1",
+                    name: "Native",
+                    path: "/native"
+                ),
+            ]
+        )
+        client.finishEvents()
+        let model = FeatureRootModel(client: client, outboxStore: outbox, draftStore: drafts)
+        await model.start()
+        #expect(model.snapshot.threads.contains(where: { $0.id == threadID }))
+        #expect(model.details[threadID] != nil)
+        try FileManager.default.removeItem(at: outboxURL)
+        try FileManager.default.createDirectory(
+            at: outboxURL,
+            withIntermediateDirectories: false
+        )
+
+        await model.signOutT3Connect()
+
+        #expect(try await drafts.draft(for: draftKey) == nil)
+        #expect(model.snapshot.threads.isEmpty)
+        #expect(model.details.isEmpty)
+        #expect(model.errorMessage?.contains("Could not clear saved T3 Connect data") == true)
     }
 
     @Test
@@ -2005,6 +2380,7 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
     var enabledEnvironmentID: String?
     var environmentEnabledValue: Bool?
     var removedEnvironmentID: String?
+    var beforeStartTask: (() async throws -> Void)?
     var beforeSendMessage: (() throws -> Void)?
     var loadThreadError: (any Error)?
     var loadThreadHandler: ((String) async throws -> FeatureThreadDetail)?
@@ -2117,6 +2493,7 @@ private final class FeatureClientStub: FeatureClient, T3ConnectCapable {
         startFromOrigin: Bool,
         attachments: [FeatureUploadAttachment]
     ) async throws -> FeatureThread {
+        try await beforeStartTask?()
         if let startTaskError { throw startTaskError }
         startedPrompt = prompt
         startedAttachments = attachments

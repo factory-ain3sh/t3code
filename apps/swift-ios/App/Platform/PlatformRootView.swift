@@ -51,11 +51,16 @@ struct PlatformRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .t3ConnectSessionChanged)) { note in
             guard let capability = model.client as? any T3ConnectCapable,
                   let controller = note.object as? T3ConnectController,
-                  controller === capability.t3ConnectController,
-                  let previousAccountID = note.userInfo?["previousAccountID"] as? String,
-                  let accountID = note.userInfo?["accountID"] as? String,
-                  previousAccountID != accountID else { return }
+                  controller === capability.t3ConnectController else { return }
+            let previousAccountID = note.userInfo?["previousAccountID"] as? String
+            let accountID = note.userInfo?["accountID"] as? String
+            guard Self.shouldRemoveManagedEnvironments(
+                previousAccountID: previousAccountID,
+                accountID: accountID,
+                isSigningOut: model.isSigningOutT3Connect
+            ) else { return }
             Task { @MainActor in
+                guard !model.isSigningOutT3Connect else { return }
                 await model.removeManagedEnvironmentsAfterAccountChange()
             }
         }
@@ -112,6 +117,15 @@ struct PlatformRootView: View {
         } message: {
             Text("Your share is saved. Connect an environment and create a project to finish importing it.")
         }
+    }
+
+    static func shouldRemoveManagedEnvironments(
+        previousAccountID: String?,
+        accountID: String?,
+        isSigningOut: Bool
+    ) -> Bool {
+        guard !isSigningOut, let previousAccountID else { return false }
+        return previousAccountID != accountID
     }
 
     private var incomingShareProjects: [FeatureProject] {

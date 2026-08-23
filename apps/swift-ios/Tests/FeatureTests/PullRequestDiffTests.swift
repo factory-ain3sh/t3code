@@ -66,4 +66,37 @@ struct PullRequestDiffTests {
         #expect(file.lines[3].oldLine == 2)
         #expect(file.lines[3].newLine == 2)
     }
+
+    @Test
+    func repeatedDiffCursorsStopPaginationAndMarkDiffIncomplete() {
+        var pagination = PullRequestDiffPagination()
+
+        #expect(pagination.append(
+            PullRequestDiffResult(
+                patch: "first",
+                truncated: false,
+                nextCursor: "first-cursor",
+                omittedFileStats: nil
+            )
+        ) == "first-cursor")
+        #expect(pagination.append(
+            PullRequestDiffResult(
+                patch: "second",
+                truncated: false,
+                nextCursor: "second-cursor",
+                omittedFileStats: nil
+            )
+        ) == "second-cursor")
+        #expect(pagination.append(
+            PullRequestDiffResult(
+                patch: "third",
+                truncated: false,
+                nextCursor: "first-cursor",
+                omittedFileStats: nil
+            )
+        ) == nil)
+
+        #expect(pagination.patch == "firstsecondthird")
+        #expect(pagination.isIncomplete)
+    }
 }

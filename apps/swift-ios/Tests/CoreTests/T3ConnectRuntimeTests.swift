@@ -314,6 +314,27 @@ final class T3ConnectRuntimeTests: XCTestCase {
         XCTAssertNil(restoredCredential)
     }
 
+    func testFailedManagedSaveDoesNotOverwriteNewerCredential() async throws {
+        try await assertFailedManagedSavePreservesNewerCredential(
+            previousCredential: managedCredential(accessToken: "previous-managed-token"),
+            replacementTiming: .afterInstallation
+        )
+    }
+
+    func testFailedFirstManagedSaveDoesNotDeleteNewerCredential() async throws {
+        try await assertFailedManagedSavePreservesNewerCredential(
+            previousCredential: nil,
+            replacementTiming: .afterInstallation
+        )
+    }
+
+    func testFailedManagedSaveRestoresCredentialRefreshedBeforeInstallation() async throws {
+        try await assertFailedManagedSavePreservesNewerCredential(
+            previousCredential: managedCredential(accessToken: "previous-managed-token"),
+            replacementTiming: .beforeInstallation
+        )
+    }
+
     func testRotatedProofKeyRebindsFreshCredential() async throws {
         let fixture = try await refreshFixture(
             savedThumbprint: "stale-proof-key",
@@ -965,6 +986,60 @@ final class T3ConnectRuntimeTests: XCTestCase {
         )
     }
 
+    private func assertFailedManagedSavePreservesNewerCredential(
+        previousCredential: EnvironmentCredential?,
+        replacementTiming: ManagedPersistenceCredentialStore.ReplacementTiming
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-managed-credential-race-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o700))],
+                ofItemAtPath: directory.path
+            )
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let environment = managedEnvironment(descriptor: descriptor())
+        let newerCredential = managedCredential(accessToken: "newer-managed-token")
+        let credentials = ManagedPersistenceCredentialStore(
+            previousCredential: previousCredential,
+            newerCredential: newerCredential,
+            replacementTiming: replacementTiming
+        )
+        let runtime = EnvironmentRuntime(
+            environmentStore: EnvironmentStore(
+                fileURL: directory.appendingPathComponent("environments.json")
+            ),
+            credentialStore: credentials
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o500))],
+            ofItemAtPath: directory.path
+        )
+
+        do {
+            _ = try await runtime.saveManagedEnvironment(
+                environment,
+                credential: managedCredential(accessToken: "pairing-managed-token")
+            )
+            XCTFail("Managed pairing unexpectedly updated a read-only environment catalog")
+        } catch {
+            let saved = await credentials.credential(for: environment.id)
+            XCTAssertEqual(saved, newerCredential)
+        }
+    }
+
+    private func managedCredential(accessToken: String) -> EnvironmentCredential {
+        .managedDPoP(
+            accessToken: accessToken,
+            expiresAt: Date(timeIntervalSince1970: 2_000_000_000),
+            scopes: T3ConnectManagedEnvironmentAuthorizer.standardScopes,
+            environmentID: "managed-1",
+            proofKeyThumbprint: "proof-key"
+        )
+    }
+
     private func testSigner() throws -> T3ConnectDPoPSigner {
         var scalar = Data(repeating: 0, count: 32)
         scalar[31] = 7
@@ -1028,6 +1103,84 @@ private struct T3ConnectRefreshFixture {
 private enum T3ConnectTestError: Error {
     case unexpectedRefresh
     case unexpectedPath(String?)
+}
+
+private actor ManagedPersistenceCredentialStore: CredentialStore {
+    enum ReplacementTiming {
+        case beforeInstallation
+        case afterInstallation
+    }
+
+    private var storedCredential: EnvironmentCredential?
+    private let newerCredential: EnvironmentCredential
+    private let replacementTiming: ReplacementTiming
+    private var hasInsertedNewerCredential = false
+
+    init(
+        previousCredential: EnvironmentCredential?,
+        newerCredential: EnvironmentCredential,
+        replacementTiming: ReplacementTiming
+    ) {
+        storedCredential = previousCredential
+        self.newerCredential = newerCredential
+        self.replacementTiming = replacementTiming
+    }
+
+    func credential(for environmentID: String) -> EnvironmentCredential? {
+        let currentCredential = storedCredential
+        if replacementTiming == .beforeInstallation, !hasInsertedNewerCredential {
+            hasInsertedNewerCredential = true
+            storedCredential = newerCredential
+        }
+        return currentCredential
+    }
+
+    func setCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) {
+        storedCredential = credential
+        if replacementTiming == .afterInstallation, !hasInsertedNewerCredential {
+            hasInsertedNewerCredential = true
+            storedCredential = newerCredential
+        }
+    }
+
+    func swapCredential(
+        _ credential: EnvironmentCredential,
+        for environmentID: String
+    ) -> EnvironmentCredential? {
+        if replacementTiming == .beforeInstallation, !hasInsertedNewerCredential {
+            hasInsertedNewerCredential = true
+            storedCredential = newerCredential
+        }
+        let previousCredential = storedCredential
+        setCredential(credential, for: environmentID)
+        return previousCredential
+    }
+
+    func replaceCredential(
+        _ credential: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) -> Bool {
+        guard storedCredential == expected else { return false }
+        storedCredential = credential
+        return true
+    }
+
+    func removeCredential(for environmentID: String) {
+        storedCredential = nil
+    }
+
+    func removeCredential(
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) -> Bool {
+        guard storedCredential == expected else { return false }
+        storedCredential = nil
+        return true
+    }
 }
 
 private actor T3ConnectBootstrapSource {
