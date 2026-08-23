@@ -508,11 +508,24 @@ const ToolResult = Schema.Struct({
   isError: Schema.optional(Schema.Boolean),
 });
 
+// factory-mono: protocol/droid/schemas/cli.ts. `type` stays an open string: droid
+// enumerates it, but nothing here reads it, and a kind added later must not cost us
+// the subagent activity this notification carries.
+const ToolProgressUpdatePayload = Schema.Struct({
+  type: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+  details: Schema.optional(Schema.String),
+  text: Schema.optional(Schema.String),
+  error: Schema.optional(Schema.String),
+  valueSnippet: Schema.optional(Schema.String),
+  subagentSessionId: Schema.optional(Schema.String),
+});
+
 const ToolProgressUpdate = Schema.Struct({
   type: Schema.Literal("tool_progress_update"),
   toolUseId: Schema.String,
   toolName: Schema.String,
-  update: Schema.Unknown,
+  update: ToolProgressUpdatePayload,
 });
 
 const ToolExecutionPhaseChanged = Schema.Struct({

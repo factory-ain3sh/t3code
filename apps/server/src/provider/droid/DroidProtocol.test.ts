@@ -52,15 +52,6 @@ const fixtures: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
     },
   ],
   [
-    "tool_progress_update",
-    {
-      type: "tool_progress_update",
-      toolUseId: "tool-1",
-      toolName: "Read",
-      update: { type: "status", status: "running" },
-    },
-  ],
-  [
     "tool_execution_phase_changed",
     {
       type: "tool_execution_phase_changed",
@@ -177,6 +168,55 @@ describe("DroidSessionNotification", () => {
 
     assert.equal(decoded.type, "assistant_text_delta");
     assert.notProperty(decoded, "addedByNewerCli");
+  });
+
+  it("decodes attributed tool progress and strips unknown update fields", () => {
+    const decoded = decodeNotification({
+      type: "tool_progress_update",
+      toolUseId: "tool-1",
+      toolName: "Task",
+      update: {
+        type: "status",
+        status: "running",
+        text: "Inspecting the repository",
+        subagentSessionId: "child-1",
+        addedByNewerCli: true,
+      },
+    });
+
+    assert.equal(decoded.type, "tool_progress_update");
+    if (decoded.type === "tool_progress_update") {
+      assert.deepStrictEqual(decoded.update, {
+        type: "status",
+        status: "running",
+        text: "Inspecting the repository",
+        subagentSessionId: "child-1",
+      });
+      assert.notProperty(decoded.update, "addedByNewerCli");
+    }
+  });
+
+  it("decodes tool progress without a subagent session id", () => {
+    const decoded = decodeNotification({
+      type: "tool_progress_update",
+      toolUseId: "tool-2",
+      toolName: "Execute",
+      update: {
+        type: "message",
+        details: "Still running",
+        valueSnippet: "line 42",
+      },
+    });
+
+    assert.equal(decoded.type, "tool_progress_update");
+    if (decoded.type === "tool_progress_update") {
+      assert.deepStrictEqual(decoded.update, {
+        type: "message",
+        details: "Still running",
+        valueSnippet: "line 42",
+      });
+      assert.notProperty(decoded.update, "subagentSessionId");
+    }
   });
 
   it("decodes lastCallTokenUsage for context-window accounting", () => {

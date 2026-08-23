@@ -919,7 +919,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         cwd: process.cwd(),
         runtimeMode: "full-access",
       });
-      yield* adapter.sendTurn({
+      const sentTurn = yield* adapter.sendTurn({
         threadId,
         input: "mock child session",
         attachments: [],
@@ -935,6 +935,15 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         threadEvents.filter((event) => event.type === "task.completed"),
         1,
       );
+      const progress = threadEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "tool.progress" }> =>
+          event.type === "tool.progress",
+      );
+      assert.lengthOf(progress, 1);
+      assert.equal(String(progress[0]?.payload.taskId), "mock-session-child");
+      assert.equal(progress[0]?.payload.toolUseId, `child-task-${String(sentTurn.turnId)}`);
+      assert.equal(progress[0]?.payload.toolName, "Task");
+      assert.equal(progress[0]?.payload.summary, "Inspecting delegated files");
       assert.notInclude(
         threadEvents
           .filter(
@@ -944,6 +953,49 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           .map((event) => event.payload.delta)
           .join(""),
         "child-only output",
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("drops Droid tool progress without an owning subagent session", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-taskless-tool-progress");
+      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "mock taskless progress",
+        attachments: [],
+      });
+      yield* Deferred.await(turnCompleted);
+
+      assert.lengthOf(
+        eventsForThread(runtimeEvents, threadId).filter((event) => event.type === "tool.progress"),
+        0,
       );
 
       yield* Fiber.interrupt(runtimeEventsFiber);

@@ -4,6 +4,8 @@ import {
   type ServerProvider,
   type ServerProviderAuth,
   type ServerProviderModel,
+  type ServerProviderSkill,
+  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import { createModelCapabilities } from "@t3tools/shared/model";
@@ -19,7 +21,7 @@ import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { DroidModelInfo } from "../droid/DroidProtocol.ts";
+import { DroidCommandInfo, DroidModelInfo, DroidSkillInfo } from "../droid/DroidProtocol.ts";
 import { makeDroidRpcClient } from "../droid/DroidRpcClient.ts";
 import {
   buildSelectOptionDescriptor,
@@ -49,7 +51,7 @@ const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
 });
 
 const VERSION_PROBE_TIMEOUT_MS = 4_000;
-const MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
+const INVENTORY_DISCOVERY_TIMEOUT_MS = 15_000;
 
 export const DROID_LOGIN_MESSAGE = "Run `droid` in a terminal to sign in to Factory.";
 
@@ -115,6 +117,59 @@ export function buildDroidDiscoveredModels(
     .filter((model): model is ServerProviderModel => model !== undefined);
 }
 
+export function buildDroidSlashCommands(
+  commands: ReadonlyArray<DroidCommandInfo>,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  const seen = new Set<string>();
+  const slashCommands: ServerProviderSlashCommand[] = [];
+  for (const command of commands) {
+    const name = command.name.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const description = command.description.trim();
+    const hint = command.argumentHint?.trim();
+    slashCommands.push({
+      name,
+      ...(description ? { description } : {}),
+      ...(hint ? { input: { hint } } : {}),
+    });
+  }
+  return slashCommands.toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
+/**
+ * Droid's own user-facing surfaces hide skills the user cannot invoke — built-ins
+ * are authored `userInvocable: false` (factory-mono skills/builtin/loadBuiltinSkill.ts)
+ * and filtered out of its command palette (acp/session/availableCommands.ts). We apply
+ * the same rule, but carry `enabled` through instead of filtering on it: the skill
+ * contract models disabled state, and clients render it.
+ */
+export function buildDroidSkills(
+  skills: ReadonlyArray<DroidSkillInfo>,
+): ReadonlyArray<ServerProviderSkill> {
+  const seen = new Set<string>();
+  const providerSkills: ServerProviderSkill[] = [];
+  for (const skill of skills) {
+    if (skill.userInvocable === false) continue;
+    const name = skill.name.trim();
+    const path = skill.filePath.trim();
+    if (!name || !path || seen.has(name)) continue;
+    seen.add(name);
+    const description = skill.description?.trim();
+    // SkillLocation is `project | personal | builtin | automation`; the first two
+    // are already understood by the client's skill-source resolver.
+    const scope = skill.location?.trim();
+    providerSkills.push({
+      name,
+      path,
+      enabled: skill.enabled !== false,
+      ...(scope ? { scope } : {}),
+      ...(description ? { description, shortDescription: description } : {}),
+    });
+  }
+  return providerSkills.toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
 /**
  * Detect the credentials `droid exec` would resolve: FACTORY_API_KEY always
  * wins; otherwise the stored WorkOS login under the Factory home directory.
@@ -150,7 +205,26 @@ export const detectDroidAuth = Effect.fn("detectDroidAuth")(function* (
   return { status: "unknown" };
 });
 
-const discoverDroidModels = (
+/**
+ * Commands and skills are secondary: an older CLI without the handler must cost us
+ * the list, not the whole probe (and with it the live model catalog).
+ */
+const optionalInventory = <A, E, R>(label: string, effect: Effect.Effect<ReadonlyArray<A>, E, R>) =>
+  effect.pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning(`Droid ${label} discovery failed.`, {
+        errorTag: causeErrorTag(cause),
+      }).pipe(Effect.as<ReadonlyArray<A>>([])),
+    ),
+  );
+
+/**
+ * One droid process answers every inventory question. Startup is the expensive part,
+ * and `list_models`/`list_commands`/`list_skills` are all session-less handlers
+ * (factory-mono streamingJsonRpcExecRunner.ts) resolved against this process's cwd,
+ * so environment-scoped commands and skills come back without initializing a session.
+ */
+const discoverDroidInventory = (
   droidSettings: DroidSettings,
   environment: NodeJS.ProcessEnv = process.env,
 ) =>
@@ -161,9 +235,28 @@ const discoverDroidModels = (
       cwd: process.cwd(),
       env: environment,
     });
-    const result = yield* rpc.request("droid.list_models", {});
-    const models = yield* decodeListModels(result);
-    return buildDroidDiscoveredModels(models);
+
+    const models = yield* rpc
+      .request("droid.list_models", {})
+      .pipe(Effect.flatMap((result) => decodeInventory(result, "models", decodeModelInfo)));
+    const commands = yield* optionalInventory(
+      "slash command",
+      rpc
+        .request("droid.list_commands", {})
+        .pipe(Effect.flatMap((result) => decodeInventory(result, "commands", decodeCommandInfo))),
+    );
+    const skills = yield* optionalInventory(
+      "skill",
+      rpc
+        .request("droid.list_skills", {})
+        .pipe(Effect.flatMap((result) => decodeInventory(result, "skills", decodeSkillInfo))),
+    );
+
+    return {
+      models: buildDroidDiscoveredModels(models),
+      slashCommands: buildDroidSlashCommands(commands),
+      skills: buildDroidSkills(skills),
+    };
   }).pipe(Effect.scoped);
 
 const runDroidVersionCommand = (
@@ -317,28 +410,28 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
   }
 
   const auth = yield* detectDroidAuth(environment);
-  const discoveryExit = yield* discoverDroidModels(droidSettings, environment).pipe(
-    Effect.timeoutOption(MODEL_DISCOVERY_TIMEOUT_MS),
+  const discoveryExit = yield* discoverDroidInventory(droidSettings, environment).pipe(
+    Effect.timeoutOption(INVENTORY_DISCOVERY_TIMEOUT_MS),
     Effect.exit,
   );
-  const discoveredModels =
+  const inventory =
     Exit.isSuccess(discoveryExit) && Option.isSome(discoveryExit.value)
       ? discoveryExit.value.value
       : undefined;
-  if (discoveredModels === undefined) {
+  if (inventory === undefined) {
     if (Exit.isFailure(discoveryExit)) {
-      yield* Effect.logWarning("Droid model discovery failed.", {
+      yield* Effect.logWarning("Droid inventory discovery failed.", {
         errorTag: causeErrorTag(discoveryExit.cause),
       });
     } else {
       yield* Effect.logWarning(
-        `Droid model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS}ms.`,
+        `Droid inventory discovery timed out after ${INVENTORY_DISCOVERY_TIMEOUT_MS}ms.`,
       );
     }
   }
   const models =
-    discoveredModels !== undefined && discoveredModels.length > 0
-      ? droidModelsFromSettings(droidSettings.customModels, discoveredModels)
+    inventory !== undefined && inventory.models.length > 0
+      ? droidModelsFromSettings(droidSettings.customModels, inventory.models)
       : fallbackModels;
 
   return buildServerProvider({
@@ -346,6 +439,7 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
     enabled: droidSettings.enabled,
     checkedAt,
     models,
+    ...(inventory ? { slashCommands: inventory.slashCommands, skills: inventory.skills } : {}),
     probe: {
       installed: true,
       version,
@@ -357,16 +451,20 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
 });
 
 const decodeModelInfo = Schema.decodeUnknownEffect(DroidModelInfo);
+const decodeCommandInfo = Schema.decodeUnknownEffect(DroidCommandInfo);
+const decodeSkillInfo = Schema.decodeUnknownEffect(DroidSkillInfo);
 
-/** Undecodable entries are skipped, not fatal: model metadata drifts. */
-const decodeListModels = (result: unknown) =>
+/** Undecodable entries are skipped, not fatal: droid's inventory metadata drifts. */
+const decodeInventory = <A, E, R>(
+  result: unknown,
+  key: string,
+  decode: (value: unknown) => Effect.Effect<A, E, R>,
+): Effect.Effect<ReadonlyArray<A>, never, R> =>
   Effect.gen(function* () {
-    const models = (result as { readonly models?: ReadonlyArray<unknown> } | undefined)?.models;
-    if (!Array.isArray(models)) return [];
-    const decoded = yield* Effect.forEach(models, (model) =>
-      decodeModelInfo(model).pipe(Effect.option),
-    );
-    return decoded.filter(Option.isSome).map((model) => model.value);
+    const entries = (result as Record<string, unknown> | undefined)?.[key];
+    if (!Array.isArray(entries)) return [];
+    const decoded = yield* Effect.forEach(entries, (entry) => decode(entry).pipe(Effect.option));
+    return decoded.filter(Option.isSome).map((entry) => entry.value);
   });
 
 export const enrichDroidSnapshot = (input: {

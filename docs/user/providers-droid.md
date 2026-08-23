@@ -33,6 +33,16 @@ T3 Code fetches the available models from Droid dynamically. Each model advertis
 efforts it supports, and those choices appear with the model in the picker. The list can change as
 Factory adds or updates models without requiring a T3 Code update.
 
+## Slash Commands And Skills
+
+T3 Code reads your Droid slash commands and skills when it checks the provider, so they appear in the
+composer alongside every other provider's. Custom commands keep their argument hints, and skills keep
+their descriptions and whether they came from your personal or project configuration. Skills Droid
+does not let you invoke directly, such as its built-ins, stay out of the list.
+
+Commands and skills resolve on the machine running the server, from your personal Droid
+configuration. Add a command or skill, refresh the Droid card in Settings, and it shows up.
+
 ## Permission Modes
 
 T3 Code maps its permission modes onto Droid's command confirmation levels:

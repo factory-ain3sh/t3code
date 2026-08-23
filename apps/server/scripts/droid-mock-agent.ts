@@ -234,6 +234,16 @@ async function runTurn(params: {
       description: "Mock delegated task",
       timestamp: 1,
     });
+    notify({
+      type: "tool_progress_update",
+      toolUseId: `child-task-${turnId}`,
+      toolName: "Task",
+      update: {
+        type: "message",
+        text: "Inspecting delegated files",
+        subagentSessionId: childSessionId,
+      },
+    });
     notifyForSession(childSessionId, {
       type: "assistant_text_delta",
       messageId: `assistant-child-${turnId}`,
@@ -241,6 +251,18 @@ async function runTurn(params: {
       textDelta: "child-only output",
     });
     emitTerminalForSession(childSessionId, "completed", `child-${turnId}`);
+  }
+
+  if (params.text === "mock taskless progress") {
+    notify({
+      type: "tool_progress_update",
+      toolUseId: `parent-tool-${turnId}`,
+      toolName: "Execute",
+      update: {
+        type: "status",
+        status: "running",
+      },
+    });
   }
 
   if (params.text === "mock steering original") {

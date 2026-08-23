@@ -821,6 +821,41 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             });
             return;
           }
+          case "tool_progress_update": {
+            const taskId = notification.update.subagentSessionId?.trim();
+            if (!taskId) {
+              // Ingestion discards taskless progress, and the parent
+              // conversation's item lifecycle already covers its tools.
+              return;
+            }
+            const toolUseId = notification.toolUseId.trim();
+            const toolName = notification.toolName.trim();
+            const summary = [
+              notification.update.text,
+              notification.update.details,
+              notification.update.error,
+              notification.update.status,
+              notification.update.valueSnippet,
+            ]
+              .map((value) => value?.trim())
+              .find((value): value is string => value !== undefined && value.length > 0);
+            // Do not gate on childSessions: progress can arrive before
+            // child_session_available, and its session id already owns it.
+            yield* offerRuntimeEvent({
+              type: "tool.progress",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              turnId,
+              payload: {
+                taskId: RuntimeTaskId.make(taskId),
+                ...(toolUseId ? { toolUseId } : {}),
+                ...(toolName ? { toolName } : {}),
+                ...(summary ? { summary } : {}),
+              },
+            });
+            return;
+          }
           default:
             // Unknown and internal notification types (heartbeats, working
             // state, mission traffic) are intentionally ignored.
