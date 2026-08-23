@@ -3,14 +3,18 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import type { DroidCommandInfo, DroidModelInfo, DroidSkillInfo } from "../droid/DroidProtocol.ts";
+import { DroidModelInfo as DroidModelInfoSchema } from "../droid/DroidProtocol.ts";
 import {
   buildDroidDiscoveredModels,
   buildDroidSkills,
   buildDroidSlashCommands,
   detectDroidAuth,
 } from "./DroidProvider.ts";
+
+const decodeModelInfo = Schema.decodeUnknownSync(DroidModelInfoSchema);
 
 describe("buildDroidDiscoveredModels", () => {
   it("keeps enabled models, dedupes ids, and falls back to the id for a display name", () => {
@@ -31,6 +35,29 @@ describe("buildDroidDiscoveredModels", () => {
       {
         slug: "gpt-5-6-luna",
         name: "gpt-5-6-luna",
+        isCustom: false,
+        capabilities: { optionDescriptors: [] },
+      },
+    ]);
+  });
+
+  it("surfaces Droid's own custom models as ordinary probe models", () => {
+    // Verbatim `droid.list_models` shape for a BYOK entry, `isCustom` included.
+    const model = decodeModelInfo({
+      id: "custom:factory://kimi-k3",
+      displayName: "factory://kimi-k3",
+      modelProvider: "generic-chat-completion-api",
+      isCustom: true,
+      noImageSupport: false,
+      disabled: false,
+    });
+
+    assert.deepEqual(buildDroidDiscoveredModels([model]), [
+      {
+        slug: "custom:factory://kimi-k3",
+        name: "factory://kimi-k3",
+        // T3 renders `isCustom` rows from its own custom-model config, so a true
+        // here would hide the model from the provider's Models section.
         isCustom: false,
         capabilities: { optionDescriptors: [] },
       },

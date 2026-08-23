@@ -96,6 +96,13 @@ function reasoningEffortCapabilities(model: DroidModelInfo): ModelCapabilities {
   });
 }
 
+/**
+ * Every model the CLI reports is a probe result, including the `custom:` entries a
+ * user configured in Droid's own settings. They stay `isCustom: false` because T3's
+ * flag means "slug the user typed into T3's custom-model field": custom rows render
+ * from that config list, so marking a probe model custom would drop it from the
+ * Models section entirely instead of merely labelling it.
+ */
 export function buildDroidDiscoveredModels(
   models: ReadonlyArray<DroidModelInfo>,
 ): ReadonlyArray<ServerProviderModel> {
@@ -110,7 +117,7 @@ export function buildDroidDiscoveredModels(
         slug,
         name: model.displayName?.trim() || slug,
         ...(model.shortDisplayName?.trim() ? { shortName: model.shortDisplayName.trim() } : {}),
-        isCustom: model.isCustom === true,
+        isCustom: false,
         capabilities: reasoningEffortCapabilities(model),
       };
     })

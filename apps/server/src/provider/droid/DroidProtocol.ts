@@ -49,8 +49,6 @@ export const DroidModelInfo = Schema.Struct({
   modelProvider: Schema.optional(Schema.String),
   supportedReasoningEfforts: Schema.optional(Schema.Array(DroidReasoningEffort)),
   defaultReasoningEffort: Schema.optional(DroidReasoningEffort),
-  isCustom: Schema.optional(Schema.Boolean),
-  noImageSupport: Schema.optional(Schema.Boolean),
   disabled: Schema.optional(Schema.Boolean),
 });
 export type DroidModelInfo = typeof DroidModelInfo.Type;
