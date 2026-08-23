@@ -279,8 +279,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
               let webSocketBaseURL = credential.endpoint.webSocketBaseURL,
               httpBaseURL.scheme?.lowercased() == "https",
               webSocketBaseURL.scheme?.lowercased() == "wss",
-              httpBaseURL.host != nil,
-              webSocketBaseURL.host != nil else {
+              let httpHost = httpBaseURL.host,
+              let webSocketHost = webSocketBaseURL.host,
+              httpHost.caseInsensitiveCompare(webSocketHost) == .orderedSame,
+              (httpBaseURL.port ?? 443) == (webSocketBaseURL.port ?? 443) else {
             throw T3ConnectRelayError.invalidConfiguration(
                 "The managed environment endpoint is invalid."
             )
@@ -461,14 +463,39 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
     {
-        let environments = try await runtime.environments().filter(\.isEnabled)
+        let environments = try await runtime.environments().filter {
+            $0.isEnabled && $0.descriptor?.capabilities.pullRequests == true
+        }
         let runtime = runtime
         return await withTaskGroup(of: FeaturePullRequestEnvironmentList.self) { group in
             for environment in environments {
                 group.addTask {
                     let probe = await runtime.ephemeralClient(for: environment)
                     do {
-                        let result = try await probe.pullRequests(input)
+                        var result = try await probe.pullRequests(input)
+                        var visitedCursors = Set<String>()
+                        while !result.nextCursors.isEmpty {
+                            try Task.checkCancellation()
+                            let cursorIdentity = result.nextCursors
+                                .sorted { $0.key < $1.key }
+                                .map { "\($0.key)=\($0.value)" }
+                                .joined(separator: "&")
+                            guard visitedCursors.insert(cursorIdentity).inserted else { break }
+                            let next = try await probe.pullRequests(
+                                PullRequestListInput(
+                                    state: input.state,
+                                    involvement: input.involvement,
+                                    filters: input.filters,
+                                    projectId: input.projectId,
+                                    projectIds: input.projectIds,
+                                    host: input.host,
+                                    limit: input.limit,
+                                    cursors: result.nextCursors,
+                                    query: input.query
+                                )
+                            )
+                            result = result.appending(next)
+                        }
                         await probe.disconnect()
                         return FeaturePullRequestEnvironmentList(
                             environmentID: environment.id,
@@ -1887,6 +1914,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         settingsStore.set(data, forKey: Self.settingsKey)
     }
 
+    var managesServerSessions: Bool {
+        !t3ConnectDeviceManager.hasActiveAccount
+    }
+
     func loadDeviceSessions() async throws -> [FeatureDeviceSession] {
         if t3ConnectDeviceManager.hasActiveAccount {
             let devices = try await t3ConnectDeviceManager.registeredDevices()
@@ -2273,6 +2304,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let mapped = NativeWorkspaceMapper.terminal(snapshot)
         var scoped = mapped
         scoped.threadID = route.uiID
+        scoped.buffer = Self.cappedTerminalBuffer(scoped.buffer)
         terminalSnapshots[TerminalKey(threadID: route.uiID, terminalID: terminalID)] = scoped
     }
 
@@ -2881,7 +2913,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         client: T3Client,
         refreshActiveThread: Bool
     ) async {
-        guard let currentClient = self.client, currentClient === client else { return }
+        guard let currentClient = self.client,
+              currentClient === client,
+              shell.snapshotSequence >= (latestShell?.snapshotSequence ?? .min) else {
+            return
+        }
         shellPublishTask?.cancel()
         shellPublishTask = nil
         latestShell = shell
@@ -2899,7 +2935,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         client: T3Client,
         generation: Int
     ) async {
-        guard isCurrentSession(client: client, generation: generation) else { return }
+        guard isCurrentSession(client: client, generation: generation),
+              shell.snapshotSequence >= (latestShell?.snapshotSequence ?? .min) else {
+            return
+        }
         shellPublishTask?.cancel()
         shellPublishTask = nil
         latestShell = shell
@@ -3390,7 +3429,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 }
             }
             if let shell = load.shell {
-                shellsByEnvironmentID[load.environment.id] = shell
+                if shell.snapshotSequence
+                    >= (shellsByEnvironmentID[load.environment.id]?.snapshotSequence ?? .min) {
+                    shellsByEnvironmentID[load.environment.id] = shell
+                }
                 environmentConnectionStates[load.environment.id] = .connected
                 environmentConnectionDetails[load.environment.id] = nil
             } else {
@@ -3495,6 +3537,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let shell = try await client.shellSnapshot()
         guard isKnownClient(client, environmentID: environment.id, generation: generation) else {
             throw CancellationError()
+        }
+        guard shell.snapshotSequence
+            >= (shellsByEnvironmentID[environment.id]?.snapshotSequence ?? .min) else {
+            return
         }
         shellsByEnvironmentID[environment.id] = shell
         if activeEnvironment?.id == environment.id {
@@ -3601,7 +3647,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         let environments = (try? await runtime.environments()) ?? [environment]
         guard generation == environmentGeneration,
               expectedGeneration == nil || expectedGeneration == environmentGeneration,
-              activeEnvironment?.id == environment.id else {
+              activeEnvironment?.id == environment.id,
+              shell.snapshotSequence
+                  >= (shellsByEnvironmentID[sourceEnvironment.id]?.snapshotSequence ?? .min) else {
             return
         }
         shellsByEnvironmentID[sourceEnvironment.id] = shell
@@ -3725,6 +3773,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         previous.connection == next.connection
             && previous.environments == next.environments
             && previous.providers == next.providers
+            && previous.providersByEnvironment == next.providersByEnvironment
+            && previous.preferencesByEnvironment == next.preferencesByEnvironment
             && previous.settings == next.settings
             && projectsMatchIgnoringThreadCounts(previous.projects, next.projects)
     }
@@ -3741,6 +3791,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 && left.name == right.name
                 && left.path == right.path
                 && left.defaultSelection == right.defaultSelection
+                && left.repositoryIdentity == right.repositoryIdentity
+                && left.createdAt == right.createdAt
+                && left.updatedAt == right.updatedAt
         }
     }
 
@@ -4049,7 +4102,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             providerID: thread.modelSelection.instanceId,
             providerName: threadProviderName(
                 session: thread.session,
-                modelSelection: thread.modelSelection
+                modelSelection: thread.modelSelection,
+                environmentID: environment.id
             ),
             modelID: thread.modelSelection.model,
             modelOptions: mapOptionSelections(thread.modelSelection.options),
@@ -4118,7 +4172,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             providerID: thread.modelSelection.instanceId,
             providerName: threadProviderName(
                 session: thread.session,
-                modelSelection: thread.modelSelection
+                modelSelection: thread.modelSelection,
+                environmentID: environment.id
             ),
             modelID: thread.modelSelection.model,
             modelOptions: mapOptionSelections(thread.modelSelection.options),
@@ -5193,14 +5248,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func threadProviderName(
         session: OrchestrationSession?,
-        modelSelection: ModelSelection
+        modelSelection: ModelSelection,
+        environmentID: String
     ) -> String {
         if let name = session?.providerName?.trimmingCharacters(in: .whitespacesAndNewlines),
            !name.isEmpty {
             return name
         }
         let providerID = session?.providerInstanceId ?? modelSelection.instanceId
-        if let provider = latestServerConfig?.providers.first(where: {
+        if let provider = serverConfigsByEnvironmentID[environmentID]?.providers.first(where: {
             $0.instanceId == providerID
         }) {
             return provider.displayName ?? providerDisplayName(provider.driver)

@@ -326,6 +326,17 @@ private actor RemovalOrderCredentialStore: CredentialStore {
         storedCredential = credential
     }
 
+    func replaceCredential(
+        _ credential: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) -> Bool {
+        guard environmentID == self.environmentID,
+              storedCredential == expected else { return false }
+        storedCredential = credential
+        return true
+    }
+
     func removeCredential(for environmentID: String) async throws {
         guard environmentID == self.environmentID else { return }
         catalogContainedEnvironmentOnRemoval = try await environmentStore.load()

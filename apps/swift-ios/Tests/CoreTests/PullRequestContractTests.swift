@@ -50,4 +50,30 @@ final class PullRequestContractTests: XCTestCase {
             ])
         )
     }
+
+    func testListPagesPreserveRowsAndAdvanceCursors() {
+        let first = PullRequestListResult(
+            viewers: ["github.com": "theo"],
+            providers: [],
+            entries: [],
+            errors: [],
+            truncated: true,
+            nextCursors: ["github.com t3/repo": "first"]
+        )
+        let second = PullRequestListResult(
+            viewers: ["gitlab.com": "maintainer"],
+            providers: [],
+            entries: [],
+            errors: [],
+            truncated: false,
+            nextCursors: [:]
+        )
+
+        let combined = first.appending(second)
+
+        XCTAssertEqual(combined.viewers["github.com"], "theo")
+        XCTAssertEqual(combined.viewers["gitlab.com"], "maintainer")
+        XCTAssertFalse(combined.truncated)
+        XCTAssertTrue(combined.nextCursors.isEmpty)
+    }
 }

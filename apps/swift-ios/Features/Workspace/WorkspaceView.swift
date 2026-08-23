@@ -40,6 +40,7 @@ public struct WorkspaceView: View {
     @State private var showingEnvironments = false
     @State private var showingSettings = false
     @State private var renamingThread: FeatureThread?
+    @State private var deletingThread: FeatureThread?
     @State private var renameTitle = ""
     @State private var sidebarBoundaryNow = Date.now
     @State private var preferredCompactColumn = NavigationSplitViewColumn.sidebar
@@ -173,6 +174,22 @@ public struct WorkspaceView: View {
             }
             .disabled(renameTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+        .alert(
+            "Delete thread?",
+            isPresented: Binding(
+                get: { deletingThread != nil },
+                set: { if !$0 { deletingThread = nil } }
+            ),
+            presenting: deletingThread
+        ) { thread in
+            Button("Delete", role: .destructive) {
+                deletingThread = nil
+                Task { await model.deleteThread(thread.id) }
+            }
+            Button("Cancel", role: .cancel) { deletingThread = nil }
+        } message: { thread in
+            Text("\"\(thread.title)\" and its terminal history will be permanently deleted.")
+        }
         .onChange(of: selectedThreadIsAvailable) { _, isAvailable in
             if !isAvailable { closeSelectedThread() }
         }
@@ -270,7 +287,7 @@ public struct WorkspaceView: View {
                     Task { await model.setPinned(thread.id, pinned: pinned) }
                 },
                 onDelete: { thread in
-                    Task { await model.deleteThread(thread.id) }
+                    deletingThread = thread
                 }
             )
         }

@@ -48,6 +48,17 @@ struct PlatformRootView: View {
             _ = PlatformRouteMailbox.shared.take()
             handle(route)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .t3ConnectSessionChanged)) { note in
+            guard let capability = model.client as? any T3ConnectCapable,
+                  let controller = note.object as? T3ConnectController,
+                  controller === capability.t3ConnectController,
+                  let previousAccountID = note.userInfo?["previousAccountID"] as? String,
+                  let accountID = note.userInfo?["accountID"] as? String,
+                  previousAccountID != accountID else { return }
+            Task { @MainActor in
+                await model.removeManagedEnvironmentsAfterAccountChange()
+            }
+        }
         .onChange(of: model.isLoading, initial: true) { _, isLoading in
             guard !isLoading else { return }
             processThreadChanges()
@@ -215,7 +226,13 @@ struct PlatformRootView: View {
         importedShareProjectID = project.id
         Task { @MainActor in
             do {
-                try await incomingShareCoordinator.importPending(into: project)
+                try await incomingShareCoordinator.importPending(
+                    into: project,
+                    draftKey: FeatureComposerDraftStore.newTaskKey(
+                        project: project,
+                        in: model.snapshot
+                    )
+                )
             } catch {
                 importedShareProjectID = nil
                 model.errorMessage = error.localizedDescription

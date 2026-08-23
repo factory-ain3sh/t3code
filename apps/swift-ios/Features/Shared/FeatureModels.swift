@@ -293,18 +293,29 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.interactionMode = interactionMode
     }
 
-    /// Older cached environment descriptors may omit the optional capability even
-    /// when their server supports pinning. Always keep an existing pin reversible.
+    /// Missing capabilities mean unsupported. Existing states remain reversible
+    /// so older cached snapshots cannot trap a thread in its current state.
     public var canTogglePin: Bool {
-        pinnedAt != nil || supportsPinning != false
+        pinnedAt != nil || supportsPinning == true
     }
 
     public var canToggleSettlement: Bool {
-        isSettled || supportsSettlement != false
+        isSettled || supportsSettlement == true
     }
 
     public var canToggleSnooze: Bool {
-        snoozedUntil != nil || supportsSnooze != false
+        snoozedUntil != nil || supportsSnooze == true
+    }
+
+    var canSettleNow: Bool {
+        guard canToggleSettlement else { return false }
+        if isSettled { return true }
+        switch state {
+        case .queued, .working, .monitoring, .waitingForApproval, .waitingForInput:
+            return false
+        case .idle, .failed, .completed:
+            return true
+        }
     }
 }
 

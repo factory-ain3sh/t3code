@@ -23,13 +23,18 @@ public struct T3ConnectView: View {
 
     public init(
         capability: any T3ConnectCapable,
+        model: FeatureRootModel? = nil,
         purpose: Purpose = .connect,
         onConnected: @escaping @MainActor () async -> Void = {},
         onUnlinked: @escaping @MainActor (String) async -> Void = { _ in }
     ) {
         controller = capability.t3ConnectController
         connectEnvironment = capability.connectT3Environment
-        signOut = capability.signOutT3Connect
+        signOut = if let model {
+            model.signOutT3Connect
+        } else {
+            capability.signOutT3Connect
+        }
         self.purpose = purpose
         self.onConnected = onConnected
         self.onUnlinked = onUnlinked

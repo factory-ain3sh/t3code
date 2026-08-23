@@ -114,6 +114,29 @@ struct HomeThreadSwipeActionTests {
         #expect(!HomeThreadSwipeAction.performsFullSwipe(with: archivedActions))
     }
 
+    @Test
+    func workingRowsNeverOfferSettlementOrAFullSwipe() {
+        for state in [
+            FeatureThreadState.queued,
+            .working,
+            .monitoring,
+            .waitingForApproval,
+            .waitingForInput,
+        ] {
+            var active = thread(id: "active-\(state.rawValue)")
+            active.state = state
+
+            let actions = HomeThreadSwipeAction.trailingActions(
+                for: active,
+                isArchived: false,
+                at: now
+            )
+
+            #expect(actions == [.archive, .delete])
+            #expect(!HomeThreadSwipeAction.performsFullSwipe(with: actions))
+        }
+    }
+
     /// Delete must never reach the edge slot, because the edge slot is what a
     /// full swipe runs. This sweeps every pinned/settled/capability/archived
     /// combination rather than trusting the branch order.
@@ -264,7 +287,9 @@ struct HomeThreadSwipeActionTests {
             updatedAt: now.addingTimeInterval(-50),
             state: .idle,
             lastActivityAt: now.addingTimeInterval(-50),
-            pinnedAt: pinnedAt
+            pinnedAt: pinnedAt,
+            supportsSettlement: true,
+            supportsPinning: true
         )
     }
 }

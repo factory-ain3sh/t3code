@@ -104,6 +104,7 @@ final class PlatformCloudDeliveryCoordinator {
     private var activityTokenTasks: [String: Task<Void, Never>] = [:]
     private var pendingActivityTokens: Set<String> = []
     private var retryTask: Task<Void, Never>?
+    private var observedAccountID: String?
 
     private let deviceFingerprintKey = "swift-ios.cloud-delivery-device.v1"
     private let deviceRegisteredAtKey = "swift-ios.cloud-delivery-device-date.v1"
@@ -131,6 +132,7 @@ final class PlatformCloudDeliveryCoordinator {
 
     func install(controller: T3ConnectController) {
         self.controller = controller
+        observedAccountID = controller.account?.id
         guard observerTasks.isEmpty else {
             requestRegistration()
             return
@@ -148,12 +150,14 @@ final class PlatformCloudDeliveryCoordinator {
         observerTasks.append(Task { @MainActor [weak self] in
             for await _ in NotificationCenter.default.notifications(named: .t3ConnectSessionChanged) {
                 guard !Task.isCancelled, let self else { return }
-                if controller.account == nil {
+                let accountID = controller.account?.id
+                if observedAccountID != accountID {
                     clearSuccessfulRegistrationCache()
                     pendingActivityTokens.removeAll()
                     PlatformAgentAwarenessCoordinator.shared
                         .resetAndResynchronizeLiveActivity()
                 }
+                observedAccountID = accountID
                 refreshActivityTokenObservers()
                 requestRegistration()
             }

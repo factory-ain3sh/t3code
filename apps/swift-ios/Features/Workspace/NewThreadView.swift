@@ -2,6 +2,7 @@ import SwiftUI
 
 public struct NewThreadView: View {
     @SwiftUI.Environment(\.dismiss) private var dismiss
+    @SwiftUI.Environment(\.scenePhase) private var scenePhase
     @Bindable var model: FeatureRootModel
     let submit: (NewTaskRequest) async -> FeatureThread?
     let onCreated: (FeatureThread) -> Void
@@ -153,6 +154,11 @@ public struct NewThreadView: View {
         .onChange(of: startFromOrigin) { scheduleDraftSave() }
         .onChange(of: submissionValidationMessage) { _, _ in
             submissionValidationError = nil
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active, !submittedSuccessfully {
+                persistCurrentDraftImmediately()
+            }
         }
         .task(id: projectID) { await restoreDraftAndLoadBranches() }
         .onDisappear {
@@ -928,14 +934,7 @@ public struct NewThreadView: View {
     }
 
     private func draftKey(for project: FeatureProject) -> String {
-        guard project.repositoryIdentity != nil,
-              let group = DailyUXProjectGrouping.group(
-                  containing: project.id,
-                  in: creationProjectGroups
-              ) else {
-            return FeatureComposerDraftStore.newTaskKey(project: project)
-        }
-        return FeatureComposerDraftStore.newTaskKey(logicalProjectID: group.id)
+        FeatureComposerDraftStore.newTaskKey(project: project, in: model.snapshot)
     }
 
     private var composerDraft: FeatureComposerDraft {

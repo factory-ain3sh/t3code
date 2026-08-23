@@ -394,7 +394,20 @@ public actor EnvironmentAPI {
               refreshed.proofKeyThumbprint?.isEmpty == false else {
             throw HTTPError.incompatibleCredential
         }
-        try await credentials.setCredential(refreshed, for: environment.id)
+        guard try await credentials.replaceCredential(
+            refreshed,
+            ifMatching: credential,
+            for: environment.id
+        ) else {
+            if let current = try await newestUsableManagedCredential(
+                replacing: credential,
+                environment: environment,
+                using: managedAuthorization
+            ) {
+                return current
+            }
+            throw HTTPError.missingCredential
+        }
         return refreshed
     }
 

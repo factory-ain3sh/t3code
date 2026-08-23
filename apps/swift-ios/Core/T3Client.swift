@@ -1741,7 +1741,7 @@ public enum OrchestrationCommands {
                 "type": .string("thread.snooze"),
                 "commandId": .string(commandID),
                 "threadId": .string(threadID),
-                "snoozedUntil": .string(iso8601.string(from: until)),
+                "snoozedUntil": .string(iso8601.format(until)),
             ])
         }
         return .object([
@@ -1803,10 +1803,9 @@ public enum OrchestrationCommands {
     }
 
     public static func now() -> String {
-        iso8601.string(from: Date())
+        iso8601.format(Date())
     }
 
-    /// ISO8601DateFormatter is expensive to construct and thread-safe to use;
-    /// `now()` runs as the default argument of nearly every outbound command.
-    static let iso8601 = ISO8601DateFormatter()
+    /// Commands are built on several actors, so their shared formatter must be Sendable.
+    private static let iso8601 = Date.ISO8601FormatStyle()
 }

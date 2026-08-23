@@ -150,10 +150,10 @@ struct DailyUXSidebarTests {
     }
 
     @Test
-    func pinActionsTolerateMissingCapabilitiesAndKeepPinsReversible() {
+    func pinActionsRequireCapabilitiesAndKeepPinsReversible() {
         var legacyDescriptor = thread(id: "legacy", created: -20, updated: -10)
         legacyDescriptor.supportsPinning = nil
-        #expect(legacyDescriptor.canTogglePin)
+        #expect(!legacyDescriptor.canTogglePin)
 
         var explicitlyUnsupported = thread(id: "unsupported", created: -20, updated: -10)
         explicitlyUnsupported.supportsPinning = false
@@ -179,8 +179,8 @@ struct DailyUXSidebarTests {
         var legacy = thread(id: "legacy-capabilities", created: -20, updated: -10)
         legacy.supportsSettlement = nil
         legacy.supportsSnooze = nil
-        #expect(legacy.canToggleSettlement)
-        #expect(legacy.canToggleSnooze)
+        #expect(!legacy.canToggleSettlement)
+        #expect(!legacy.canToggleSnooze)
     }
 
     @Test
@@ -502,7 +502,10 @@ struct DailyUXSidebarTests {
             updatedAt: now.addingTimeInterval(updated),
             state: state,
             isSettled: isSettled,
-            lastActivityAt: now.addingTimeInterval(updated)
+            lastActivityAt: now.addingTimeInterval(updated),
+            supportsSettlement: true,
+            supportsSnooze: true,
+            supportsPinning: true
         )
     }
 }

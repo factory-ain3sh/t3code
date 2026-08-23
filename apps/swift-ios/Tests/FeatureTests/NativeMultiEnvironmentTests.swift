@@ -200,6 +200,51 @@ final class NativeMultiEnvironmentTests: XCTestCase {
         await fixture.client.disconnect()
     }
 
+    func testOlderHTTPSnapshotCannotReplaceNewerEnvironmentState() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.client.initialSnapshot()
+
+        let newer = multiEnvironmentShell(
+            projectID: "project-one",
+            threadID: "thread-one",
+            title: "Newer work"
+        )
+        await fixture.transport.setShell(
+            OrchestrationShellSnapshot(
+                snapshotSequence: 3,
+                projects: newer.projects,
+                threads: newer.threads,
+                updatedAt: newer.updatedAt
+            ),
+            host: "one.example"
+        )
+        _ = try await fixture.client.initialSnapshot()
+
+        let older = multiEnvironmentShell(
+            projectID: "project-one",
+            threadID: "thread-one",
+            title: "Stale work"
+        )
+        await fixture.transport.setShell(
+            OrchestrationShellSnapshot(
+                snapshotSequence: 2,
+                projects: older.projects,
+                threads: older.threads,
+                updatedAt: older.updatedAt
+            ),
+            host: "one.example"
+        )
+
+        let snapshot = try await fixture.client.initialSnapshot()
+
+        XCTAssertEqual(
+            snapshot.threads.first(where: { $0.environmentID == "one" })?.title,
+            "Newer work"
+        )
+        await fixture.client.disconnect()
+    }
+
     func testBackgroundSnapshotDoesNotStartAggregateRefreshLoops() async throws {
         let loader = CountingAggregateEnvironmentLoader()
         let fixture = try await makeFixture(

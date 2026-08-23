@@ -23,7 +23,7 @@ struct FeatureComposerPowerFeatures {
         self.searchPaths = searchPaths
     }
 
-    static let disabled = FeatureComposerPowerFeatures()
+    static var disabled: FeatureComposerPowerFeatures { FeatureComposerPowerFeatures() }
 }
 
 public struct FeatureProviderSlashCommand: Identifiable, Sendable, Equatable, Hashable, Codable {

@@ -59,6 +59,46 @@ final class WebSocketRPCRaceTests: XCTestCase {
         await client.stop()
     }
 
+    func testUnansweredKeepaliveReconnectsAHalfOpenSocket() async throws {
+        let silent = BlockingReceiveConnection()
+        let recovered = AutoReplyConnection()
+        let connector = SequencedConnector(connections: [silent, recovered])
+        let client = WebSocketRPCClient(
+            connector: connector,
+            connectionWaitTimeout: .seconds(1),
+            keepaliveInterval: .milliseconds(10),
+            reconnectBackoff: { _ in .zero },
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+
+        await client.start()
+        await connector.waitUntilConnectionCount(2)
+
+        let response = try await client.request("server.afterKeepalive", as: JSONValue.self)
+        XCTAssertEqual(response, .object([:]))
+        await client.stop()
+    }
+
+    func testSubscriptionOverflowReconnectsWithoutAcknowledgingDroppedEvents() async {
+        let overflowing = OverflowingSubscriptionConnection()
+        let recovered = BlockingReceiveConnection()
+        let connector = SequencedConnector(connections: [overflowing, recovered])
+        let client = WebSocketRPCClient(
+            connector: connector,
+            subscriptionBufferLimit: 2,
+            reconnectBackoff: { _ in .zero },
+            endpointProvider: { URL(string: "wss://studio.example/ws")! }
+        )
+
+        let stream = await client.subscribe("thread.events", as: JSONValue.self)
+        await connector.waitUntilConnectionCount(2)
+
+        let acknowledgementCount = await overflowing.acknowledgementCount()
+        XCTAssertEqual(acknowledgementCount, 0)
+        _ = stream
+        await client.stop()
+    }
+
     func testHungSendTimesOutAndReconnectsWithAFreshResponseWindow() async throws {
         let hung = HungSendConnection()
         let recovered = AutoReplyConnection()
@@ -461,6 +501,54 @@ private actor BlockingReceiveConnection: WebSocketConnection {
     func close() {
         continuation?.resume(throwing: CancellationError())
         continuation = nil
+    }
+}
+
+private actor OverflowingSubscriptionConnection: WebSocketConnection {
+    private var queuedResponses: [Data] = []
+    private var receiver: CheckedContinuation<Data, Error>?
+    private var acknowledgements = 0
+
+    func send(_ data: Data) throws {
+        let envelope = try JSONDecoder.t3.decode(JSONValue.self, from: data)
+        if envelope["_tag"]?.stringValue == "Ack" {
+            acknowledgements += 1
+            return
+        }
+        guard envelope["_tag"]?.stringValue == "Request",
+              case let .number(requestID)? = envelope["id"] else { return }
+        let chunk = JSONValue.object([
+            "_tag": .string("Chunk"),
+            "requestId": .number(requestID),
+            "values": .array([
+                .string("first"),
+                .string("second"),
+                .string("overflow"),
+            ]),
+        ])
+        let response = try JSONEncoder.t3.encode(chunk)
+        if let receiver {
+            self.receiver = nil
+            receiver.resume(returning: response)
+        } else {
+            queuedResponses.append(response)
+        }
+    }
+
+    func receive() async throws -> Data {
+        if !queuedResponses.isEmpty {
+            return queuedResponses.removeFirst()
+        }
+        return try await withCheckedThrowingContinuation { receiver = $0 }
+    }
+
+    func close() {
+        receiver?.resume(throwing: CancellationError())
+        receiver = nil
+    }
+
+    func acknowledgementCount() -> Int {
+        acknowledgements
     }
 }
 

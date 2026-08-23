@@ -377,7 +377,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                     })
                 }
 
-                if thread.canToggleSettlement {
+                if thread.canSettleNow {
                     let isSettled = thread.isEffectivelySettled(at: .now)
                     actions.append(accessibilityAction(
                         isSettled ? "Reopen" : "Settle",
@@ -497,7 +497,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                         }
                     )
                 }
-                if thread.canToggleSettlement {
+                if thread.canSettleNow {
                     let isSettled = thread.isEffectivelySettled(at: .now)
                     statusActions.append(
                         UIAction(
@@ -739,7 +739,7 @@ enum HomeThreadSwipeAction: Equatable {
     ) -> [HomeThreadSwipeAction] {
         guard !isArchived else { return [.restore, .delete] }
 
-        let settlement: HomeThreadSwipeAction? = thread.canToggleSettlement
+        let settlement: HomeThreadSwipeAction? = thread.canSettleNow
             ? (thread.isEffectivelySettled(at: now) ? .reopen : .settle)
             : nil
         let isPinned = thread.pinnedAt != nil && thread.canTogglePin

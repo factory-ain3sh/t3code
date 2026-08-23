@@ -4,6 +4,11 @@ import Security
 public protocol CredentialStore: Sendable {
     func credential(for environmentID: String) async throws -> EnvironmentCredential?
     func setCredential(_ credential: EnvironmentCredential, for environmentID: String) async throws
+    func replaceCredential(
+        _ credential: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) async throws -> Bool
     func removeCredential(for environmentID: String) async throws
 }
 
@@ -91,6 +96,16 @@ public actor KeychainCredentialStore: CredentialStore {
             throw CredentialStoreError.keychain(status)
         }
     }
+
+    public func replaceCredential(
+        _ credential: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) throws -> Bool {
+        guard try self.credential(for: environmentID) == expected else { return false }
+        try setCredential(credential, for: environmentID)
+        return true
+    }
 }
 
 public actor InMemoryCredentialStore: CredentialStore {
@@ -113,6 +128,16 @@ public actor InMemoryCredentialStore: CredentialStore {
 
     public func removeCredential(for environmentID: String) {
         credentials.removeValue(forKey: environmentID)
+    }
+
+    public func replaceCredential(
+        _ credential: EnvironmentCredential,
+        ifMatching expected: EnvironmentCredential,
+        for environmentID: String
+    ) -> Bool {
+        guard credentials[environmentID] == expected else { return false }
+        credentials[environmentID] = credential
+        return true
     }
 }
 

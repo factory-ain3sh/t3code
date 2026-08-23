@@ -45,6 +45,45 @@ final class PairingServiceTests: XCTestCase {
         // fails with scope_not_granted.
         XCTAssertFalse(form.contains("scope="))
     }
+
+    func testFailedRepairRestoresTheExistingCredential() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t3-swift-pairing-rollback-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o700))],
+                ofItemAtPath: directory.path
+            )
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let credentials = InMemoryCredentialStore(credentials: [
+            "environment-1": EnvironmentCredential(accessToken: "previous-access-token"),
+        ])
+        let environments = EnvironmentStore(
+            fileURL: directory.appendingPathComponent("environments.json")
+        )
+        let service = PairingService(
+            transport: PairingHTTPTransport(),
+            environmentStore: environments,
+            credentialStore: credentials
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o500))],
+            ofItemAtPath: directory.path
+        )
+
+        do {
+            _ = try await service.pair(
+                url: "https://studio.example/#token=pair-once",
+                label: "Theo's iPhone"
+            )
+            XCTFail("Pairing unexpectedly updated a read-only environment catalog")
+        } catch {
+            let restored = await credentials.credential(for: "environment-1")
+            XCTAssertEqual(restored?.accessToken, "previous-access-token")
+        }
+    }
 }
 
 private actor PairingHTTPTransport: HTTPTransport {

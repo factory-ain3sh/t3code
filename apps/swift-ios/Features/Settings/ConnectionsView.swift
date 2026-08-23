@@ -60,6 +60,7 @@ struct ConnectionsView: View {
                 NavigationStack {
                     T3ConnectView(
                         capability: capability,
+                        model: model,
                         purpose: .manage,
                         onUnlinked: { id in
                             await model.removeEnvironment(id)

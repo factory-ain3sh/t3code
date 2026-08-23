@@ -5,6 +5,7 @@ import UIKit
 public struct ThreadDetailView: View {
     @SwiftUI.Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @SwiftUI.Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @SwiftUI.Environment(\.scenePhase) private var scenePhase
 
     @Bindable var model: FeatureRootModel
     let thread: FeatureThread
@@ -79,6 +80,11 @@ public struct ThreadDetailView: View {
         .onChange(of: draft) { scheduleDraftSave() }
         .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: selection) { scheduleDraftSave() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active {
+                persistDraftBeforeLeaving()
+            }
+        }
         .onDisappear {
             model.releaseThread(thread.id)
             persistDraftBeforeLeaving()
@@ -254,7 +260,7 @@ public struct ThreadDetailView: View {
                         )
                     }
                 }
-                if currentThread.canToggleSettlement, !currentThread.isArchived {
+                if currentThread.canSettleNow, !currentThread.isArchived {
                     let isSettled = currentThread.isEffectivelySettled(at: .now)
                     Button {
                         Task { await model.setSettled(thread.id, settled: !isSettled) }
@@ -1419,10 +1425,6 @@ private struct ThreadBackSwipeGestureView: UIViewRepresentable {
 
         required init?(coder: NSCoder) {
             fatalError("init(coder:) has not been implemented")
-        }
-
-        deinit {
-            uninstallGesture()
         }
 
         override func didMoveToWindow() {

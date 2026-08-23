@@ -149,7 +149,7 @@ public struct ConnectionOnboardingView: View {
                    let capability = model.client as? any T3ConnectCapable,
                    capability.t3ConnectController.unavailableReason == nil {
                     NavigationLink {
-                        T3ConnectView(capability: capability) {
+                        T3ConnectView(capability: capability, model: model) {
                             await model.reloadAfterConnection()
                             onConnected()
                         }
