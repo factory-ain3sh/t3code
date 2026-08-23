@@ -642,6 +642,77 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("rejects a concurrent duplicate Droid permission response", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-permission-response-race");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const requestResolved =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.resolved" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) return Effect.void;
+        if (event.type === "request.opened") {
+          return Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
+        }
+        if (event.type === "request.resolved") {
+          return Deferred.succeed(requestResolved, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "race permission responses",
+        attachments: [],
+      });
+
+      const opened = yield* Deferred.await(requestOpened);
+      const requestId = ApprovalRequestId.make(String(opened.requestId));
+      const outcomes = yield* Effect.all(
+        [
+          { label: "accept", decision: "accept" as const },
+          { label: "decline", decision: "decline" as const },
+        ].map(({ label, decision }) =>
+          adapter.respondToRequest(threadId, requestId, decision).pipe(
+            Effect.match({
+              onFailure: (error) => ({ _tag: "Failure" as const, label, error }),
+              onSuccess: () => ({ _tag: "Success" as const, label, decision }),
+            }),
+          ),
+        ),
+        { concurrency: "unbounded" },
+      );
+      const successes = outcomes.filter((outcome) => outcome._tag === "Success");
+      const failures = outcomes.filter((outcome) => outcome._tag === "Failure");
+
+      assert.lengthOf(successes, 1, "exactly one concurrent approval response should succeed");
+      assert.lengthOf(failures, 1, "the duplicate approval response should fail");
+      const duplicateFailure = failures[0];
+      assert.equal(duplicateFailure?.error._tag, "ProviderAdapterRequestError");
+      if (duplicateFailure?.error._tag === "ProviderAdapterRequestError") {
+        assert.include(duplicateFailure.error.detail, "Unknown pending approval request");
+      }
+
+      const resolved = yield* Deferred.await(requestResolved);
+      const appliedDecision = successes[0]?.decision;
+      assert.isDefined(appliedDecision);
+      assert.equal(resolved.payload.decision, appliedDecision);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("round-trips a denied Droid permission as a cancelled turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-denied");
@@ -766,6 +837,77 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(String(resolvedEvent.requestId), String(requestedEvent.requestId));
       assert.deepEqual(resolvedEvent.payload.answers, { "1": "workspace" });
       assert.equal(terminal.payload.state, "completed");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a concurrent duplicate Droid user-input response", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-user-input-response-race");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDroidWrapper({ T3_DROID_MOCK_ASK_USER: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const requested =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
+      const resolved =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) return Effect.void;
+        if (event.type === "user-input.requested") {
+          return Deferred.succeed(requested, event).pipe(Effect.ignore);
+        }
+        if (event.type === "user-input.resolved") {
+          return Deferred.succeed(resolved, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "race user input responses",
+        attachments: [],
+      });
+
+      const requestedEvent = yield* Deferred.await(requested);
+      const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
+      const outcomes = yield* Effect.all(
+        [
+          { label: "workspace", answers: { "1": "workspace" } },
+          { label: "session", answers: { "1": "session" } },
+        ].map(({ label, answers }) =>
+          adapter.respondToUserInput(threadId, requestId, answers).pipe(
+            Effect.match({
+              onFailure: (error) => ({ _tag: "Failure" as const, label, error }),
+              onSuccess: () => ({ _tag: "Success" as const, label, answers }),
+            }),
+          ),
+        ),
+        { concurrency: "unbounded" },
+      );
+      const successes = outcomes.filter((outcome) => outcome._tag === "Success");
+      const failures = outcomes.filter((outcome) => outcome._tag === "Failure");
+
+      assert.lengthOf(successes, 1, "exactly one concurrent user-input response should succeed");
+      assert.lengthOf(failures, 1, "the duplicate user-input response should fail");
+      const duplicateFailure = failures[0];
+      assert.equal(duplicateFailure?.error._tag, "ProviderAdapterRequestError");
+      if (duplicateFailure?.error._tag === "ProviderAdapterRequestError") {
+        assert.include(duplicateFailure.error.detail, "Unknown pending user-input request");
+      }
+
+      const resolvedEvent = yield* Deferred.await(resolved);
+      const appliedAnswers = successes[0]?.answers;
+      assert.isDefined(appliedAnswers);
+      assert.deepEqual(resolvedEvent.payload.answers, appliedAnswers);
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
@@ -1452,6 +1594,115 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("stops open Droid child tasks before an explicit session exit", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-child-session-stop");
+      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const taskStarted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "task.started" }>>();
+      const sessionExited =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "task.started" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(taskStarted, event).pipe(Effect.asVoid)
+              : event.type === "session.exited" && String(event.threadId) === String(threadId)
+                ? Deferred.succeed(sessionExited, event).pipe(Effect.asVoid)
+                : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "mock hanging child session",
+        attachments: [],
+      });
+      const started = yield* Deferred.await(taskStarted);
+      yield* adapter.stopSession(threadId);
+      const exited = yield* Deferred.await(sessionExited);
+      const threadEvents = eventsForThread(runtimeEvents, threadId);
+      const taskCompleted = threadEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "task.completed" }> =>
+          event.type === "task.completed" &&
+          String(event.payload.taskId) === String(started.payload.taskId),
+      );
+
+      assert.lengthOf(taskCompleted, 1, "stopping the session should settle its open child task");
+      assert.equal(taskCompleted[0]?.payload.status, "stopped");
+      assert.isBelow(threadEvents.indexOf(taskCompleted[0]!), threadEvents.indexOf(exited));
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+    }),
+  );
+
+  it.effect("stops open Droid child tasks before an unexpected process exit", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-child-session-process-exit");
+      const wrapperPath = yield* Effect.promise(() => makeMockDroidWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const taskStarted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "task.started" }>>();
+      const sessionExited =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "task.started" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(taskStarted, event).pipe(Effect.asVoid)
+              : event.type === "session.exited" && String(event.threadId) === String(threadId)
+                ? Deferred.succeed(sessionExited, event).pipe(Effect.asVoid)
+                : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "mock child session then exit",
+        attachments: [],
+      });
+      const started = yield* Deferred.await(taskStarted);
+      const exited = yield* Deferred.await(sessionExited);
+      const threadEvents = eventsForThread(runtimeEvents, threadId);
+      const taskCompleted = threadEvents.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "task.completed" }> =>
+          event.type === "task.completed" &&
+          String(event.payload.taskId) === String(started.payload.taskId),
+      );
+
+      assert.lengthOf(
+        taskCompleted,
+        1,
+        "unexpected process exit should settle its open child task",
+      );
+      assert.equal(taskCompleted[0]?.payload.status, "stopped");
+      assert.isBelow(threadEvents.indexOf(taskCompleted[0]!), threadEvents.indexOf(exited));
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
     }),
   );
 

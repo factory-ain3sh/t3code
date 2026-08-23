@@ -631,6 +631,33 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         { discard: true },
       );
 
+    const completeAllOpenChildTasks = (ctx: DroidSessionContext) =>
+      Effect.gen(function* () {
+        const childSessions = Array.from(ctx.childSessions);
+        ctx.childSessions.clear();
+        yield* Effect.forEach(
+          childSessions,
+          ([sessionId, child]) =>
+            makeEventStamp().pipe(
+              Effect.flatMap((stamp) =>
+                offerRuntimeEvent({
+                  type: "task.completed",
+                  ...stamp,
+                  provider: PROVIDER,
+                  threadId: ctx.threadId,
+                  turnId: ctx.activeTurnId ?? ctx.session.activeTurnId,
+                  payload: {
+                    taskId: RuntimeTaskId.make(sessionId),
+                    status: "stopped",
+                    summary: child.description,
+                  },
+                }),
+              ),
+            ),
+          { discard: true },
+        );
+      });
+
     /**
      * Terminal settlement for a turn. Emits exactly one turn.completed; late
      * completions for interrupted or already-settled turns are dropped.
@@ -1128,6 +1155,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        yield* completeAllOpenChildTasks(ctx);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
@@ -1413,6 +1441,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   // stale watcher must not tear down a replacement session.
                   const live = sessions.get(input.threadId);
                   if (live !== ctx || live.stopped) return;
+                  live.stopped = true;
+                  yield* completeAllOpenChildTasks(live);
                   const activeTurnId = live.activeTurnId ?? live.session.activeTurnId;
                   if (activeTurnId !== undefined) {
                     yield* settleTurn(live, activeTurnId, {
@@ -1420,7 +1450,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                       errorMessage: `Droid exited unexpectedly (${exit.description}).`,
                     });
                   }
-                  live.stopped = true;
                   yield* settlePendingApprovalsAsCancelled(live.pendingApprovals);
                   yield* settlePendingUserInputsAsCancelled(live.pendingUserInputs);
                   sessions.delete(input.threadId);
@@ -1681,6 +1710,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             detail: `Unknown pending approval request: ${requestId}`,
           });
         }
+        ctx.pendingApprovals.delete(requestId);
         yield* Deferred.succeed(pending.decision, decision);
       });
 
@@ -1699,6 +1729,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             detail: `Unknown pending user-input request: ${requestId}`,
           });
         }
+        ctx.pendingUserInputs.delete(requestId);
         yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers });
       });
 

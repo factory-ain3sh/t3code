@@ -285,6 +285,25 @@ async function runTurn(params: {
     emitTerminalForSession(childSessionId, "completed", `child-${turnId}`);
   }
 
+  if (
+    params.text === "mock hanging child session" ||
+    params.text === "mock child session then exit"
+  ) {
+    notify({
+      type: "child_session_available",
+      childSessionId,
+      description: "Mock delegated task",
+      timestamp: 1,
+    });
+    if (params.text === "mock child session then exit") {
+      await new Promise<void>((resolve, reject) =>
+        process.stdout.write("", (error) => (error ? reject(error) : resolve())),
+      );
+      process.exit(7);
+    }
+    return;
+  }
+
   if (params.text === "mock taskless progress") {
     notify({
       type: "tool_progress_update",
