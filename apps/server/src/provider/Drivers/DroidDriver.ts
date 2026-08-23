@@ -29,6 +29,7 @@ import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
   makePackageManagedProviderMaintenanceResolver,
+  normalizeCommandPath,
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "../providerMaintenance.ts";
 import {
@@ -40,11 +41,30 @@ import {
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("droid");
-const UPDATE = makePackageManagedProviderMaintenanceResolver({
+
+/**
+ * The curl installer puts droid in ~/.local/bin; the Windows PowerShell installer puts
+ * droid.exe in %USERPROFILE%\bin. Both are self-updating single-executable installs, so
+ * they update through `droid update`. Anything else (npm, bun, pnpm, Homebrew) keeps its
+ * package-manager update path.
+ */
+function isDroidNativeCommandPath(commandPath: string): boolean {
+  const normalized = normalizeCommandPath(commandPath);
+  return (
+    normalized.endsWith("/.local/bin/droid") || /\/users\/[^/]+\/bin\/droid\.exe$/.test(normalized)
+  );
+}
+
+export const DroidProviderMaintenanceResolver = makePackageManagedProviderMaintenanceResolver({
   provider: DRIVER_KIND,
   npmPackageName: "@factory/cli",
   homebrewFormula: null,
-  nativeUpdate: null,
+  nativeUpdate: {
+    executable: "droid",
+    args: ["update"],
+    lockKey: "droid-native",
+    isCommandPath: isDroidNativeCommandPath,
+  },
 });
 
 export type DroidDriverEnv =
@@ -102,10 +122,13 @@ export const DroidDriver: ProviderDriver<DroidSettings, DroidDriverEnv> = {
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies DroidSettings;
-      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
-        binaryPath: effectiveConfig.binaryPath,
-        env: processEnv,
-      });
+      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+        DroidProviderMaintenanceResolver,
+        {
+          binaryPath: effectiveConfig.binaryPath,
+          env: processEnv,
+        },
+      );
 
       const adapter = yield* makeDroidAdapter(effectiveConfig, {
         environment: processEnv,

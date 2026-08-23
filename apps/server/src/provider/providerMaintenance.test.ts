@@ -20,6 +20,7 @@ import {
   resolveLatestProviderVersion,
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "./providerMaintenance.ts";
+import { DroidProviderMaintenanceResolver } from "./Drivers/DroidDriver.ts";
 
 const driver = (value: string) => ProviderDriverKind.make(value);
 const makeTempDir = (name: string) =>
@@ -595,6 +596,90 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       provider: driver("packageTool"),
       packageName: "@example/package-tool",
       update: null,
+    });
+  });
+
+  it.effect("routes curl-installed Droid binaries to droid's native self-update", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* makeTempDir("t3-droid-native-capabilities");
+      const droidBinDir = NodePath.join(tempDir, ".local", "bin");
+      NodeFS.mkdirSync(droidBinDir, { recursive: true });
+      const droidPath = NodePath.join(droidBinDir, "droid");
+      NodeFS.writeFileSync(droidPath, "#!/bin/sh\n");
+      NodeFS.chmodSync(droidPath, 0o755);
+
+      const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+        DroidProviderMaintenanceResolver,
+        {
+          binaryPath: "droid",
+          env: {
+            PATH: droidBinDir,
+          },
+        },
+      ).pipe(Effect.provideService(HostProcessPlatform, "darwin"));
+
+      expect(capabilities).toEqual({
+        provider: driver("droid"),
+        packageName: "@factory/cli",
+        update: {
+          command: "droid update",
+
+          executable: "droid",
+
+          args: ["update"],
+
+          lockKey: "droid-native",
+        },
+      });
+    }),
+  );
+
+  it("routes Windows-installed Droid binaries to droid's native self-update", () => {
+    expect(
+      DroidProviderMaintenanceResolver.resolve({
+        binaryPath: "C:\\Users\\dev\\bin\\droid.exe",
+        env: {
+          PATH: "",
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+      }),
+    ).toEqual({
+      provider: driver("droid"),
+      packageName: "@factory/cli",
+      update: {
+        command: "droid update",
+
+        executable: "droid",
+
+        args: ["update"],
+
+        lockKey: "droid-native",
+      },
+    });
+  });
+
+  it("keeps npm updates for Droid binaries inside npm's global node_modules tree", () => {
+    expect(
+      DroidProviderMaintenanceResolver.resolve({
+        binaryPath:
+          "C:\\Users\\dev\\AppData\\Roaming\\npm\\node_modules\\@factory\\cli\\bin\\droid.exe",
+        env: {
+          PATH: "",
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+      }),
+    ).toEqual({
+      provider: driver("droid"),
+      packageName: "@factory/cli",
+      update: {
+        command: "npm install -g --allow-scripts=@factory/cli @factory/cli@latest",
+
+        executable: "npm",
+
+        args: ["install", "-g", "--allow-scripts=@factory/cli", "@factory/cli@latest"],
+
+        lockKey: "npm-global",
+      },
     });
   });
 });

@@ -9,11 +9,21 @@ installing and authenticating the CLI.
 
 ## Install And Log In
 
-Install Factory Droid:
+Install Factory Droid.
+
+macOS and Linux:
 
 ```bash
-npm install -g @factory/cli
+curl -fsSL https://app.factory.ai/cli | sh
 ```
+
+Windows:
+
+```powershell
+irm https://app.factory.ai/cli/windows | iex
+```
+
+Droid keeps itself up to date. Run `droid update` to update manually.
 
 Then start Droid in a terminal:
 
