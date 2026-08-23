@@ -63,8 +63,10 @@ to use, then authenticate it.
 | Grok Build | [Grok Build CLI](https://x.ai/cli)                    | See provider instructions                     | `grok`         | `grok login`                            |
 | OpenCode   | [OpenCode](https://opencode.ai)                       | See provider instructions                     | `opencode`     | `opencode auth login`                   |
 
-Codex and Claude are on by default. Cursor, Droid, Grok Build, and OpenCode are off by default;
-turn them on in **Settings** → the provider's card when you want to use them.
+On Windows, install Droid with `irm https://app.factory.ai/cli/windows | iex`.
+
+Codex, Claude, and Cursor are on by default. Droid, Grok Build, and OpenCode are off by default; turn
+them on in **Settings** → the provider's card when you want to use them.
 
 Cursor is the one to watch: install Cursor CLI, which provides the `cursor-agent` binary that
 T3 Code looks for, but authenticate with `agent login`, not `cursor-agent login`.

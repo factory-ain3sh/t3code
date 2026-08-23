@@ -23,7 +23,8 @@ Windows:
 irm https://app.factory.ai/cli/windows | iex
 ```
 
-Droid keeps itself up to date. Run `droid update` to update manually.
+Installations from these commands support automatic updates. Run `droid update` to check and update
+manually.
 
 Then start Droid in a terminal:
 
@@ -31,11 +32,13 @@ Then start Droid in a terminal:
 droid
 ```
 
-Follow the browser sign-in flow. Run this on the machine that runs the T3 Code server.
+Follow the browser sign-in flow. Run this on the machine that runs the T3 Code server. Droid stores
+the resulting Factory account credentials in that user's Factory home.
 
-For API-key authentication, set `FACTORY_API_KEY` in the Droid provider's Environment variables
-section in Settings. Mark it as sensitive so T3 Code stores it as a server secret and does not send
-it back to the app after saving.
+For automation, set `FACTORY_API_KEY` in the Droid provider's Environment variables section in
+Settings. Mark it as sensitive so T3 Code stores it as a server secret and does not send it back to
+the app after saving. When both are present, the API key takes precedence over the stored Factory
+account login.
 
 ## Models And Reasoning
 
@@ -43,15 +46,19 @@ T3 Code fetches the available models from Droid dynamically. Each model advertis
 efforts it supports, and those choices appear with the model in the picker. The list can change as
 Factory adds or updates models without requiring a T3 Code update.
 
+You can change the model or reasoning effort in an existing thread. T3 Code applies the new choice
+before it sends the next message to Droid.
+
 ## Slash Commands And Skills
 
 T3 Code reads your Droid slash commands and skills when it checks the provider, so they appear in the
 composer alongside every other provider's. Custom commands keep their argument hints, and skills keep
-their descriptions and whether they came from your personal or project configuration. Skills Droid
-does not let you invoke directly, such as its built-ins, stay out of the list.
+their descriptions and source. Skills Droid does not let you invoke directly, such as its built-ins,
+stay out of the list.
 
-Commands and skills resolve on the machine running the server, from your personal Droid
-configuration. Add a command or skill, refresh the Droid card in Settings, and it shows up.
+Commands and skills resolve on the machine running the server against the server's working
+directory, so project-local entries are discovered alongside personal ones. Add a command or skill,
+refresh the Droid card in Settings, and it shows up.
 
 ## Permission Modes
 
@@ -64,16 +71,17 @@ T3 Code maps its permission modes onto Droid's command confirmation levels:
 | Auto                           | Also allows reversible commands without prompting |
 | Full access                    | Allows all commands without prompting             |
 
-Approvals appear inline in the conversation. Rejecting one returns control to Droid so it can adapt
-or ask what to do next.
+Approvals appear inline in the conversation. Rejecting one cancels the current turn; send another
+message to tell Droid how to proceed.
 
 ## Plan Mode
 
-T3 Code's plan mode uses Droid's Spec Mode. Droid researches and writes a plan before implementation,
-then presents the plan approval as an approval request in the conversation. Approve it to begin
-implementation or reject it to keep refining the plan. On approval, Droid hands the work to an
-implementation session in the same thread; the turn keeps streaming and the thread resumes onto the
-implementation conversation afterwards.
+When T3 Code's plan mode is enabled, it uses Droid's Spec Mode. Droid researches and writes a plan
+before implementation, then presents the plan approval as an approval request in the conversation.
+Approve it to begin implementation. Rejecting it cancels the turn; send another message in plan mode
+to refine the plan. On approval, Droid hands the work to an implementation session in the same
+thread; the turn keeps streaming and the thread resumes onto the implementation conversation
+afterwards.
 
 ## Context And Subagents
 
@@ -81,10 +89,17 @@ Droid compacts long conversations automatically, so the context meter shows the 
 compaction rather than lifetime usage. When Droid delegates work to a subagent, it appears as a task
 in the conversation with its own completion state.
 
+If you send another message while Droid is working, T3 Code treats it as steering for the active
+turn. Droid may fold it into the current run or process it immediately afterwards.
+
 ## Session Resume
 
 Droid sessions resume across T3 Code server restarts. Reopen the same thread and continue where you
 left off instead of starting a new Droid conversation.
+
+After a session resumes, rollback can only target turns completed since T3 Code most recently loaded
+that Droid session. Earlier turns remain in the conversation, but T3 Code cannot use them as Droid
+rollback points.
 
 ## Early Access
 

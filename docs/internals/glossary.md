@@ -98,6 +98,11 @@ The backend agent runtime that actually performs work. Six drivers ship built in
 Cursor, Droid, Grok, and OpenCode. See [ProviderService.ts][14], [ProviderAdapter.ts][15], and
 [CodexAdapter.ts][17] as a representative adapter.
 
+#### Factory home
+
+The per-user base directory used by Factory Droid for settings and credentials. It normally lives
+under the operating-system user's home directory as `.factory`.
+
 #### Session
 
 The live provider-backed runtime attached to a thread. Session shape is in [the orchestration contracts][1], and lifecycle is managed in [ProviderService.ts][14].
