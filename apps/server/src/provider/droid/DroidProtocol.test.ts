@@ -373,7 +373,6 @@ describe("DroidPermissionRequest", () => {
               input: { command: "echo hello" },
               name: "Execute",
             },
-            confirmationType: "exec",
             details: {
               type: "exec",
               fullCommand: "echo hello",

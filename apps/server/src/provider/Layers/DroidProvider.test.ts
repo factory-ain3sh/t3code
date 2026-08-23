@@ -20,7 +20,7 @@ const decodeModelInfo = Schema.decodeUnknownSync(DroidModelInfoSchema);
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 
 const makeInventoryProbeBinary = Effect.fn("makeInventoryProbeBinary")(function* (
-  mode: "concurrent" | "commands-error" | "malformed-model",
+  mode: "concurrent" | "commands-error" | "cwd" | "malformed-model",
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -64,7 +64,12 @@ function resultFor(method) {
         ]
       };
     case "droid.list_commands":
-      return { commands: [{ name: "review", description: "Review changes" }] };
+      return {
+        commands: [{
+          name: "review",
+          description: mode === "cwd" ? process.cwd() : "Review changes"
+        }]
+      };
     case "droid.list_skills":
       return {
         skills: [
@@ -357,6 +362,24 @@ it.layer(NodeServices.layer)("detectDroidAuth", (it) => {
     }),
   );
 
+  it.effect("recognizes the macOS login-keychain credential marker", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-droid-auth-" });
+      yield* fs.makeDirectory(path.join(home, ".factory"), { recursive: true });
+      yield* fs.writeFileString(path.join(home, ".factory", "auth.v2.loginkeychain"), "{}");
+
+      const auth = yield* detectDroidAuth({ HOME: home });
+
+      assert.deepEqual(auth, {
+        status: "authenticated",
+        type: "oauth",
+        label: "Factory account",
+      });
+    }),
+  );
+
   it.effect("degrades to unknown when no credential is on disk", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -395,6 +418,23 @@ it.layer(NodeServices.layer)("checkDroidProviderStatus", (it) => {
             scope: "personal",
           },
         ]);
+      }),
+    ),
+  );
+
+  it.effect("discovers project commands from the configured server cwd", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const binaryPath = yield* makeInventoryProbeBinary("cwd");
+        const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-droid-inventory-cwd-" });
+        const snapshot = yield* checkDroidProviderStatus(
+          decodeDroidSettings({ enabled: true, binaryPath }),
+          { FACTORY_API_KEY: "test-key", PATH: process.env.PATH },
+          cwd,
+        );
+
+        assert.equal(snapshot.slashCommands[0]?.description, cwd);
       }),
     ),
   );

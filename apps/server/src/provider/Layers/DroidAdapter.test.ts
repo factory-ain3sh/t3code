@@ -1307,6 +1307,62 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("applies the selected model to Droid's separate spec-mode slots", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-spec-model");
+      const { adapter } = yield* makeDroidScenario();
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock report selected model",
+        attachments: [],
+        interactionMode: "plan",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("droid"),
+          model: "mock-deep",
+          options: [{ id: "reasoningEffort", value: "high" }],
+        },
+      });
+      yield* Deferred.await(turnCompleted);
+
+      const turnEvents = eventsForThread(runtimeEvents, threadId).filter(
+        (event) => event.turnId !== undefined && String(event.turnId) === String(sentTurn.turnId),
+      );
+      const started = turnEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.started" }> =>
+          event.type === "turn.started",
+      );
+      const modelReport = turnEvents
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta)
+        .join("");
+
+      assert.deepEqual(started?.payload, { model: "mock-deep", effort: "high" });
+      assert.equal(modelReport, "mock-deep:high");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("treats compaction as a no-op and reports the last-call context meter", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-compaction");

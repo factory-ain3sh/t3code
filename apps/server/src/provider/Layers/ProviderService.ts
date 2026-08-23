@@ -314,7 +314,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         );
 
   const persistedResumeCursors = yield* Ref.make(
-    new Map<ProviderInstanceId, ReadonlyMap<ThreadId, unknown | null>>(),
+    new Map<
+      ThreadId,
+      {
+        readonly providerInstanceId: ProviderInstanceId;
+        readonly resumeCursor: unknown | null;
+      }
+    >(),
   );
   const rememberPersistedResumeCursor = (
     providerInstanceId: ProviderInstanceId,
@@ -322,10 +328,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     resumeCursor: unknown | null,
   ) =>
     Ref.update(persistedResumeCursors, (current) => {
+      const persistedSession = current.get(threadId);
+      if (
+        persistedSession?.providerInstanceId === providerInstanceId &&
+        Equal.equals(persistedSession.resumeCursor, resumeCursor)
+      ) {
+        return current;
+      }
       const next = new Map(current);
-      const instanceCursors = new Map(next.get(providerInstanceId));
-      instanceCursors.set(threadId, resumeCursor);
-      next.set(providerInstanceId, instanceCursors);
+      next.set(threadId, { providerInstanceId, resumeCursor });
+      return next;
+    });
+  const forgetPersistedResumeCursor = (threadId: ThreadId) =>
+    Ref.update(persistedResumeCursors, (current) => {
+      if (!current.has(threadId)) return current;
+      const next = new Map(current);
+      next.delete(threadId);
       return next;
     });
 
@@ -373,15 +391,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.flatMap((activeSessions) => {
         const live = activeSessions.find((session) => session.threadId === threadId);
         if (!live) {
-          return Effect.void;
+          return forgetPersistedResumeCursor(threadId);
         }
         const liveResumeCursor = live.resumeCursor ?? null;
         return Ref.get(persistedResumeCursors).pipe(
           Effect.flatMap((persisted) => {
-            const persistedResumeCursor = persisted.get(instanceId)?.get(threadId);
+            const persistedSession = persisted.get(threadId);
             return !force &&
-              persistedResumeCursor !== undefined &&
-              Equal.equals(persistedResumeCursor, liveResumeCursor)
+              persistedSession?.providerInstanceId === instanceId &&
+              Equal.equals(persistedSession.resumeCursor, liveResumeCursor)
               ? Effect.void
               : upsertSessionBinding({ ...live, providerInstanceId: instanceId }, threadId);
           }),
@@ -443,17 +461,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       next.set(id, adapter);
       if (previous.get(id) !== adapter) {
         yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          processRuntimeEvent(
-            {
-              instanceId: id,
-              provider: adapter.provider,
-            },
-            event,
+          (event.type === "session.exited"
+            ? forgetPersistedResumeCursor(event.threadId)
+            : event.type === "turn.completed" &&
+                adapter.capabilities.resumeCursorChangesDuringTurn === true
+              ? persistSessionSnapshot(adapter, id, event.threadId)
+              : Effect.void
           ).pipe(
             Effect.andThen(
-              event.type === "turn.completed"
-                ? persistSessionSnapshot(adapter, id, event.threadId)
-                : Effect.void,
+              processRuntimeEvent(
+                {
+                  instanceId: id,
+                  provider: adapter.provider,
+                },
+                event,
+              ),
             ),
           ),
         ).pipe(Effect.forkScoped);
@@ -1024,6 +1046,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           yield* routed.adapter.stopSession(routed.threadId);
         }
         yield* clearMcpSession(input.threadId);
+        yield* forgetPersistedResumeCursor(input.threadId);
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,

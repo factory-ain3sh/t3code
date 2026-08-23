@@ -25,6 +25,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, describe, vi } from "@effect/vitest";
 
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -73,9 +74,11 @@ const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
+const droidInstanceId = ProviderInstanceId.make("droid");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+const DROID_DRIVER = ProviderDriverKind.make("droid");
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -216,6 +219,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     provider,
     capabilities: {
       sessionModelSwitch: "in-session",
+      ...(provider === DROID_DRIVER ? { resumeCursorChangesDuringTurn: true } : {}),
     },
     startSession,
     sendTurn,
@@ -286,10 +290,12 @@ function makeProviderServiceLayer() {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+  const droid = makeFakeCodexAdapter(DROID_DRIVER);
   const registry = makeAdapterRegistryMock({
     [ProviderDriverKind.make("codex")]: codex.adapter,
     [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
     [ProviderDriverKind.make("cursor")]: cursor.adapter,
+    [ProviderDriverKind.make("droid")]: droid.adapter,
   });
 
   const providerAdapterLayer = Layer.succeed(
@@ -327,6 +333,7 @@ function makeProviderServiceLayer() {
     codex,
     claude,
     cursor,
+    droid,
     layer,
   };
 }
@@ -1770,6 +1777,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         status: "completed",
       };
 
+      const listSessionsCallCount = fanout.codex.listSessions.mock.calls.length;
       fanout.codex.emit(completedEvent);
       yield* advanceTestClock(50);
 
@@ -1787,6 +1795,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         ),
         true,
       );
+      assert.equal(fanout.codex.listSessions.mock.calls.length, listSessionsCallCount);
     }),
   );
 
@@ -1796,8 +1805,8 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
       const threadId = asThreadId("thread-snapshot-unchanged");
       const session = yield* provider.startSession(threadId, {
-        provider: CODEX_DRIVER,
-        providerInstanceId: codexInstanceId,
+        provider: DROID_DRIVER,
+        providerInstanceId: droidInstanceId,
         threadId,
         runtimeMode: "full-access",
       });
@@ -1808,7 +1817,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         return;
       }
 
-      fanout.codex.updateSession(threadId, (current) => ({
+      fanout.droid.updateSession(threadId, (current) => ({
         ...current,
         resumeCursor:
           current.resumeCursor !== null && typeof current.resumeCursor === "object"
@@ -1816,10 +1825,10 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
             : current.resumeCursor,
       }));
       for (const eventId of ["evt-snapshot-unchanged-1", "evt-snapshot-unchanged-2"]) {
-        fanout.codex.emit({
+        fanout.droid.emit({
           type: "turn.completed",
           eventId: asEventId(eventId),
-          provider: CODEX_DRIVER,
+          provider: DROID_DRIVER,
           createdAt: "2026-01-01T00:00:00.000Z",
           threadId,
           turnId: asTurnId(`turn-${eventId}`),
@@ -1844,22 +1853,22 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
       const threadId = asThreadId("thread-snapshot-changed");
       const session = yield* provider.startSession(threadId, {
-        provider: CODEX_DRIVER,
-        providerInstanceId: codexInstanceId,
+        provider: DROID_DRIVER,
+        providerInstanceId: droidInstanceId,
         threadId,
         runtimeMode: "full-access",
       });
       const changedResumeCursor = {
         opaque: `resume-successor-${String(threadId)}`,
       };
-      fanout.codex.updateSession(threadId, (current) => ({
+      fanout.droid.updateSession(threadId, (current) => ({
         ...current,
         resumeCursor: changedResumeCursor,
       }));
-      fanout.codex.emit({
+      fanout.droid.emit({
         type: "turn.completed",
         eventId: asEventId("evt-snapshot-changed"),
-        provider: CODEX_DRIVER,
+        provider: DROID_DRIVER,
         createdAt: "2026-01-01T00:00:00.000Z",
         threadId,
         turnId: asTurnId("turn-snapshot-changed"),
@@ -1873,6 +1882,64 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         assert.notDeepEqual(changedRuntime.value.resumeCursor, session.resumeCursor);
         assert.deepEqual(changedRuntime.value.resumeCursor, changedResumeCursor);
       }
+    }),
+  );
+
+  it.effect("persists a dynamic resume cursor before publishing turn completion", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-snapshot-before-terminal");
+      yield* provider.startSession(threadId, {
+        provider: DROID_DRIVER,
+        providerInstanceId: droidInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      fanout.droid.updateSession(threadId, (current) => ({
+        ...current,
+        resumeCursor: { opaque: "successor-before-terminal" },
+      }));
+
+      const snapshotStarted = yield* Deferred.make<void>();
+      const releaseSnapshot = yield* Deferred.make<void>();
+      const terminalPublished = yield* Deferred.make<void>();
+      const listSessionsImplementation = fanout.droid.listSessions.getMockImplementation();
+      if (listSessionsImplementation === undefined) {
+        return yield* Effect.die("Droid fake listSessions implementation is missing");
+      }
+      fanout.droid.listSessions.mockImplementation(() =>
+        Deferred.succeed(snapshotStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseSnapshot)),
+          Effect.andThen(listSessionsImplementation()),
+        ),
+      );
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => fanout.droid.listSessions.mockImplementation(listSessionsImplementation)),
+      );
+      const runtimeEventsFiber = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        event.type === "turn.completed" && event.threadId === threadId
+          ? Deferred.succeed(terminalPublished, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+
+      fanout.droid.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-snapshot-before-terminal"),
+        provider: DROID_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-snapshot-before-terminal"),
+        status: "completed",
+      });
+      yield* Deferred.await(snapshotStarted);
+      yield* advanceTestClock(1);
+
+      assert.equal(Option.isNone(yield* Deferred.poll(terminalPublished)), true);
+
+      yield* Deferred.succeed(releaseSnapshot, undefined);
+      yield* Deferred.await(terminalPublished);
+      yield* Fiber.interrupt(runtimeEventsFiber);
     }),
   );
 

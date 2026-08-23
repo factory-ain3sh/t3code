@@ -32,6 +32,10 @@ export interface ProviderAdapterCapabilities {
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /**
+   * Declares that a settled turn can replace the session's resume cursor.
+   */
+  readonly resumeCursorChangesDuringTurn?: boolean;
 }
 
 export interface ProviderThreadTurnSnapshot {

@@ -246,10 +246,10 @@ it.effect("correlates RPCs, decodes notifications, handles server requests, and 
     assert.equal(permission.value.sessionId, undefined);
     if (permission.value.method === "droid.request_permission") {
       assert.equal(permission.value.params.options[0]?.outcome, "proceed_once");
-      // The parsed view is projected down to the fields the adapter summarises, so `raw` is
-      // what lets it forward droid's original request as the approval event's args.
+      // The parsed view is projected down to the fields the adapter summarises; the
+      // RPC envelope retains droid's original request for approval-event diagnostics.
       const rawToolUse = (
-        permission.value.params.raw as {
+        permission.value.rawParams as {
           toolUses: readonly {
             toolUse: { type?: unknown };
             details: { impactLevel?: unknown; riskLevelReason?: unknown };

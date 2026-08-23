@@ -1,3 +1,4 @@
+import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -35,6 +36,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
   environment: NodeJS.ProcessEnv = process.env,
 ) {
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const { randomUUIDv4 } = yield* Crypto.Crypto;
 
   const runDroidJson = <S extends Schema.Top>({
     operation,
@@ -117,7 +119,9 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
             autonomyLevel: "off",
             interactionMode: "auto",
             // Text generation must never touch the workspace.
-            restrictToolIds: [],
+            // Droid treats an empty restriction as unrestricted; an unknown
+            // non-empty id collapses the tool allowlist to zero.
+            restrictToolIds: ["t3_text_generation"],
             ...(modelSelection.model ? { modelId: modelSelection.model } : {}),
             ...(reasoningEffort ? { reasoningEffort } : {}),
           },
@@ -126,7 +130,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         .pipe(Effect.mapError((cause) => failWith("Failed to initialize Droid session.", cause)));
 
       yield* rpc
-        .request("droid.add_user_message", { text: prompt })
+        .request("droid.add_user_message", { messageId: yield* randomUUIDv4, text: prompt })
         .pipe(Effect.mapError((cause) => failWith("Droid rejected the prompt.", cause)));
 
       // Race the completion against process death: a crashed CLI must fail
@@ -148,13 +152,17 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         ),
       );
 
-      const trimmed = outputChunks.join("").trim();
-      if (!trimmed) {
+      if (completionReason !== "completed") {
         return yield* failWith(
           completionReason === "cancelled"
             ? "Droid request was cancelled."
-            : "Droid returned empty output.",
+            : `Droid request failed (${completionReason ?? "unknown reason"}).`,
         );
+      }
+
+      const trimmed = outputChunks.join("").trim();
+      if (!trimmed) {
+        return yield* failWith("Droid returned empty output.");
       }
 
       const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson));

@@ -108,6 +108,7 @@ export const DroidDriver: ProviderDriver<DroidSettings, DroidDriverEnv> = {
       const path = yield* Path.Path;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const httpClient = yield* HttpClient.HttpClient;
+      const serverConfig = yield* ServerConfig;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
@@ -137,7 +138,11 @@ export const DroidDriver: ProviderDriver<DroidSettings, DroidDriverEnv> = {
       });
       const textGeneration = yield* makeDroidTextGeneration(effectiveConfig, processEnv);
 
-      const checkProvider = checkDroidProviderStatus(effectiveConfig, processEnv).pipe(
+      const checkProvider = checkDroidProviderStatus(
+        effectiveConfig,
+        processEnv,
+        serverConfig.cwd,
+      ).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(FileSystem.FileSystem, fileSystem),

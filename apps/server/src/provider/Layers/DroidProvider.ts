@@ -210,7 +210,7 @@ export const detectDroidAuth = Effect.fn("detectDroidAuth")(function* (
   if (!factoryHome) {
     return { status: "unknown" };
   }
-  for (const candidate of ["auth.v2.keyring", "auth.v2.file"]) {
+  for (const candidate of ["auth.v2.keyring", "auth.v2.loginkeychain", "auth.v2.file"]) {
     const exists = yield* fileSystem
       .exists(path.join(factoryHome, candidate))
       .pipe(Effect.orElseSucceed(() => false));
@@ -230,12 +230,13 @@ export const detectDroidAuth = Effect.fn("detectDroidAuth")(function* (
 const discoverDroidInventory = (
   droidSettings: DroidSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
 ) =>
   Effect.gen(function* () {
     const rpc = yield* makeDroidRpcClient({
       command: droidSettings.binaryPath,
       args: ["exec", "--input-format", "stream-jsonrpc", "--output-format", "stream-jsonrpc"],
-      cwd: process.cwd(),
+      cwd,
       env: environment,
     });
 
@@ -324,6 +325,7 @@ export function buildInitialDroidProviderSnapshot(
 export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(function* (
   droidSettings: DroidSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
@@ -415,7 +417,7 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
   }
 
   const auth = yield* detectDroidAuth(environment);
-  const discoveryExit = yield* discoverDroidInventory(droidSettings, environment).pipe(
+  const discoveryExit = yield* discoverDroidInventory(droidSettings, environment, cwd).pipe(
     Effect.timeoutOption(INVENTORY_DISCOVERY_TIMEOUT_MS),
     Effect.exit,
   );

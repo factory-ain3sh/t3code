@@ -22,8 +22,10 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -42,13 +44,12 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import {
-  DroidAskUserRequest,
   DroidExecuteRewindResult,
   DroidInitializeSessionResult,
   DroidLoadSessionResult,
-  DroidPermissionRequest,
   type DroidLastCallTokenUsage,
   type DroidPermissionOption,
+  type DroidPermissionRequest,
   type DroidSessionNotification,
   type DroidTokenUsage,
   type DroidToolUse,
@@ -146,6 +147,8 @@ interface DroidSessionContext {
   lastEmittedTokenUsage: ThreadTokenUsageSnapshot | undefined;
   currentModelId: string | undefined;
   currentReasoningEffort: string | undefined;
+  currentSpecModeModelId: string | undefined;
+  currentSpecModeReasoningEffort: string | undefined;
   currentInteractionMode: "auto" | "spec";
   stopped: boolean;
 }
@@ -287,20 +290,7 @@ function droidTokenUsageSnapshotsEqual(
   left: ThreadTokenUsageSnapshot | undefined,
   right: ThreadTokenUsageSnapshot,
 ): boolean {
-  return (
-    left !== undefined &&
-    left.usedTokens === right.usedTokens &&
-    left.totalProcessedTokens === right.totalProcessedTokens &&
-    left.inputTokens === right.inputTokens &&
-    left.cachedInputTokens === right.cachedInputTokens &&
-    left.outputTokens === right.outputTokens &&
-    left.reasoningOutputTokens === right.reasoningOutputTokens &&
-    left.lastUsedTokens === right.lastUsedTokens &&
-    left.lastInputTokens === right.lastInputTokens &&
-    left.lastCachedInputTokens === right.lastCachedInputTokens &&
-    left.lastOutputTokens === right.lastOutputTokens &&
-    left.compactsAutomatically === right.compactsAutomatically
-  );
+  return left !== undefined && Equal.equals(left, right);
 }
 
 type DroidTurnOutcome =
@@ -335,12 +325,8 @@ export function droidTurnOutcomeForReason(reason: string | undefined): DroidTurn
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export function parseDroidResume(raw: unknown): { sessionId: string } | undefined {
-  if (!isRecord(raw)) return undefined;
+  if (!Predicate.isObject(raw)) return undefined;
   if (raw.schemaVersion !== DROID_RESUME_VERSION) return undefined;
   if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
   return { sessionId: raw.sessionId.trim() };
@@ -366,7 +352,6 @@ function settlePendingUserInputsAsCancelled(
   );
 }
 
-const decodeAskUserRequest = Schema.decodeUnknownEffect(DroidAskUserRequest);
 const decodeInitializeResult = Schema.decodeUnknownEffect(DroidInitializeSessionResult);
 const decodeLoadResult = Schema.decodeUnknownEffect(DroidLoadSessionResult);
 const decodeExecuteRewindResult = Schema.decodeUnknownEffect(DroidExecuteRewindResult);
@@ -827,7 +812,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         }
         if (notification.type === "create_message") {
           if (
-            isRecord(notification.message) &&
+            Predicate.isObject(notification.message) &&
             typeof notification.message.id === "string" &&
             (notification.message.role === "user" ||
               notification.message.type === "user_message") &&
@@ -835,17 +820,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           ) {
             ctx.persistedPendingTurnMessageIds.add(notification.message.id);
           }
-          const turnId = ctx.activeTurnId;
-          if (turnId !== undefined) {
-            const existing = ctx.turns.find((turn) => turn.id === turnId);
-            ctx.turns = existing
-              ? ctx.turns.map((turn) =>
-                  turn.id === turnId
-                    ? { ...turn, items: [...turn.items, notification.message] }
-                    : turn,
-                )
-              : [...ctx.turns, { id: turnId, items: [notification.message] }];
-          }
+          // Runtime events carry conversation content; these snapshots only
+          // retain t3 turn ids as rewind anchors.
           return;
         }
 
@@ -1014,7 +990,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     ) =>
       Effect.gen(function* () {
         const params = request.params;
-        yield* logNative(ctx.threadId, "droid.request_permission", params.raw);
+        yield* logNative(ctx.threadId, "droid.request_permission", request.rawParams);
         const primaryToolUse = params.toolUses[0];
         if (primaryToolUse) rememberToolUse(ctx, primaryToolUse.toolUse);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
@@ -1022,7 +998,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
         const turnId = ctx.activeTurnId;
         ctx.pendingApprovals.set(requestId, { decision });
-        const requestType = droidCanonicalRequestType(primaryToolUse?.confirmationType);
+        const requestType = droidCanonicalRequestType(primaryToolUse?.details.type);
         yield* offerRuntimeEvent({
           type: "request.opened",
           ...(yield* makeEventStamp()),
@@ -1034,14 +1010,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             requestType,
             detail:
               droidPermissionDetail(params) ??
-              encodeJsonStringForDiagnostics(params.raw)?.slice(0, 2000) ??
+              encodeJsonStringForDiagnostics(request.rawParams)?.slice(0, 2000) ??
               "[unserializable params]",
-            args: params.raw,
+            args: request.rawParams,
           },
           raw: {
             source: "droid.jsonrpc.request",
             method: "droid.request_permission",
-            payload: params.raw,
+            payload: request.rawParams,
           },
         });
         const resolved = yield* Deferred.await(decision);
@@ -1062,19 +1038,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         yield* request.respond({ selectedOption: selectedOutcome });
       });
 
-    const handleAskUserRequest = (ctx: DroidSessionContext, request: DroidServerRequest) =>
+    const handleAskUserRequest = (
+      ctx: DroidSessionContext,
+      request: Extract<DroidServerRequest, { method: "droid.ask_user" }>,
+    ) =>
       Effect.gen(function* () {
-        const params = yield* decodeAskUserRequest(request.params).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "droid.ask_user",
-                detail: "Failed to decode Droid ask_user request.",
-                cause,
-              }),
-          ),
-        );
+        const params = request.params;
         yield* logNative(ctx.threadId, "droid.ask_user", request.params);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
@@ -1308,8 +1277,15 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                     cwd,
                     autonomyLevel,
                     interactionMode: "auto",
-                    ...(requestedModelId ? { modelId: requestedModelId } : {}),
-                    ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+                    ...(requestedModelId
+                      ? { modelId: requestedModelId, specModeModelId: requestedModelId }
+                      : {}),
+                    ...(requestedEffort
+                      ? {
+                          reasoningEffort: requestedEffort,
+                          specModeReasoningEffort: requestedEffort,
+                        }
+                      : {}),
                     ...(input.title ? { title: input.title } : {}),
                     ...mcpServers,
                   }),
@@ -1326,8 +1302,15 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             yield* requestSession("droid.update_session_settings", {
               autonomyLevel,
               interactionMode: "auto",
-              ...(requestedModelId ? { modelId: requestedModelId } : {}),
-              ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+              ...(requestedModelId
+                ? { modelId: requestedModelId, specModeModelId: requestedModelId }
+                : {}),
+              ...(requestedEffort
+                ? {
+                    reasoningEffort: requestedEffort,
+                    specModeReasoningEffort: requestedEffort,
+                  }
+                : {}),
             });
           }
 
@@ -1374,6 +1357,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             lastEmittedTokenUsage: undefined,
             currentModelId: requestedModelId,
             currentReasoningEffort: requestedEffort,
+            currentSpecModeModelId: requestedModelId,
+            currentSpecModeReasoningEffort: requestedEffort,
             currentInteractionMode: "auto",
             stopped: false,
           };
@@ -1532,12 +1517,22 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             "reasoningEffort",
           );
           const requestedInteractionMode = input.interactionMode === "plan" ? "spec" : "auto";
+          const currentModeModelId =
+            requestedInteractionMode === "spec" ? ctx.currentSpecModeModelId : ctx.currentModelId;
+          const currentModeReasoningEffort =
+            requestedInteractionMode === "spec"
+              ? ctx.currentSpecModeReasoningEffort
+              : ctx.currentReasoningEffort;
           const settingsPatch = {
-            ...(requestedModelId && requestedModelId !== ctx.currentModelId
-              ? { modelId: requestedModelId }
+            ...(requestedModelId && requestedModelId !== currentModeModelId
+              ? requestedInteractionMode === "spec"
+                ? { specModeModelId: requestedModelId }
+                : { modelId: requestedModelId }
               : {}),
-            ...(requestedEffort && requestedEffort !== ctx.currentReasoningEffort
-              ? { reasoningEffort: requestedEffort }
+            ...(requestedEffort && requestedEffort !== currentModeReasoningEffort
+              ? requestedInteractionMode === "spec"
+                ? { specModeReasoningEffort: requestedEffort }
+                : { reasoningEffort: requestedEffort }
               : {}),
             ...(requestedInteractionMode !== ctx.currentInteractionMode
               ? { interactionMode: requestedInteractionMode }
@@ -1545,8 +1540,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           };
           if (Object.keys(settingsPatch).length > 0) {
             yield* requestViaRpc(ctx, "droid.update_session_settings", settingsPatch);
-            ctx.currentModelId = requestedModelId ?? ctx.currentModelId;
-            ctx.currentReasoningEffort = requestedEffort ?? ctx.currentReasoningEffort;
+            if (requestedInteractionMode === "spec") {
+              ctx.currentSpecModeModelId = requestedModelId ?? ctx.currentSpecModeModelId;
+              ctx.currentSpecModeReasoningEffort =
+                requestedEffort ?? ctx.currentSpecModeReasoningEffort;
+            } else {
+              ctx.currentModelId = requestedModelId ?? ctx.currentModelId;
+              ctx.currentReasoningEffort = requestedEffort ?? ctx.currentReasoningEffort;
+            }
             ctx.currentInteractionMode = requestedInteractionMode;
           }
 
@@ -1587,7 +1588,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           const turnId = steeringTurnId ?? TurnId.make(messageId);
           ctx.pendingTurnMessageIds.add(messageId);
           ctx.activeTurnId = turnId;
-          const displayModel = ctx.currentModelId;
+          const displayModel =
+            requestedInteractionMode === "spec" ? ctx.currentSpecModeModelId : ctx.currentModelId;
+          const displayEffort =
+            requestedInteractionMode === "spec"
+              ? ctx.currentSpecModeReasoningEffort
+              : ctx.currentReasoningEffort;
           ctx.session = {
             ...ctx.session,
             status: "running",
@@ -1609,7 +1615,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               turnId,
               payload: {
                 ...(displayModel ? { model: displayModel } : {}),
-                ...(ctx.currentReasoningEffort ? { effort: ctx.currentReasoningEffort } : {}),
+                ...(displayEffort ? { effort: displayEffort } : {}),
               },
             });
           }
@@ -1847,7 +1853,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                 return ctx ? stopSessionInternal(ctx) : Effect.void;
               }),
             ),
-          { discard: true },
+          { concurrency: "unbounded", discard: true },
         ).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -1868,7 +1874,10 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session" },
+      capabilities: {
+        sessionModelSwitch: "in-session",
+        resumeCursorChangesDuringTurn: true,
+      },
       startSession,
       sendTurn,
       interruptTurn,

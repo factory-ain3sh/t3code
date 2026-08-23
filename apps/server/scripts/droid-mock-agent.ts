@@ -30,6 +30,8 @@ let serverRequestId = 0;
 let currentSettings = {
   modelId: "mock-fast",
   reasoningEffort: "medium",
+  specModeModelId: "mock-spec-default",
+  specModeReasoningEffort: "max",
   interactionMode: "auto",
   autonomyLevel: "off",
 };
@@ -316,7 +318,16 @@ async function runTurn(params: {
     });
   }
 
-  if (params.text === "mock report interaction mode") {
+  if (
+    params.text === "mock report interaction mode" ||
+    params.text === "mock report selected model"
+  ) {
+    const report =
+      params.text === "mock report interaction mode"
+        ? currentSettings.interactionMode
+        : currentSettings.interactionMode === "spec"
+          ? `${currentSettings.specModeModelId}:${currentSettings.specModeReasoningEffort}`
+          : `${currentSettings.modelId}:${currentSettings.reasoningEffort}`;
     notify({
       type: "thinking_text_complete",
       messageId: `assistant-${turnId}`,
@@ -327,7 +338,7 @@ async function runTurn(params: {
       type: "assistant_text_delta",
       messageId: `assistant-${turnId}`,
       blockIndex: 1,
-      textDelta: currentSettings.interactionMode,
+      textDelta: report,
     });
     notify({
       type: "assistant_text_complete",

@@ -102,6 +102,7 @@ interface DroidServerRequestBase {
 export interface DroidPermissionServerRequest extends DroidServerRequestBase {
   readonly method: "droid.request_permission";
   readonly params: DroidPermissionRequestType;
+  readonly rawParams: unknown;
 }
 
 export interface DroidAskUserServerRequest extends DroidServerRequestBase {
@@ -405,41 +406,24 @@ export const makeDroidRpcClient = (
         yield* Deferred.succeed(requestState.deferred, message.result);
       });
 
-    const publishServerRequest = (
-      id: string,
-      sessionId: string | undefined,
-      method: "droid.request_permission" | "droid.ask_user",
-      params: DroidPermissionRequestType | DroidAskUserRequestType,
-    ) => {
-      const base = {
-        id,
-        sessionId,
-        respond: (result: unknown) =>
-          sendResponse(id, {
-            _tag: "Success",
-            value: result,
-          }),
-        fail: (code: number, message: string) =>
-          sendResponse(id, {
-            _tag: "Failure",
-            code,
-            message,
-          }),
-      };
-      const request =
-        method === "droid.request_permission"
-          ? ({
-              ...base,
-              method,
-              params: params as DroidPermissionRequestType,
-            } satisfies DroidPermissionServerRequest)
-          : ({
-              ...base,
-              method,
-              params: params as DroidAskUserRequestType,
-            } satisfies DroidAskUserServerRequest);
-      return Queue.offer(serverRequestPubSub, request).pipe(Effect.asVoid);
-    };
+    const makeServerRequestBase = (id: string, sessionId: string | undefined) => ({
+      id,
+      sessionId,
+      respond: (result: unknown) =>
+        sendResponse(id, {
+          _tag: "Success",
+          value: result,
+        }),
+      fail: (code: number, message: string) =>
+        sendResponse(id, {
+          _tag: "Failure",
+          code,
+          message,
+        }),
+    });
+
+    const publishServerRequest = (request: DroidServerRequest) =>
+      Queue.offer(serverRequestPubSub, request).pipe(Effect.asVoid);
 
     const handleServerRequest = (message: ParsedJsonRpcMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
@@ -465,7 +449,12 @@ export const makeDroidRpcClient = (
             }).pipe(Effect.ignore);
             return;
           }
-          yield* publishServerRequest(id, sessionId, message.method, decoded.success);
+          yield* publishServerRequest({
+            ...makeServerRequestBase(id, sessionId),
+            method: message.method,
+            params: decoded.success,
+            rawParams: message.params,
+          });
           return;
         }
         if (message.method === "droid.ask_user") {
@@ -481,7 +470,11 @@ export const makeDroidRpcClient = (
             }).pipe(Effect.ignore);
             return;
           }
-          yield* publishServerRequest(id, sessionId, message.method, decoded.success);
+          yield* publishServerRequest({
+            ...makeServerRequestBase(id, sessionId),
+            method: message.method,
+            params: decoded.success,
+          });
           return;
         }
         yield* publishDiagnostic(

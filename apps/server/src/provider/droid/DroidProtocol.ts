@@ -211,46 +211,13 @@ const DroidPermissionRequestFields = {
   toolUses: Schema.Array(
     Schema.Struct({
       toolUse: DroidToolUse,
-      confirmationType: Schema.Literals([
-        "edit",
-        "exec",
-        "create",
-        "ask_user",
-        "exit_spec_mode",
-        "propose_mission",
-        "start_mission_run",
-        "apply_patch",
-        "mcp_tool",
-        "sandbox_violation",
-        "droid_shield_violation",
-      ]),
       details: DroidToolConfirmationDetails,
     }),
   ),
   options: Schema.Array(DroidPermissionOption),
 } as const;
 
-const DroidPermissionRequestDecoded = Schema.Struct({
-  ...DroidPermissionRequestFields,
-  raw: Schema.Record(Schema.String, Schema.Unknown),
-});
-
-const DroidPermissionRequestRaw = Schema.Record(Schema.String, Schema.Unknown);
-
-export const DroidPermissionRequest = DroidPermissionRequestRaw.pipe(
-  Schema.decodeTo(
-    DroidPermissionRequestDecoded,
-    SchemaTransformation.transformOrFail({
-      decode: (raw) =>
-        Effect.succeed({
-          ...raw,
-          raw,
-        } as typeof DroidPermissionRequestDecoded.Encoded),
-      encode: ({ raw: _raw, ...request }) =>
-        Effect.succeed(request as typeof DroidPermissionRequestRaw.Encoded),
-    }),
-  ),
-);
+export const DroidPermissionRequest = Schema.Struct(DroidPermissionRequestFields);
 export type DroidPermissionRequest = typeof DroidPermissionRequest.Type;
 
 export const DroidAskUserRequest = Schema.Struct({
