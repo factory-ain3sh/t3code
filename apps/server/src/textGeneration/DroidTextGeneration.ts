@@ -1,7 +1,6 @@
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -27,6 +26,7 @@ import {
 
 const DROID_TIMEOUT_MS = 180_000;
 const SESSION_INIT_TIMEOUT_MS = 75_000;
+const MAX_OUTPUT_CHARS = 256 * 1024;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
@@ -70,8 +70,9 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         Effect.mapError((cause) => failWith("Failed to start the Droid CLI.", cause)),
       );
 
-      const outputRef = yield* Ref.make("");
-      const turnDone = yield* Deferred.make<string | undefined>();
+      const outputChunks: string[] = [];
+      let outputLength = 0;
+      const turnDone = yield* Deferred.make<string | undefined, TextGenerationError>();
 
       // Collect assistant text and resolve on turn completion. The session is
       // private to this request and carries exactly one user message, so the
@@ -80,7 +81,24 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         Stream.mapEffect(rpc.notifications, ({ notification }) => {
           switch (notification.type) {
             case "assistant_text_delta":
-              return Ref.update(outputRef, (current) => current + notification.textDelta);
+              return Effect.sync(() => {
+                const nextLength = outputLength + notification.textDelta.length;
+                if (nextLength > MAX_OUTPUT_CHARS) {
+                  return false;
+                }
+                outputChunks.push(notification.textDelta);
+                outputLength = nextLength;
+                return true;
+              }).pipe(
+                Effect.flatMap((accepted) =>
+                  accepted
+                    ? Effect.void
+                    : Deferred.fail(
+                        turnDone,
+                        failWith(`Droid output exceeded the ${MAX_OUTPUT_CHARS}-character limit.`),
+                      ).pipe(Effect.asVoid),
+                ),
+              );
             case "agent_turn_completed":
               return Deferred.succeed(turnDone, notification.reason).pipe(Effect.asVoid);
             default:
@@ -130,7 +148,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         ),
       );
 
-      const trimmed = (yield* Ref.get(outputRef)).trim();
+      const trimmed = outputChunks.join("").trim();
       if (!trimmed) {
         return yield* failWith(
           completionReason === "cancelled"
