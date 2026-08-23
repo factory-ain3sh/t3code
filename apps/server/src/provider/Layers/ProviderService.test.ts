@@ -14,7 +14,6 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
-  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -1190,6 +1189,35 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("persists the post-rollback snapshot even when the resume cursor is unchanged", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-rollback-snapshot");
+      const session = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const beforeRollback = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(beforeRollback), true);
+      if (Option.isNone(beforeRollback)) {
+        return;
+      }
+
+      yield* advanceTestClock(50);
+      yield* provider.rollbackConversation({ threadId, numTurns: 1 });
+
+      const afterRollback = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(afterRollback), true);
+      if (Option.isSome(afterRollback)) {
+        assert.notEqual(afterRollback.value.lastSeenAt, beforeRollback.value.lastSeenAt);
+        assert.deepEqual(afterRollback.value.resumeCursor, session.resumeCursor);
+      }
+    }),
+  );
+
   it.effect("preserves the persisted binding when stopping a session", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1759,6 +1787,92 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         ),
         true,
       );
+    }),
+  );
+
+  it.effect("skips completed-turn snapshot writes while the resume cursor is unchanged", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-snapshot-unchanged");
+      const session = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const initialRuntime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(initialRuntime), true);
+      if (Option.isNone(initialRuntime)) {
+        return;
+      }
+
+      fanout.codex.updateSession(threadId, (current) => ({
+        ...current,
+        resumeCursor:
+          current.resumeCursor !== null && typeof current.resumeCursor === "object"
+            ? { ...current.resumeCursor }
+            : current.resumeCursor,
+      }));
+      for (const eventId of ["evt-snapshot-unchanged-1", "evt-snapshot-unchanged-2"]) {
+        fanout.codex.emit({
+          type: "turn.completed",
+          eventId: asEventId(eventId),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          turnId: asTurnId(`turn-${eventId}`),
+          status: "completed",
+        });
+        yield* advanceTestClock(50);
+      }
+
+      const unchangedRuntime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(unchangedRuntime), true);
+      if (Option.isNone(unchangedRuntime)) {
+        return;
+      }
+      assert.equal(unchangedRuntime.value.lastSeenAt, initialRuntime.value.lastSeenAt);
+      assert.deepEqual(unchangedRuntime.value.resumeCursor, session.resumeCursor);
+    }),
+  );
+
+  it.effect("persists a completed-turn snapshot when the resume cursor changes", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-snapshot-changed");
+      const session = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const changedResumeCursor = {
+        opaque: `resume-successor-${String(threadId)}`,
+      };
+      fanout.codex.updateSession(threadId, (current) => ({
+        ...current,
+        resumeCursor: changedResumeCursor,
+      }));
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-snapshot-changed"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-snapshot-changed"),
+        status: "completed",
+      });
+      yield* advanceTestClock(50);
+
+      const changedRuntime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(changedRuntime), true);
+      if (Option.isSome(changedRuntime)) {
+        assert.notDeepEqual(changedRuntime.value.resumeCursor, session.resumeCursor);
+        assert.deepEqual(changedRuntime.value.resumeCursor, changedResumeCursor);
+      }
     }),
   );
 

@@ -28,6 +28,7 @@ import {
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -312,6 +313,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ),
         );
 
+  const persistedResumeCursors = yield* Ref.make(
+    new Map<ProviderInstanceId, ReadonlyMap<ThreadId, unknown | null>>(),
+  );
+  const rememberPersistedResumeCursor = (
+    providerInstanceId: ProviderInstanceId,
+    threadId: ThreadId,
+    resumeCursor: unknown | null,
+  ) =>
+    Ref.update(persistedResumeCursors, (current) => {
+      const next = new Map(current);
+      const instanceCursors = new Map(next.get(providerInstanceId));
+      instanceCursors.set(threadId, resumeCursor);
+      next.set(providerInstanceId, instanceCursors);
+      return next;
+    });
+
   const upsertSessionBinding = (
     session: ProviderSession,
     threadId: ThreadId,
@@ -335,22 +352,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
         runtimePayload: toRuntimePayloadFromSession(session, extra),
       });
+      yield* rememberPersistedResumeCursor(
+        providerInstanceId,
+        threadId,
+        session.resumeCursor ?? null,
+      );
     });
 
   // Adapters can change their resume cursor mid-session (droid compaction and
-  // rewind mint successor sessions). Re-persisting the snapshot when a turn
-  // settles keeps the durable binding pointing at the live conversation.
+  // rewind mint successor sessions). Persist changed snapshots when a turn
+  // settles so the durable binding follows the live conversation without
+  // rewriting stable cursors for every provider.
   const persistSessionSnapshot = (
     adapter: ProviderAdapterShape<ProviderAdapterError>,
     instanceId: ProviderInstanceId,
     threadId: ThreadId,
+    force = false,
   ) =>
     adapter.listSessions().pipe(
       Effect.flatMap((activeSessions) => {
         const live = activeSessions.find((session) => session.threadId === threadId);
-        return live
-          ? upsertSessionBinding({ ...live, providerInstanceId: instanceId }, threadId)
-          : Effect.void;
+        if (!live) {
+          return Effect.void;
+        }
+        const liveResumeCursor = live.resumeCursor ?? null;
+        return Ref.get(persistedResumeCursors).pipe(
+          Effect.flatMap((persisted) => {
+            const persistedResumeCursor = persisted.get(instanceId)?.get(threadId);
+            return !force &&
+              persistedResumeCursor !== undefined &&
+              Equal.equals(persistedResumeCursor, liveResumeCursor)
+              ? Effect.void
+              : upsertSessionBinding({ ...live, providerInstanceId: instanceId }, threadId);
+          }),
+        );
       }),
       Effect.catchCause((cause) =>
         Effect.logWarning("provider.session.snapshot-persist-failed", { threadId, cause }),
@@ -825,6 +860,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           lastRuntimeEventAt: yield* nowIso,
         },
       });
+      if (turn.resumeCursor !== undefined) {
+        yield* rememberPersistedResumeCursor(routed.instanceId, input.threadId, turn.resumeCursor);
+      }
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
@@ -1131,7 +1169,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
       // A rollback can re-anchor the provider on a forked session; persist the
       // adapter's post-rollback snapshot so the resume cursor follows it.
-      yield* persistSessionSnapshot(routed.adapter, routed.instanceId, routed.threadId);
+      yield* persistSessionSnapshot(routed.adapter, routed.instanceId, routed.threadId, true);
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         turns: input.numTurns,
