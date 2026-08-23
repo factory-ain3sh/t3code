@@ -35,7 +35,7 @@ jobs:
         uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: false
           run-install: |
             args:
               - --filter=@t3tools/desktop...
@@ -44,7 +44,7 @@ jobs:
 
       - name: Cache resource monitor
         id: resource_monitor_cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
           key: resource-monitor-x86_64-pc-windows-msvc-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
