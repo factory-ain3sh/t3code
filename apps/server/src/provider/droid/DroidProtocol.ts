@@ -213,7 +213,7 @@ const DroidPermissionRequestFields = {
       toolUse: DroidToolUse,
       details: DroidToolConfirmationDetails,
     }),
-  ),
+  ).check(Schema.isNonEmpty()),
   options: Schema.Array(DroidPermissionOption),
 } as const;
 

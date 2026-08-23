@@ -336,6 +336,15 @@ describe("DroidExecuteRewindResult", () => {
 });
 
 describe("DroidPermissionRequest", () => {
+  it("rejects permission requests with no tool to classify or render", () => {
+    assert.throws(() =>
+      decodePermissionRequest({
+        toolUses: [],
+        options: [{ label: "Allow once", value: "proceed_once" }],
+      }),
+    );
+  });
+
   it("decodes the canonical option and only permission detail fields the adapter consumes", () => {
     const decoded = decodePermissionRequest({
       toolUses: [
