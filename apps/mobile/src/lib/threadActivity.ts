@@ -1,3 +1,7 @@
+import {
+  approvalRequestKindFromPayload,
+  type ApprovalRequestKind,
+} from "@t3tools/client-runtime/approvalRequests";
 import { ApprovalRequestId, isToolLifecycleItemType } from "@t3tools/contracts";
 import type {
   OrchestrationLatestTurn,
@@ -14,7 +18,7 @@ import * as Order from "effect/Order";
 
 export interface PendingApproval {
   readonly requestId: ApprovalRequestId;
-  readonly requestKind: "command" | "file-read" | "file-change" | "plan";
+  readonly requestKind: ApprovalRequestKind;
   readonly createdAt: string;
   readonly detail?: string;
 }
@@ -136,23 +140,6 @@ export type ThreadFeedLatestTurn = Pick<
   OrchestrationLatestTurn,
   "turnId" | "state" | "startedAt" | "completedAt"
 >;
-
-function requestKindFromRequestType(requestType: unknown): PendingApproval["requestKind"] | null {
-  switch (requestType) {
-    case "command_execution_approval":
-    case "exec_command_approval":
-      return "command";
-    case "file_read_approval":
-      return "file-read";
-    case "file_change_approval":
-    case "apply_patch_approval":
-      return "file-change";
-    case "plan_approval":
-      return "plan";
-    default:
-      return null;
-  }
-}
 
 function isStalePendingRequestFailureDetail(detail: string | undefined): boolean {
   const normalized = detail?.toLowerCase();
@@ -966,15 +953,7 @@ function extractWorkLogItemType(
 function extractWorkLogRequestKind(
   payload: Record<string, unknown> | null,
 ): WorkLogEntry["requestKind"] | undefined {
-  if (
-    payload?.requestKind === "command" ||
-    payload?.requestKind === "file-read" ||
-    payload?.requestKind === "file-change" ||
-    payload?.requestKind === "plan"
-  ) {
-    return payload.requestKind;
-  }
-  return requestKindFromRequestType(payload?.requestType) ?? undefined;
+  return approvalRequestKindFromPayload(payload) ?? undefined;
 }
 
 function pushChangedFile(target: string[], seen: Set<string>, value: unknown) {
@@ -1378,13 +1357,7 @@ export function derivePendingApprovals(
         ? (activity.payload as Record<string, unknown>)
         : null;
     const requestId = parseApprovalRequestId(payload?.requestId);
-    const requestKind =
-      payload?.requestKind === "command" ||
-      payload?.requestKind === "file-read" ||
-      payload?.requestKind === "file-change" ||
-      payload?.requestKind === "plan"
-        ? payload.requestKind
-        : requestKindFromRequestType(payload?.requestType);
+    const requestKind = approvalRequestKindFromPayload(payload);
     const detail = typeof payload?.detail === "string" ? payload.detail : undefined;
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {

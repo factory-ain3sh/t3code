@@ -1,3 +1,4 @@
+import { resolveProviderDisplayName } from "@t3tools/client-runtime/providerDisplayName";
 import type { OrchestrationThreadActivity, ThreadTokenUsageSnapshot } from "@t3tools/contracts";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -28,25 +29,10 @@ export type ContextWindowSnapshot = NullableContextWindowUsage & {
 /** Map a provider driver kind to a user-facing display name. */
 export function formatProviderDisplayName(provider: string | null | undefined): string {
   if (!provider) return "This agent";
-  switch (provider) {
-    case "claudeAgent":
-    case "claude":
-      return "Claude";
-    case "codex":
-      return "Codex";
-    case "cursor":
-      return "Cursor";
-    case "opencode":
-      return "OpenCode";
-    case "droid":
-      return "Droid";
-    default: {
-      // Title-case unknown driver kinds so they read reasonably.
-      const trimmed = provider.replace(/Agent$/i, "").trim();
-      if (trimmed.length === 0) return provider;
-      return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
-    }
-  }
+  const trimmed = provider.replace(/Agent$/i, "").trim();
+  const fallback =
+    trimmed.length === 0 ? provider : trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  return resolveProviderDisplayName(provider, fallback);
 }
 
 export function deriveLatestContextWindowSnapshot(

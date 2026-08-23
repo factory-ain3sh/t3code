@@ -206,6 +206,32 @@ describe("derivePendingApprovals", () => {
       },
     ]);
   });
+
+  it("maps dynamic tool calls into actionable generic approvals", () => {
+    const activities = [
+      makeActivity({
+        id: EventId.make("approval-open-dynamic-tool"),
+        kind: "approval.requested",
+        summary: "Approval requested",
+        tone: "approval",
+        createdAt: "2026-04-01T00:00:01.000Z",
+        payload: {
+          requestId: "req-dynamic-tool",
+          requestType: "dynamic_tool_call",
+          detail: "Search the web",
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toEqual([
+      {
+        requestId: "req-dynamic-tool",
+        requestKind: "command",
+        createdAt: "2026-04-01T00:00:01.000Z",
+        detail: "Search the web",
+      },
+    ]);
+  });
 });
 
 describe("buildThreadFeed", () => {

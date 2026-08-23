@@ -1,3 +1,4 @@
+import { resolveProviderDisplayName } from "@t3tools/client-runtime/providerDisplayName";
 import type {
   ModelCapabilities,
   ModelSelection,
@@ -33,10 +34,7 @@ function providerDisplayLabel(provider: {
   readonly instanceId: string;
 }): string {
   if (provider.displayName) return provider.displayName;
-  if (provider.driver === "codex") return "Codex";
-  if (provider.driver === "claudeAgent") return "Claude";
-  if (provider.driver === "droid") return "Droid";
-  return provider.instanceId;
+  return resolveProviderDisplayName(provider.driver, provider.instanceId);
 }
 
 function normalizeSelectionOptions(
