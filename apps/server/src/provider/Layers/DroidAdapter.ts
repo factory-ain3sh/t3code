@@ -64,6 +64,7 @@ import {
   makeKeyedLock,
   parseVersionedSessionResumeCursor,
   type ProviderAdapterSession,
+  type ProviderThreadRollbackTarget,
   rollbackTargetMatchesTurnPrefix,
 } from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -114,6 +115,8 @@ interface DroidSessionContext {
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  /** True until a rewind replaces the process-known suffix with the absolute t3 prefix. */
+  hasUnknownTurnPrefix: boolean;
   /** Turns already interrupted; late completions must not resurrect them. */
   readonly interruptedTurnIds: Set<TurnId>;
   /** Explicit rewind anchors already applied by this live process. */
@@ -341,6 +344,15 @@ export function droidTurnOutcomeForReason(reason: string | undefined): DroidTurn
     default:
       return { state: "failed", errorMessage: `Droid turn ended with reason '${reason}'.` };
   }
+}
+
+function rollbackTargetMatchesDroidHistory(
+  ctx: Pick<DroidSessionContext, "hasUnknownTurnPrefix" | "turns">,
+  target: ProviderThreadRollbackTarget,
+): boolean {
+  return ctx.hasUnknownTurnPrefix
+    ? target.anchorTurnId !== undefined
+    : rollbackTargetMatchesTurnPrefix(ctx.turns, target);
 }
 
 function settlePendingApprovalsAsCancelled(
@@ -1363,10 +1375,11 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             pendingApprovals: new Map(),
             pendingUserInputs: new Map(),
             // Durable Droid user messages do not identify which ones were
-            // steers coalesced into an earlier t3 turn. Only turns opened by
-            // this process are safe rewind anchors; resumed rollback fails
-            // loudly rather than guessing at a user-message boundary.
+            // steers coalesced into an earlier t3 turn. Keep only the turns
+            // opened by this process as a known suffix; an explicit rollback
+            // anchor can join that suffix to t3's persisted absolute prefix.
             turns: [],
+            hasUnknownTurnPrefix: initialized.kind === "loaded",
             interruptedTurnIds: new Set(),
             appliedRollbackAnchors: new Set(),
             pendingTurnMessageIds: new Set(),
@@ -1815,7 +1828,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               issue: "Cannot roll back while a turn is running.",
             });
           }
-          if (!rollbackTargetMatchesTurnPrefix(ctx.turns, target)) {
+          if (!rollbackTargetMatchesDroidHistory(ctx, target)) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "rollbackThread",
@@ -1872,6 +1885,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           });
           ctx.droidSessionId = rewound.newSessionId;
           ctx.turns = target.turnIds.map((id) => ({ id, items: [] }));
+          ctx.hasUnknownTurnPrefix = false;
           ctx.appliedRollbackAnchors.add(anchor);
           ctx.session = {
             ...ctx.session,

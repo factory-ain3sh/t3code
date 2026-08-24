@@ -1977,17 +1977,100 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         runtimeMode: "full-access",
         resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
       });
+      const persistedTurnIds = [
+        TurnId.make("persisted-turn-1"),
+        TurnId.make("persisted-turn-2"),
+        TurnId.make("persisted-turn-3"),
+      ];
+      const missingAnchor = yield* Effect.flip(
+        adapter.rollbackThread(threadId, {
+          turnIds: persistedTurnIds,
+        }),
+      );
+      assert.equal(missingAnchor._tag, "ProviderAdapterValidationError");
+      if (missingAnchor._tag === "ProviderAdapterValidationError") {
+        assert.equal(
+          missingAnchor.issue,
+          "Rollback target does not match the current thread history.",
+        );
+      }
+
       const snapshot = yield* adapter.rollbackThread(threadId, {
-        turnIds: [],
+        turnIds: persistedTurnIds,
         anchorTurnId: TurnId.make("persisted-anchor"),
       });
 
-      assert.deepEqual(snapshot.turns, []);
+      assert.deepEqual(
+        snapshot.turns.map((turn) => turn.id),
+        persistedTurnIds,
+      );
       assert.deepStrictEqual(snapshot.resumeCursor, {
         schemaVersion: 1,
         sessionId: "mock-session-rewound",
       });
 
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rolls back the first turn completed after resuming a Droid session", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-resumed-turn-rollback");
+      const { adapter } = yield* makeDroidScenario();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed" && String(event.threadId) === String(threadId)
+          ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+      });
+      const resumedTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "turn after restart",
+        attachments: [],
+      });
+      yield* Deferred.await(turnCompleted);
+
+      const persistedTurnIds = [
+        TurnId.make("persisted-turn-1"),
+        TurnId.make("persisted-turn-2"),
+        TurnId.make("persisted-turn-3"),
+      ];
+      const snapshot = yield* adapter.rollbackThread(threadId, {
+        turnIds: persistedTurnIds,
+        anchorTurnId: resumedTurn.turnId,
+      });
+
+      assert.deepEqual(
+        snapshot.turns.map((turn) => turn.id),
+        persistedTurnIds,
+      );
+      assert.deepStrictEqual(snapshot.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "mock-session-rewound",
+      });
+
+      const repeated = yield* adapter.rollbackThread(threadId, {
+        turnIds: persistedTurnIds,
+      });
+      assert.deepEqual(
+        repeated.turns.map((turn) => turn.id),
+        persistedTurnIds,
+      );
+      assert.deepStrictEqual(repeated.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "mock-session-rewound",
+      });
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
     }),
   );
