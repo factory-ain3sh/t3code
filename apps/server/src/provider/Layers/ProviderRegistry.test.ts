@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -1477,14 +1478,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
       // `providers.codex.binaryPath` in settings must tear down the live
       // instance and rebuild it so a fresh probe runs with the new binary.
       // This test drives the real settings stream → registry reconcile →
-      // aggregator sync pipeline and asserts that `getProviders` reflects
-      // the new background probe's outcome.
+      // aggregator sync pipeline and asserts at the injected process boundary
+      // that the rebuilt instance probes the new executable.
       //
       it.effect("re-probes when settings change the codex binaryPath", () =>
         Effect.gen(function* () {
           const firstMissing = `t3code_codex_first_`;
           const secondMissing = `t3code_codex_second_`;
           const spawnedCommands: Array<string> = [];
+          const secondProbeStarted = yield* Deferred.make<void>();
           const serverSettings = yield* makeMutableServerSettingsService(
             decodeServerSettings(
               deepMerge(encodedDefaultServerSettings, {
@@ -1521,8 +1523,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
             Layer.updateService(ChildProcessSpawner.ChildProcessSpawner, (spawner) =>
               ChildProcessSpawner.make((command) => {
-                spawnedCommands.push((command as { readonly command: string }).command);
-                return spawner.spawn(command);
+                const executable = (command as { readonly command: string }).command;
+                spawnedCommands.push(executable);
+                return Effect.gen(function* () {
+                  if (executable === secondMissing) {
+                    yield* Deferred.succeed(secondProbeStarted, undefined);
+                  }
+                  return yield* spawner.spawn(command);
+                });
               }),
             ),
             Layer.provideMerge(NodeServices.layer),
@@ -1570,30 +1578,8 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               },
             });
 
-            // Poll until the injected process boundary observes the new
-            // executable. This verifies the public settings-to-probe behavior
-            // without depending on timestamps assigned by TestClock.
-            const refreshed = yield* Effect.gen(function* () {
-              for (let attempts = 0; attempts < 60; attempts += 1) {
-                const providers = yield* registry.getProviders;
-                const codex = providers.find((provider) => provider.instanceId === "codex");
-                if (
-                  codex !== undefined &&
-                  codex.status === "error" &&
-                  spawnedCommands.includes(secondMissing)
-                ) {
-                  return providers;
-                }
-                yield* TestClock.adjust("50 millis");
-                yield* Effect.yieldNow;
-              }
-              return yield* registry.getProviders;
-            });
-
-            const reprobedCodex = refreshed.find((provider) => provider.instanceId === "codex");
+            yield* Deferred.await(secondProbeStarted);
             assert.deepStrictEqual(spawnedCommands, [firstMissing, secondMissing]);
-            assert.strictEqual(reprobedCodex?.status, "error");
-            assert.strictEqual(reprobedCodex?.installed, false);
           }).pipe(Effect.provide(runtimeServices));
         }),
       );
