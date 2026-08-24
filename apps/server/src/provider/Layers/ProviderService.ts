@@ -26,6 +26,7 @@ import {
   type ProviderSession,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -91,6 +92,16 @@ const ProviderRollbackConversationInput = Schema.Struct({
   turnIds: Schema.Array(TurnId),
   anchorTurnId: Schema.optional(TurnId),
 });
+
+// Fiber-context record of the session lifecycle locks the current fiber
+// holds. `withSessionLifecycleLock` adds the thread for the locked region, and
+// `rollbackConversation` dies without it: the per-thread lock is not
+// reentrant, so acquiring inside would deadlock the caller, and running
+// unlocked races session lifecycle transitions mid-rollback.
+const HeldSessionLifecycleLocks = Context.Reference<ReadonlySet<ThreadId>>(
+  "ProviderService/HeldSessionLifecycleLocks",
+  { defaultValue: () => new Set<ThreadId>() },
+);
 
 function toValidationError(
   operation: string,
@@ -243,9 +254,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     threadId: ThreadId,
     effect: Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E, R> =>
-    sessionLifecycleLocks
-      .withLock(threadId, effect)
-      .pipe(Effect.withSpan("ProviderService.withSessionLifecycleLock"));
+    Effect.service(HeldSessionLifecycleLocks).pipe(
+      Effect.flatMap((held) =>
+        sessionLifecycleLocks.withLock(
+          threadId,
+          effect.pipe(
+            Effect.provideService(HeldSessionLifecycleLocks, new Set([...held, threadId])),
+          ),
+        ),
+      ),
+      Effect.withSpan("ProviderService.withSessionLifecycleLock"),
+    );
   /**
    * Attach the `t3-code` MCP server to the session that is about to start.
    *
@@ -1282,7 +1301,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   // Contract: the caller holds this thread's session lifecycle lock (the
   // CheckpointReactor wraps revert execution in withSessionLifecycleLock).
   // The per-thread lock is not reentrant, so acquiring it here would deadlock
-  // the reactor; lifecycleLockHeld below asserts the caller's obligation.
+  // the reactor; the HeldSessionLifecycleLocks check enforces the caller's
+  // obligation, and lifecycleLockHeld below routes recovery accordingly.
   const rollbackConversation: ProviderServiceMethod<"rollbackConversation"> = Effect.fn(
     "rollbackConversation",
   )(function* (rawInput) {
@@ -1295,6 +1315,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return yield* toValidationError(
         "ProviderService.rollbackConversation",
         "Rollback target must include at least one turn ID or an anchor turn ID.",
+      );
+    }
+    const heldLocks = yield* Effect.service(HeldSessionLifecycleLocks);
+    if (!heldLocks.has(input.threadId)) {
+      return yield* Effect.die(
+        new Error(
+          "ProviderService.rollbackConversation requires the caller to hold this thread's session lifecycle lock; wrap the call in withSessionLifecycleLock.",
+        ),
       );
     }
     let metricProvider = "unknown";

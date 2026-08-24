@@ -363,6 +363,7 @@ describe("CheckpointReactor", () => {
     readonly replaceBindingDuringRollback?: boolean;
     readonly failResumeCursorUpdate?: boolean;
     readonly rejectRevertIntentPersistence?: boolean;
+    readonly failFirstRevertCompleteDispatch?: boolean;
   }) {
     const cwd = createGitRepository();
     tempDirs.push(cwd);
@@ -378,7 +379,7 @@ describe("CheckpointReactor", () => {
         ),
       options?.rollbackResumeCursor,
     );
-    const orchestrationLayer = OrchestrationEngineLive.pipe(
+    const baseOrchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(ThreadBackgroundLiveness.layer),
       Layer.provide(ThreadPlanProgress.layer),
@@ -388,6 +389,30 @@ describe("CheckpointReactor", () => {
       Layer.provide(RepositoryIdentityResolver.layer),
       Layer.provide(SqlitePersistenceMemory),
     );
+    // Simulates a crash between the destructive revert phase and its
+    // bookkeeping: the first thread.revert.complete dispatch dies as if the
+    // process were killed right before the read model learned about the
+    // revert. Persisted state (intent, tree, refs) is exactly what a real
+    // crash leaves behind.
+    const orchestrationLayer = options?.failFirstRevertCompleteDispatch
+      ? Layer.effect(
+          OrchestrationEngineService,
+          Effect.gen(function* () {
+            const engine = yield* Effect.service(OrchestrationEngineService);
+            let injected = false;
+            return OrchestrationEngineService.of({
+              ...engine,
+              dispatch: (command) => {
+                if (!injected && command.type === "thread.revert.complete") {
+                  injected = true;
+                  return Effect.die(new Error("Injected crash between restore and bookkeeping"));
+                }
+                return engine.dispatch(command);
+              },
+            });
+          }),
+        ).pipe(Layer.provide(baseOrchestrationLayer))
+      : baseOrchestrationLayer;
     const projectionSnapshotLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
       Layer.provide(ThreadBackgroundLiveness.layer),
       Layer.provide(ThreadPlanProgress.layer),
@@ -661,6 +686,18 @@ describe("CheckpointReactor", () => {
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
     await Effect.runPromise(provider.awaitSubscription);
 
+    // Tears down the reactor's start scope and starts it again over the same
+    // persisted state, the in-process equivalent of a server restart: startup
+    // recovery re-reads the bindings and replays any retained revert intent.
+    const restartReactor = async () => {
+      if (scope) {
+        await Effect.runPromise(Scope.close(scope, Exit.void));
+      }
+      scope = await Effect.runPromise(Scope.make("sequential"));
+      await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+      await Effect.runPromise(provider.awaitSubscription);
+    };
+
     return {
       engine,
       dispatch: (command: Parameters<typeof engine.dispatch>[0]) =>
@@ -673,6 +710,7 @@ describe("CheckpointReactor", () => {
       cwd,
       drain,
       releaseLifecycleLock,
+      restartReactor,
     };
   }
 
@@ -1364,30 +1402,26 @@ describe("CheckpointReactor", () => {
         createdAt,
       }),
     );
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-diff-claude-2"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-claude-2"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
-        status: "ready",
-        files: [],
-        checkpointTurnCount: 2,
-        createdAt,
-      }),
-    );
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-diff-claude-2"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-claude-2"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 2,
+      createdAt,
+    });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-revert-request-claude"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
-        createdAt,
-      }),
-    );
+    await harness.dispatch({
+      type: "thread.checkpoint.revert",
+      commandId: CommandId.make("cmd-revert-request-claude"),
+      threadId: ThreadId.make("thread-1"),
+      turnCount: 1,
+      createdAt,
+    });
 
     await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
     expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
@@ -1414,7 +1448,7 @@ describe("CheckpointReactor", () => {
       gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2)),
     ).toBe(false);
 
-    const binding = await Effect.runPromise(
+    const binding = await harness.runtime.runPromise(
       harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
     );
     expect(Option.isSome(binding)).toBe(true);
@@ -1434,7 +1468,7 @@ describe("CheckpointReactor", () => {
 
     await harness.drain();
 
-    const binding = await Effect.runPromise(
+    const binding = await harness.runtime.runPromise(
       harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
     );
     expect(Option.isSome(binding)).toBe(true);
@@ -1522,6 +1556,67 @@ describe("CheckpointReactor", () => {
       });
       expect(binding.value.runtimePayload).toEqual({ owner: "b" });
     }
+  });
+
+  it("preserves a replacement session's newer revert intent when a stale intent clears terminally", async () => {
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      holdLifecycleLockOnStart: true,
+    });
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    // The recovered stale intent is parked on the lifecycle lock. A
+    // replacement session takes ownership and persists its own revert intent
+    // into the same slot before the stale replay gets to run.
+    const newerCommandId = CommandId.make("server:checkpoint-revert-complete:newer");
+    await harness.runtime.runPromise(
+      harness.providerSessionDirectory.upsert({
+        threadId: ThreadId.make("thread-1"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        resumeCursor: { sessionId: "session-b" },
+        runtimePayload: {
+          checkpointRevertIntent: {
+            commandId: newerCommandId,
+            threadId: ThreadId.make("thread-1"),
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            sessionLease: ProviderSessionLease.make("lease-b"),
+            cwd: harness.cwd,
+            turnCount: 1,
+            turnIds: [asTurnId("turn-1")],
+            anchorTurnId: asTurnId("turn-2"),
+            checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+            staleCheckpointRefs: [checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2)],
+            createdAt,
+          },
+        },
+      }),
+    );
+
+    harness.releaseLifecycleLock?.();
+    await harness.drain();
+
+    // The stale intent's terminal clear is identity-guarded: it must surface
+    // its failure receipt without erasing the replacement's newer intent.
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v3\n");
+    const binding = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value.sessionLease).toBe(ProviderSessionLease.make("lease-b"));
+      expect(binding.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: { commandId: newerCommandId },
+      });
+    }
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+    ).toBe(true);
   });
 
   it("does not clear a replacement owner's binding after an in-flight recovered revert", async () => {
@@ -1733,6 +1828,113 @@ describe("CheckpointReactor", () => {
     expect(
       thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
     ).toBe(true);
+  });
+
+  it("replays a retained intent to convergence after a crash between restore and bookkeeping", async () => {
+    const harness = await createHarness({
+      rollbackResumeCursor: { sessionId: "session-rewound" },
+      failFirstRevertCompleteDispatch: true,
+    });
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-set-crash-replay"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
+        threadId: ThreadId.make("thread-1"),
+        status: "ready",
+        providerName: "codex",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: createdAt,
+      },
+      createdAt,
+    });
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-crash-replay-diff-1"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-1"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 1,
+      createdAt,
+    });
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-crash-replay-diff-2"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-2"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 2,
+      createdAt,
+    });
+    await harness.dispatch({
+      type: "thread.checkpoint.revert",
+      commandId: CommandId.make("cmd-crash-replay-revert"),
+      threadId: ThreadId.make("thread-1"),
+      turnCount: 1,
+      createdAt,
+    });
+    await harness.drain();
+
+    // First pass: the destructive phase finished (provider rolled back, tree
+    // restored, stale ref deleted) and the injected crash landed before the
+    // read model learned about the revert. The intent is the durable recovery
+    // state a real SIGKILL would leave behind.
+    expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+    const retained = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(retained)).toBe(true);
+    if (Option.isSome(retained)) {
+      expect(retained.value.resumeCursor).toEqual({ sessionId: "session-a" });
+      expect(retained.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: { threadId: "thread-1" },
+      });
+    }
+    const eventsBeforeReplay = await harness.runtime.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((chunk) => Array.from(chunk)),
+      ),
+    );
+    expect(eventsBeforeReplay.filter((event) => event.type === "thread.reverted")).toHaveLength(0);
+
+    await harness.restartReactor();
+    await harness.drain();
+
+    // Startup replay converges: the equal-target rollback replays, the restore
+    // is idempotent, exactly one thread.reverted lands, the rewound cursor
+    // persists, and the intent clears terminally.
+    expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(2);
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+    const eventsAfterReplay = await harness.runtime.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((chunk) => Array.from(chunk)),
+      ),
+    );
+    expect(eventsAfterReplay.filter((event) => event.type === "thread.reverted")).toHaveLength(1);
+    const converged = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(converged)).toBe(true);
+    if (Option.isSome(converged)) {
+      expect(converged.value.resumeCursor).toEqual({ sessionId: "session-rewound" });
+      expect(converged.value.runtimePayload).toMatchObject({ checkpointRevertIntent: null });
+    }
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.checkpoints.every((checkpoint) => checkpoint.checkpointTurnCount <= 1)).toBe(
+      true,
+    );
   });
 
   it("clears a missing-checkpoint revert intent before rolling back the provider", async () => {

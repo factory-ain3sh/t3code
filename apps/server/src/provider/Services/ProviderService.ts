@@ -122,7 +122,8 @@ export interface ProviderServiceShape {
    * The caller must already hold this thread's session lifecycle lock (via
    * `withSessionLifecycleLock`): rollback routes with `lifecycleLockHeld` and
    * must not race start, send, stop, or recovery. The per-thread lock is not
-   * reentrant, so this method cannot acquire it itself.
+   * reentrant, so this method cannot acquire it itself; a call from a fiber
+   * that does not hold the lock dies.
    */
   readonly rollbackConversation: (input: {
     readonly threadId: ThreadId;

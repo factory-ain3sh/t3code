@@ -944,11 +944,14 @@ it.effect(
 
       yield* Effect.gen(function* () {
         const provider = yield* ProviderService.ProviderService;
-        yield* provider.rollbackConversation({
-          threadId: startedSession.threadId,
-          turnIds: [],
-          anchorTurnId: asTurnId("turn-1"),
-        });
+        yield* provider.withSessionLifecycleLock(
+          startedSession.threadId,
+          provider.rollbackConversation({
+            threadId: startedSession.threadId,
+            turnIds: [],
+            anchorTurnId: asTurnId("turn-1"),
+          }),
+        );
       }).pipe(Effect.provide(secondProviderLayer));
 
       assert.equal(secondCodex.startSession.mock.calls.length, 1);
@@ -1031,10 +1034,13 @@ routing.layer("ProviderServiceLive routing", (it) => {
         ],
       ]);
 
-      yield* provider.rollbackConversation({
-        threadId: session.threadId,
-        turnIds: [asTurnId("turn-1")],
-      });
+      yield* provider.withSessionLifecycleLock(
+        session.threadId,
+        provider.rollbackConversation({
+          threadId: session.threadId,
+          turnIds: [asTurnId("turn-1")],
+        }),
+      );
 
       yield* provider.stopSession({ threadId: session.threadId });
       routing.codex.startSession.mockClear();
@@ -1215,11 +1221,14 @@ routing.layer("ProviderServiceLive routing", (it) => {
       routing.codex.startSession.mockClear();
       routing.codex.rollbackThread.mockClear();
 
-      yield* provider.rollbackConversation({
-        threadId: initial.threadId,
-        turnIds: [],
-        anchorTurnId: asTurnId("turn-1"),
-      });
+      yield* provider.withSessionLifecycleLock(
+        initial.threadId,
+        provider.rollbackConversation({
+          threadId: initial.threadId,
+          turnIds: [],
+          anchorTurnId: asTurnId("turn-1"),
+        }),
+      );
 
       assert.equal(routing.codex.startSession.mock.calls.length, 1);
       const resumedStartInput = routing.codex.startSession.mock.calls[0]?.[0];
@@ -1263,11 +1272,14 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }
 
       yield* advanceTestClock(50);
-      yield* provider.rollbackConversation({
+      yield* provider.withSessionLifecycleLock(
         threadId,
-        turnIds: [],
-        anchorTurnId: asTurnId("turn-1"),
-      });
+        provider.rollbackConversation({
+          threadId,
+          turnIds: [],
+          anchorTurnId: asTurnId("turn-1"),
+        }),
+      );
 
       const afterRollback = yield* runtimeRepository.getByThreadId({ threadId });
       assert.equal(Option.isSome(afterRollback), true);
@@ -2355,10 +2367,13 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           sandbox_mode: "workspace-write",
         },
       });
-      yield* provider.rollbackConversation({
-        threadId: session.threadId,
-        turnIds: [asTurnId("turn-1")],
-      });
+      yield* provider.withSessionLifecycleLock(
+        session.threadId,
+        provider.rollbackConversation({
+          threadId: session.threadId,
+          turnIds: [asTurnId("turn-1")],
+        }),
+      );
       yield* provider.stopSession({ threadId: session.threadId });
 
       const snapshots = yield* Metric.snapshot;
@@ -2799,6 +2814,43 @@ validation.layer("ProviderServiceLive validation", (it) => {
       }
       assert.equal(validation.codex.startSession.mock.calls.length, 0);
       assert.equal(validation.codex.rollbackThread.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("dies when rollbackConversation runs without the session lifecycle lock", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-unlocked-rollback");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      validation.codex.rollbackThread.mockClear();
+
+      const exit = yield* Effect.exit(
+        provider.rollbackConversation({
+          threadId,
+          turnIds: [asTurnId("turn-1")],
+        }),
+      );
+
+      // The lock-held contract is enforced, not prose: an unlocked caller is a
+      // programming error and dies before any adapter rollback runs.
+      assert.equal(Exit.hasDies(exit), true);
+      assert.equal(validation.codex.rollbackThread.mock.calls.length, 0);
+
+      const locked = yield* provider.withSessionLifecycleLock(
+        threadId,
+        provider.rollbackConversation({
+          threadId,
+          turnIds: [asTurnId("turn-1")],
+        }),
+      );
+      assert.equal(locked.threadId, threadId);
+      assert.equal(validation.codex.rollbackThread.mock.calls.length, 1);
     }),
   );
 
