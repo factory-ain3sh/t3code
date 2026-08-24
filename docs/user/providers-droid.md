@@ -97,9 +97,8 @@ turn. Droid may fold it into the current run or process it immediately afterward
 Droid sessions resume across T3 Code server restarts. Reopen the same thread and continue where you
 left off instead of starting a new Droid conversation.
 
-After a session resumes, rollback can only target turns completed since T3 Code most recently loaded
-that Droid session. Earlier turns remain in the conversation, but T3 Code cannot use them as Droid
-rollback points.
+Checkpoint rollback remains available after a server restart. T3 Code resumes Droid before
+rewinding and continues future messages from the rewound conversation.
 
 ## Early Access
 
