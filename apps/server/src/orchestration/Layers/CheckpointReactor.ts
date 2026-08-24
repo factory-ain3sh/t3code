@@ -765,25 +765,27 @@ const make = Effect.gen(function* () {
         }
         const providerInstanceId = binding.providerInstanceId;
         const sessionLease = binding.sessionLease;
-        return providerSessionDirectory
-          .updateRuntimePayloadIfOwned({
-            threadId: intent.threadId,
-            providerInstanceId,
-            sessionLease,
-            runtimePayload: { checkpointRevertIntent: null },
-          })
-          .pipe(
-            Effect.flatMap((cleared) =>
-              resumeCursor !== undefined
-                ? providerSessionDirectory.updateResumeCursorIfOwned({
-                    threadId: intent.threadId,
-                    providerInstanceId,
-                    sessionLease,
-                    resumeCursor,
-                  })
-                : Effect.succeed(cleared),
-            ),
-          );
+        const persistResumeCursor =
+          resumeCursor === undefined
+            ? Effect.succeed(true)
+            : providerSessionDirectory.updateResumeCursorIfOwned({
+                threadId: intent.threadId,
+                providerInstanceId,
+                sessionLease,
+                resumeCursor,
+              });
+        return persistResumeCursor.pipe(
+          Effect.flatMap((persisted) =>
+            persisted
+              ? providerSessionDirectory.updateRuntimePayloadIfOwned({
+                  threadId: intent.threadId,
+                  providerInstanceId,
+                  sessionLease,
+                  runtimePayload: { checkpointRevertIntent: null },
+                })
+              : Effect.succeed(false),
+          ),
+        );
       }),
     );
 

@@ -60,6 +60,7 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectoryPersistenceError } from "../../provider/Errors.ts";
 import { ProviderSessionDirectoryLive } from "../../provider/Layers/ProviderSessionDirectory.ts";
 import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
@@ -358,6 +359,7 @@ describe("CheckpointReactor", () => {
     readonly rollbackResumeCursor?: unknown;
     readonly persistedSessionBinding?: boolean;
     readonly replaceBindingDuringRollback?: boolean;
+    readonly failResumeCursorUpdate?: boolean;
   }) {
     const cwd = createGitRepository();
     tempDirs.push(cwd);
@@ -412,9 +414,27 @@ describe("CheckpointReactor", () => {
       refreshStatus: () => Effect.die("refreshStatus should not be called in this test"),
       streamStatus: () => Stream.empty,
     });
-    const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+    const providerSessionDirectoryBaseLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
     );
+    const providerSessionDirectoryLayer = options?.failResumeCursorUpdate
+      ? Layer.effect(
+          ProviderSessionDirectory,
+          Effect.gen(function* () {
+            const directory = yield* Effect.service(ProviderSessionDirectory);
+            return ProviderSessionDirectory.of({
+              ...directory,
+              updateResumeCursorIfOwned: () =>
+                Effect.fail(
+                  new ProviderSessionDirectoryPersistenceError({
+                    operation: "updateResumeCursorIfOwned",
+                    detail: "Injected cursor persistence failure",
+                  }),
+                ),
+            });
+          }),
+        ).pipe(Layer.provide(providerSessionDirectoryBaseLayer))
+      : providerSessionDirectoryBaseLayer;
 
     const checkpointReactorLayer = CheckpointReactorLive.pipe(
       Layer.provideMerge(orchestrationLayer),
@@ -1618,5 +1638,31 @@ describe("CheckpointReactor", () => {
       true,
     );
     expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+  });
+
+  it("keeps a recovered revert intent until its rewind cursor persists", async () => {
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      rollbackResumeCursor: { sessionId: "session-rewound" },
+      failResumeCursorUpdate: true,
+    });
+
+    await harness.drain();
+
+    const binding = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value.resumeCursor).toEqual({ sessionId: "session-a" });
+      expect(binding.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: {
+          turnCount: 1,
+          turnIds: ["turn-1"],
+          anchorTurnId: "turn-2",
+          sessionLease: "lease-a",
+        },
+      });
+    }
   });
 });

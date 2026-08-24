@@ -1,4 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
@@ -16,6 +18,18 @@ import { DroidRpcError, DroidRpcSpawnError, makeDroidRpcClient } from "./DroidRp
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
+
+function isProcessAlive(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
 
 interface CapturedLog {
   readonly message: ReadonlyArray<unknown>;
@@ -871,9 +885,15 @@ it.effect("fails registration after exit and ends every public stream", () =>
 
 it.effect("terminates the transport when stdout closes before the process exits", () =>
   Effect.gen(function* () {
+    const markerDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "droid-rpc-exit-"));
+    const pidPath = NodePath.join(markerDir, "pid");
     const client = yield* makeDroidRpcClient({
       command: process.execPath,
-      args: ["-e", "process.stdout.end(); setInterval(() => {}, 1_000)"],
+      args: [
+        "-e",
+        'require("node:fs").writeFileSync(process.argv[1], String(process.pid)); process.stdout.end(); setInterval(() => {}, 1_000)',
+        pidPath,
+      ],
     });
 
     const exit = yield* within(client.exits, "stdout closure did not terminate the transport");
@@ -888,6 +908,11 @@ it.effect("terminates the transport when stdout closes before the process exits"
       assert.equal(requestResult.failure.kind, "process-exit");
       assert.deepStrictEqual(requestResult.failure.data, exit);
     }
+    const processId = Number(NodeFS.readFileSync(pidPath, "utf8"));
+    assert.isFalse(
+      isProcessAlive(processId),
+      "transport exit was published before the Droid child terminated",
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 

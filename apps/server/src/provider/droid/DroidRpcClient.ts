@@ -695,24 +695,26 @@ export const makeDroidRpcClient = (
         data: exit,
       });
 
-    const observeChildExit = child.exitCode.pipe(
-      Effect.match({
-        onFailure: (cause) =>
-          ({
-            code: null,
-            description: `Droid process exit status was unavailable: ${String(cause)}`,
-          }) satisfies DroidProcessExit,
-        onSuccess: (code) =>
-          ({
-            code: Number(code),
-            description: `Droid process exited with code ${Number(code)}`,
-          }) satisfies DroidProcessExit,
-      }),
+    const observeChildExit = yield* Effect.cached(
+      child.exitCode.pipe(
+        Effect.match({
+          onFailure: (cause) =>
+            ({
+              code: null,
+              description: `Droid process exit status was unavailable: ${String(cause)}`,
+            }) satisfies DroidProcessExit,
+          onSuccess: (code) =>
+            ({
+              code: Number(code),
+              description: `Droid process exited with code ${Number(code)}`,
+            }) satisfies DroidProcessExit,
+        }),
+      ),
     );
 
     const beginProcessExit = (exit: DroidProcessExit) =>
       SynchronizedRef.modify(lifecycle, (state) => {
-        if (state._tag === "Exited") {
+        if (state._tag !== "Running") {
           return [false, state] as const;
         }
         return [
@@ -724,8 +726,9 @@ export const makeDroidRpcClient = (
           },
         ] as const;
       }).pipe(
-        Effect.flatMap((transitioned) => (transitioned ? Queue.end(outgoing) : Effect.void)),
-        Effect.asVoid,
+        Effect.flatMap((transitioned) =>
+          (transitioned ? Queue.end(outgoing) : Effect.void).pipe(Effect.as(transitioned)),
+        ),
       );
 
     const finishProcessExit = (exit: DroidProcessExit) =>
@@ -769,6 +772,20 @@ export const makeDroidRpcClient = (
         yield* Deferred.succeed(exitDeferred, finalExit);
       });
 
+    const terminateTransport = (exit: DroidProcessExit) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (!(yield* beginProcessExit(exit))) {
+            return;
+          }
+          yield* child
+            .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.seconds(2) })
+            .pipe(Effect.ignore);
+          yield* observeChildExit;
+          yield* finalizeTransportExit(exit);
+        }),
+      );
+
     const stdoutFiber = yield* child.stdout.pipe(
       Stream.decodeText(),
       splitJsonRpcLines,
@@ -778,7 +795,7 @@ export const makeDroidRpcClient = (
         onFailure: (cause) =>
           publishDiagnostic("Droid stdout stream failed", { cause }).pipe(
             Effect.andThen(
-              finalizeTransportExit({
+              terminateTransport({
                 code: null,
                 description: `Droid stdout stream failed: ${Cause.pretty(cause)}`,
               }),
@@ -790,7 +807,7 @@ export const makeDroidRpcClient = (
             Effect.flatMap(
               Option.match({
                 onNone: () =>
-                  finalizeTransportExit({
+                  terminateTransport({
                     code: null,
                     description: "Droid stdout stream closed before the process exited",
                   }),

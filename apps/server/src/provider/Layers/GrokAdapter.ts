@@ -1394,7 +1394,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             issue: "Rollback target does not match the current thread history.",
           });
         }
-        if (ctx.turns.length === target.turnIds.length) {
+        if (ctx.turns.length === target.turnIds.length && target.anchorTurnId === undefined) {
           return { threadId, turns: ctx.turns };
         }
         return yield* new ProviderAdapterRequestError({

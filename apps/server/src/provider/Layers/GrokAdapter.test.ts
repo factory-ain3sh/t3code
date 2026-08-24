@@ -148,6 +148,32 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }),
   );
 
+  it.effect("rejects an anchored empty rollback target after Grok restart", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-anchored-empty-rollback");
+      const adapter = yield* makeTestAdapter(yield* Effect.promise(() => makeMockGrokWrapper()));
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [],
+          anchorTurnId: TurnId.make("removed-turn"),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderAdapterRequestError");
+      if (error._tag === "ProviderAdapterRequestError") {
+        assert.equal(error.detail, "Grok ACP sessions do not support provider-side rollback yet.");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-mock-thread");
