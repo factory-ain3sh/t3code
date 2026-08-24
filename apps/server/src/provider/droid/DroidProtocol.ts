@@ -197,23 +197,14 @@ export const DroidToolConfirmationDetails = Schema.Union([
 ]);
 export type DroidToolConfirmationDetails = typeof DroidToolConfirmationDetails.Type;
 
-export const DroidPermissionOutcome = Schema.Literals([
-  "proceed_once",
-  "proceed_always",
-  "proceed_always_file",
-  "proceed_auto_run",
-  "proceed_auto_run_low",
-  "proceed_auto_run_medium",
-  "proceed_auto_run_high",
-  "proceed_new_session",
-  "proceed_new_session_low",
-  "proceed_new_session_medium",
-  "proceed_new_session_high",
-  "proceed_edit",
-  "proceed_always_tools",
-  "proceed_always_server",
-  "cancel",
-]);
+/**
+ * Open string, not a literal set: the droid CLI versions its outcome
+ * vocabulary independently of this server, and a closed set would fail the
+ * whole permission-request decode (hanging the turn) the first time a newer
+ * CLI ships a new outcome. Classification happens where outcomes are
+ * consumed (selectDroidPermissionOutcome), which ignores unknown values.
+ */
+export const DroidPermissionOutcome = Schema.String;
 export type DroidPermissionOutcome = typeof DroidPermissionOutcome.Type;
 
 export const DroidPermissionOption = Schema.Struct({

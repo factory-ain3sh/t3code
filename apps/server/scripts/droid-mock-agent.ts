@@ -286,6 +286,52 @@ async function runTurn(params: {
     return;
   }
 
+  if (params.text === "mock late spec approval") {
+    // The turn settles while the exit_spec_mode permission is still pending;
+    // a late approval then streams successor traffic that the adapter must
+    // refuse to adopt. The settle waits on a marker file so the test can
+    // guarantee the request opened before the turn completes.
+    const pendingApproval = requestClient("droid.request_permission", {
+      toolUses: [
+        {
+          toolUse: {
+            type: "tool_use",
+            id: `late-exit-spec-tool-${turnId}`,
+            input: { plan: "Implement the approved plan." },
+            name: "ExitSpecMode",
+          },
+          details: {
+            type: "exit_spec_mode",
+            plan: "Implement the approved plan.",
+            title: "Approved plan",
+          },
+        },
+      ],
+      options: [
+        { label: "Implement", value: "proceed_once" },
+        { label: "Cancel", value: "cancel" },
+      ],
+    }) as Promise<{ selectedOption?: unknown }>;
+    void pendingApproval.then((result) => {
+      if (result.selectedOption === "cancel") {
+        return;
+      }
+      notifyForSession(specSuccessorSessionId, {
+        type: "assistant_text_delta",
+        messageId: `assistant-late-successor-${turnId}`,
+        blockIndex: 0,
+        textDelta: "late implementation successor",
+      });
+      emitTerminalForSession(specSuccessorSessionId, "completed", `late-successor-${turnId}`);
+    });
+    const settleFile = process.env.T3_DROID_MOCK_LATE_SPEC_SETTLE_FILE;
+    if (settleFile) {
+      await waitForFile(settleFile);
+    }
+    emitTurnCompleted("completed", turnId);
+    return;
+  }
+
   if (params.text === "mock foreign spec envelope") {
     notifyForSession(specSuccessorSessionId, {
       type: "assistant_text_delta",

@@ -1,5 +1,6 @@
 import {
   type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   type RuntimeEventRawSource,
   RuntimeItemId,
   type CanonicalRequestType,
@@ -83,7 +84,7 @@ export function makeAcpRequestOpenedEvent(input: {
   readonly turnId: TurnId | undefined;
   readonly requestId: RuntimeRequestId;
   readonly permissionRequest: AcpPermissionRequest;
-  readonly supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
+  readonly options: ReadonlyArray<ProviderApprovalOption>;
   readonly detail: string;
   readonly args: unknown;
   readonly source: AcpAdapterRawSource;
@@ -99,7 +100,7 @@ export function makeAcpRequestOpenedEvent(input: {
     requestId: input.requestId,
     payload: {
       requestType: canonicalRequestTypeFromAcpKind(input.permissionRequest.kind),
-      supportedDecisions: input.supportedDecisions,
+      options: input.options,
       detail: input.detail,
       args: input.args,
     },

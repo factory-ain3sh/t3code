@@ -29,11 +29,19 @@ const gracefulShutdownTimeout = Duration.seconds(2);
 const timedOutRequestRetentionLimit = 256;
 const diagnosticTextLimit = 2000;
 const outgoingQueueCapacity = 2;
+// Backlog threshold, not a capacity: the notification queue is unbounded so
+// the stdout reader never suspends behind a slow consumer (a suspended reader
+// stalls response resolution and gates exit delivery). Lossy notification
+// classes drop at this threshold; a lossless backlog past it is diagnosed.
 const notificationQueueCapacity = 64;
 const lossyNotificationQueueLimit = notificationQueueCapacity - 1;
 export const DROID_SERVER_REQUEST_CONCURRENCY = 16;
 const serverRequestQueueCapacity = DROID_SERVER_REQUEST_CONCURRENCY;
 const maxOutgoingMessageBytes = 128 * 1024 * 1024;
+// A single inbound frame past this cap terminates the transport rather than
+// dropping the frame: a peer that emits multi-megabyte single frames is
+// protocol-broken, silently skipping one desynchronizes request/response
+// pairing, and the session recovers through resume.
 const maxIncomingLineBytes = 2 * 1024 * 1024;
 const stdoutExitObservationGrace = Duration.millis(100);
 const lossyNotificationTypes: ReadonlySet<string> = new Set(["tool_progress_update"]);
@@ -362,12 +370,14 @@ export const makeDroidRpcClient = (
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeScope = yield* Scope.Scope;
     const outgoing = yield* Queue.bounded<string, Cause.Done<void>>(outgoingQueueCapacity);
-    const notificationPubSub = yield* Queue.bounded<DroidNotificationEnvelope, Cause.Done<void>>(
-      notificationQueueCapacity,
-    );
-    const serverRequestPubSub = yield* Queue.bounded<DroidServerRequest, Cause.Done<void>>(
-      serverRequestQueueCapacity,
-    );
+    const notificationPubSub = yield* Queue.unbounded<
+      DroidNotificationEnvelope,
+      Cause.Done<void>
+    >();
+    // Unbounded for the same reason as the notification queue: server-request
+    // delivery must never suspend the stdout reader. The adapter still caps
+    // concurrent processing at DROID_SERVER_REQUEST_CONCURRENCY.
+    const serverRequestPubSub = yield* Queue.unbounded<DroidServerRequest, Cause.Done<void>>();
     const lifecycle = yield* SynchronizedRef.make<DroidRpcLifecycle>({
       _tag: "Running",
       pending: new Map(),
@@ -554,7 +564,14 @@ export const makeDroidRpcClient = (
       });
 
     const publishServerRequest = (request: DroidServerRequest) =>
-      Queue.offer(serverRequestPubSub, request).pipe(Effect.asVoid);
+      Effect.gen(function* () {
+        if (Queue.sizeUnsafe(serverRequestPubSub) === serverRequestQueueCapacity) {
+          yield* publishDiagnostic(
+            `Droid server-request backlog exceeded ${serverRequestQueueCapacity}; the consumer is falling behind`,
+          );
+        }
+        yield* Queue.offer(serverRequestPubSub, request);
+      });
 
     const handleServerRequest = (
       message: ParsedJsonRpcMessage,
@@ -657,6 +674,14 @@ export const makeDroidRpcClient = (
             );
           }
           return;
+        }
+        if (
+          !lossyNotificationTypes.has(notification.type) &&
+          Queue.sizeUnsafe(notificationPubSub) === notificationQueueCapacity
+        ) {
+          yield* publishDiagnostic(
+            `Lossless Droid session notification backlog exceeded ${notificationQueueCapacity}; the consumer is falling behind`,
+          );
         }
         yield* Queue.offer(notificationPubSub, {
           sessionId,

@@ -4,6 +4,7 @@ import {
   type DroidSettings,
   EventId,
   type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   type ProviderRuntimeEvent,
   type ProviderSession,
   type ProviderUserInputAnswers,
@@ -139,7 +140,7 @@ interface PendingUserInput {
 
 interface DroidSessionContext {
   readonly threadId: ThreadId;
-  /** Mutable: rewind/compact mint a successor session id. */
+  /** Mutable: rewind and spec handoff mint a successor session id; compaction keeps it. */
   droidSessionId: string;
   session: ProviderAdapterSession;
   readonly scope: Scope.Closeable;
@@ -257,7 +258,12 @@ export function droidCanonicalRequestType(
 
 /**
  * Pick the droid confirmation outcome for a t3 approval decision. The reply
- * must be one of the outcomes the request offered.
+ * must be one of the outcomes the request offered. Classification is
+ * positive-only because the outcome vocabulary is an open string on the wire
+ * (the CLI versions it independently): one-shot `proceed_*` variants bind to
+ * accept, `proceed_always*` variants to acceptForSession, and an outcome this
+ * server does not recognize is never selectable — misbinding it could grant
+ * more than the user chose.
  */
 export function selectDroidPermissionOutcome(
   options: ReadonlyArray<DroidPermissionOption>,
@@ -266,36 +272,45 @@ export function selectDroidPermissionOutcome(
   const outcomes = options
     .map((option) => option.outcome.trim())
     .filter((outcome): outcome is string => Boolean(outcome));
-  const persistentOutcomes = new Set([
-    "proceed_always",
-    "proceed_always_file",
-    "proceed_always_tools",
-    "proceed_always_server",
-  ]);
   switch (decision) {
     case "accept":
-      return outcomes.find((outcome) => outcome !== "cancel" && !persistentOutcomes.has(outcome));
+      return outcomes.find(
+        (outcome) => outcome.startsWith("proceed_") && !outcome.startsWith("proceed_always"),
+      );
     case "acceptForSession":
-      return outcomes.find((outcome) => persistentOutcomes.has(outcome));
+      return outcomes.find((outcome) => outcome.startsWith("proceed_always"));
     case "decline":
       return outcomes.includes("cancel") ? "cancel" : undefined;
+    default:
+      return undefined;
   }
 }
 
-export function droidSupportedApprovalDecisions(
+const DROID_DECISION_FALLBACK_LABELS = {
+  accept: "Approve",
+  acceptForSession: "Always allow this session",
+  decline: "Decline",
+} as const;
+
+/**
+ * Approval options this droid permission request supports, labeled with the
+ * CLI's own option labels. Droid's `cancel` outcome maps to t3's `decline`;
+ * t3's `cancel` stays unadvertised because it resolves the request without a
+ * droid outcome.
+ */
+export function droidApprovalOptions(
   options: ReadonlyArray<DroidPermissionOption>,
-): ReadonlyArray<DroidApprovalDecision> {
-  const decisions: DroidApprovalDecision[] = [];
-  if (selectDroidPermissionOutcome(options, "accept") !== undefined) {
-    decisions.push("accept");
+): ReadonlyArray<ProviderApprovalOption & { readonly decision: DroidApprovalDecision }> {
+  const approvalOptions: Array<ProviderApprovalOption & { decision: DroidApprovalDecision }> = [];
+  for (const decision of ["accept", "acceptForSession", "decline"] as const) {
+    const outcome = selectDroidPermissionOutcome(options, decision);
+    if (outcome === undefined) {
+      continue;
+    }
+    const label = options.find((option) => option.outcome.trim() === outcome)?.label.trim();
+    approvalOptions.push({ decision, label: label || DROID_DECISION_FALLBACK_LABELS[decision] });
   }
-  if (selectDroidPermissionOutcome(options, "acceptForSession") !== undefined) {
-    decisions.push("acceptForSession");
-  }
-  if (selectDroidPermissionOutcome(options, "decline") !== undefined) {
-    decisions.push("decline");
-  }
-  return decisions;
+  return approvalOptions;
 }
 
 /**
@@ -1025,11 +1040,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       Effect.gen(function* () {
         const params = request.params;
         yield* logNative(ctx.threadId, "droid.request_permission", request.rawParams);
-        const supportedDecisions = droidSupportedApprovalDecisions(params.options);
-        if (supportedDecisions.length === 0) {
+        const approvalOptions = droidApprovalOptions(params.options);
+        if (approvalOptions.length === 0) {
           yield* request.fail(-32602, "Droid permission request has no supported decisions");
           return;
         }
+        const supportedDecisions = approvalOptions.map((option) => option.decision);
         const primaryToolUse = params.toolUses[0];
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
@@ -1058,7 +1074,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               requestId: runtimeRequestId,
               payload: {
                 requestType,
-                supportedDecisions,
+                options: approvalOptions,
                 detail:
                   droidPermissionDetail(params) ??
                   encodeJsonStringForDiagnostics(request.rawParams)?.slice(0, 2000) ??
@@ -1109,11 +1125,23 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             issue: `Approval decision '${resolved.decision}' is not supported by request '${requestId}'.`,
           });
         }
+        // Arm the claim window under the thread lock and only while the turn
+        // that opened this request is still the active turn: an approval that
+        // resolves after its spec turn settles must not arm the next spec
+        // turn's handoff.
         const approvedSpecHandoff =
-          primaryToolUse?.details.type === "exit_spec_mode" && selectedOutcome !== "cancel";
-        if (approvedSpecHandoff) {
-          ctx.specHandoffApproved = true;
-        }
+          primaryToolUse?.details.type === "exit_spec_mode" &&
+          selectedOutcome !== "cancel" &&
+          (yield* withThreadLock(
+            ctx.threadId,
+            Effect.sync(() => {
+              if (ctx.stopped || ctx.session.activeTurnId !== turnId) {
+                return false;
+              }
+              ctx.specHandoffApproved = true;
+              return true;
+            }),
+          ));
         yield* request.respond({ selectedOption: selectedOutcome }).pipe(
           Effect.tapError(() =>
             Effect.sync(() => {

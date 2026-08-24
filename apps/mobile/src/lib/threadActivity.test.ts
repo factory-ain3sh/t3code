@@ -143,6 +143,59 @@ describe("pending user input answers", () => {
   });
 });
 
+describe("pending approvals", () => {
+  it("keeps app access approvals and persistence choices from remote environments", () => {
+    const options = [
+      { decision: "decline", label: "Decline" },
+      { decision: "acceptAlways", label: "Always allow Safari" },
+      { decision: "accept", label: "Approve" },
+    ];
+    const activity = makeActivity({
+      id: EventId.make("approval-safari"),
+      kind: "approval.requested",
+      summary: "App access approval requested",
+      createdAt: "2026-08-24T00:00:00.000Z",
+      payload: {
+        requestId: "req-safari",
+        requestType: "mcp_elicitation_approval",
+        detail: "Allow ChatGPT to use Safari?",
+        appName: "Safari",
+        options,
+      },
+    });
+
+    expect(derivePendingApprovals([activity])).toEqual([
+      {
+        requestId: "req-safari",
+        requestKind: "mcp-elicitation",
+        createdAt: "2026-08-24T00:00:00.000Z",
+        detail: "Allow ChatGPT to use Safari?",
+        appName: "Safari",
+        options,
+      },
+    ]);
+  });
+
+  it("removes an app access approval after a remote client rejects it", () => {
+    const requested = makeActivity({
+      id: EventId.make("approval-safari-open"),
+      kind: "approval.requested",
+      summary: "App access approval requested",
+      createdAt: "2026-08-24T00:00:00.000Z",
+      payload: { requestId: "req-safari", requestKind: "mcp-elicitation" },
+    });
+    const resolved = makeActivity({
+      id: EventId.make("approval-safari-resolved"),
+      kind: "approval.resolved",
+      summary: "Approval resolved",
+      createdAt: "2026-08-24T00:00:01.000Z",
+      payload: { requestId: "req-safari", decision: "decline" },
+    });
+
+    expect(derivePendingApprovals([requested, resolved])).toEqual([]);
+  });
+});
+
 function makeActivity(
   input: Partial<OrchestrationThreadActivity> &
     Pick<OrchestrationThreadActivity, "id" | "kind" | "summary" | "createdAt">,
@@ -182,6 +235,10 @@ function makeThread(
 
 describe("derivePendingApprovals", () => {
   it("maps plan approval requestType payloads into pending approvals", () => {
+    const options = [
+      { decision: "accept", label: "Approve" },
+      { decision: "decline", label: "Decline" },
+    ];
     const activities = [
       makeActivity({
         id: EventId.make("approval-open-plan-approval"),
@@ -192,7 +249,7 @@ describe("derivePendingApprovals", () => {
         payload: {
           requestId: "req-plan-approval",
           requestType: "plan_approval",
-          supportedDecisions: ["accept", "decline"],
+          options,
           detail: "1. Map plan approvals\n2. Render the approval card",
         },
       }),
@@ -202,7 +259,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-plan-approval",
         requestKind: "plan",
-        supportedDecisions: ["accept", "decline"],
+        options,
         createdAt: "2026-04-01T00:00:01.000Z",
         detail: "1. Map plan approvals\n2. Render the approval card",
       },
@@ -229,7 +286,6 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-dynamic-tool",
         requestKind: "command",
-        supportedDecisions: ["accept", "acceptForSession", "decline", "cancel"],
         createdAt: "2026-04-01T00:00:01.000Z",
         detail: "Search the web",
       },

@@ -18,7 +18,7 @@ import {
   ProviderDriverKind,
   ProviderSessionLease,
 } from "./providerInstance.ts";
-import { ProviderApprovalDecision } from "./orchestration.ts";
+import { ProviderApprovalOption } from "./orchestration.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
@@ -146,6 +146,7 @@ export const CanonicalRequestType = Schema.Literals([
   "apply_patch_approval",
   "exec_command_approval",
   "plan_approval",
+  "mcp_elicitation_approval",
   "tool_user_input",
   "dynamic_tool_call",
   "auth_tokens_refresh",
@@ -373,6 +374,11 @@ export type TurnStartedPayload = typeof TurnStartedPayload.Type;
 const TurnCompletedPayload = Schema.Struct({
   state: RuntimeTurnState,
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
+  /**
+   * The provider's resume cursor as of this completion. Every adapter emits
+   * it when a cursor exists, including adapters whose cursor is static for
+   * the session; ingestion persists it under the event's session lease.
+   */
   resumeCursor: Schema.optional(Schema.Unknown),
   usage: Schema.optional(Schema.Unknown),
   modelUsage: Schema.optional(UnknownRecordSchema),
@@ -439,8 +445,14 @@ export type ContentDeltaPayload = typeof ContentDeltaPayload.Type;
 
 const RequestOpenedPayload = Schema.Struct({
   requestType: CanonicalRequestType,
-  supportedDecisions: Schema.Array(ProviderApprovalDecision).check(Schema.isNonEmpty()),
   detail: Schema.optional(TrimmedNonEmptyStringSchema),
+  appName: Schema.optional(TrimmedNonEmptyStringSchema),
+  /**
+   * Decision choices this request supports, with provider-supplied labels.
+   * Absent means the client's default option set applies; adapters emit it
+   * only when their set or labels differ from that default.
+   */
+  options: Schema.optional(Schema.Array(ProviderApprovalOption)),
   args: Schema.optional(Schema.Unknown),
 });
 export type RequestOpenedPayload = typeof RequestOpenedPayload.Type;

@@ -649,7 +649,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect("exposes only distinct OpenCode permission decisions", () =>
+  it.effect("exposes the OpenCode approval options on permission requests", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-opencode-permission-decisions");
@@ -683,26 +683,64 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       });
 
       const opened = yield* Fiber.join(requestOpenedFiber).pipe(Effect.timeout("1 second"));
-      NodeAssert.deepEqual(opened.payload.supportedDecisions, [
-        "accept",
-        "acceptForSession",
-        "decline",
+      NodeAssert.deepEqual(opened.payload.options, [
+        { decision: "accept", label: "Approve" },
+        { decision: "acceptForSession", label: "Always allow this session" },
+        { decision: "decline", label: "Decline" },
       ]);
-
-      const cancelResult = yield* adapter
-        .respondToRequest(threadId, ApprovalRequestId.make(String(opened.requestId)), "cancel")
-        .pipe(Effect.result);
-      NodeAssert.equal(cancelResult._tag, "Failure");
-      if (cancelResult._tag === "Failure") {
-        NodeAssert.equal(cancelResult.failure._tag, "ProviderAdapterValidationError");
-      }
-      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, []);
 
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),
         "decline",
       );
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: "permission-1", reply: "reject" },
+      ]);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("maps a cancel decision to an OpenCode reject reply for legacy clients", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-permission-cancel");
+      const providerSessionId = "http://127.0.0.1:9999/session";
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "permission.asked",
+          properties: {
+            id: "permission-1",
+            sessionID: providerSessionId,
+            permission: "bash",
+            patterns: ["echo mock"],
+            metadata: {},
+          },
+        },
+      ];
+      const requestOpenedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<typeof event, { type: "request.opened" }> =>
+            event.threadId === threadId && event.type === "request.opened",
+        ),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow),
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+
+      const opened = yield* Fiber.join(requestOpenedFiber).pipe(Effect.timeout("1 second"));
+      // Shipped clients render Cancel from their default option set even
+      // though OpenCode never advertises it; the reply must still resolve.
+      const cancelResult = yield* adapter
+        .respondToRequest(threadId, ApprovalRequestId.make(String(opened.requestId)), "cancel")
+        .pipe(Effect.result);
+      NodeAssert.equal(cancelResult._tag, "Success");
       NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
         { requestID: "permission-1", reply: "reject" },
       ]);

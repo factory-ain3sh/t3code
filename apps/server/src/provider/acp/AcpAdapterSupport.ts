@@ -1,5 +1,6 @@
 import {
   type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   type ProviderDriverKind,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -44,35 +45,57 @@ export function mapAcpToAdapterError(
   });
 }
 
-export function selectAcpPermissionOptionId(
+function acpOptionForDecision(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
-): string | undefined {
+): EffectAcpSchema.RequestPermissionRequest["options"][number] | undefined {
   const kind =
     decision === "acceptForSession"
       ? "allow_always"
       : decision === "accept"
         ? "allow_once"
-        : "reject_once";
-  const option = request.options.find((entry) => entry.kind === kind);
-  return option?.optionId.trim() || undefined;
+        : decision === "decline"
+          ? "reject_once"
+          : undefined;
+  if (kind === undefined) {
+    return undefined;
+  }
+  return request.options.find((entry) => entry.kind === kind);
 }
 
-export function supportedAcpApprovalDecisions(
+export function selectAcpPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
-): ReadonlyArray<ProviderApprovalDecision> {
-  const decisions: ProviderApprovalDecision[] = [];
-  if (selectAcpPermissionOptionId(request, "accept") !== undefined) {
-    decisions.push("accept");
+  decision: Exclude<ProviderApprovalDecision, "cancel">,
+): string | undefined {
+  return acpOptionForDecision(request, decision)?.optionId.trim() || undefined;
+}
+
+const ACP_DECISION_FALLBACK_LABELS = {
+  accept: "Approve",
+  acceptForSession: "Always allow this session",
+  decline: "Decline",
+} as const;
+
+/**
+ * Approval options this ACP request supports, labeled with the agent's own
+ * option names. Cancel is always offered: it resolves the request client-side
+ * without selecting an ACP option.
+ */
+export function acpApprovalOptions(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): ReadonlyArray<ProviderApprovalOption> {
+  const options: ProviderApprovalOption[] = [];
+  for (const decision of ["accept", "acceptForSession", "decline"] as const) {
+    const option = acpOptionForDecision(request, decision);
+    if (option?.optionId.trim()) {
+      options.push({
+        decision,
+        label: option.name.trim() || ACP_DECISION_FALLBACK_LABELS[decision],
+      });
+    }
   }
-  if (selectAcpPermissionOptionId(request, "acceptForSession") !== undefined) {
-    decisions.push("acceptForSession");
-  }
-  if (selectAcpPermissionOptionId(request, "decline") !== undefined) {
-    decisions.push("decline");
-  }
-  decisions.push("cancel");
-  return decisions;
+  options.push({ decision: "cancel", label: "Cancel" });
+  return options;
 }
 
 export function selectAutoApprovedAcpPermissionOptionId(

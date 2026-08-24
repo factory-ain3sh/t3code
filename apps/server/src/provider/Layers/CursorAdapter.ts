@@ -51,7 +51,7 @@ import {
   mapAcpToAdapterError,
   selectAcpPermissionOptionId,
   selectAutoApprovedAcpPermissionOptionId,
-  supportedAcpApprovalDecisions,
+  acpApprovalOptions,
 } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
@@ -658,11 +658,11 @@ export function makeCursorAdapter(
                   const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                  const supportedDecisions = supportedAcpApprovalDecisions(params);
+                  const approvalOptions = acpApprovalOptions(params);
                   pendingApprovals.set(requestId, {
                     decision,
                     kind: permissionRequest.kind,
-                    supportedDecisions,
+                    supportedDecisions: approvalOptions.map((option) => option.decision),
                   });
                   yield* offerRuntimeEvent(
                     makeAcpRequestOpenedEvent({
@@ -672,7 +672,7 @@ export function makeCursorAdapter(
                       turnId: ctx?.activeTurnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
-                      supportedDecisions,
+                      options: approvalOptions,
                       detail:
                         permissionRequest.detail ??
                         encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
@@ -1024,6 +1024,9 @@ export function makeCursorAdapter(
               threadId: input.threadId,
               turnId,
               payload: {
+                ...(ctx.session.resumeCursor !== undefined
+                  ? { resumeCursor: ctx.session.resumeCursor }
+                  : {}),
                 state: result.stopReason === "cancelled" ? "cancelled" : "completed",
                 stopReason: result.stopReason ?? null,
               },

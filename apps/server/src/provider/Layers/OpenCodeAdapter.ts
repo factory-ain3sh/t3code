@@ -4,7 +4,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionLease,
-  type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   type ProviderRuntimeEvent,
   RuntimeItemId,
   RuntimeRequestId,
@@ -60,10 +60,10 @@ import {
 import * as Option from "effect/Option";
 
 const PROVIDER = ProviderDriverKind.make("opencode");
-const OPENCODE_APPROVAL_DECISIONS: ReadonlyArray<ProviderApprovalDecision> = [
-  "accept",
-  "acceptForSession",
-  "decline",
+const OPENCODE_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
+  { decision: "accept", label: "Approve" },
+  { decision: "acceptForSession", label: "Always allow this session" },
+  { decision: "decline", label: "Decline" },
 ];
 
 /**
@@ -980,7 +980,7 @@ export function makeOpenCodeAdapter(
             type: "request.opened",
             payload: {
               requestType: mapPermissionToRequestType(event.properties.permission),
-              supportedDecisions: OPENCODE_APPROVAL_DECISIONS,
+              options: OPENCODE_APPROVAL_OPTIONS,
               detail:
                 event.properties.patterns.length > 0
                   ? event.properties.patterns.join("\n")
@@ -1099,6 +1099,9 @@ export function makeOpenCodeAdapter(
               type: "turn.completed",
               sessionLease: context.session.sessionLease,
               payload: {
+                ...(context.session.resumeCursor !== undefined
+                  ? { resumeCursor: context.session.resumeCursor }
+                  : {}),
                 state: "completed",
               },
             });
@@ -1128,6 +1131,9 @@ export function makeOpenCodeAdapter(
               type: "turn.completed",
               sessionLease: context.session.sessionLease,
               payload: {
+                ...(context.session.resumeCursor !== undefined
+                  ? { resumeCursor: context.session.resumeCursor }
+                  : {}),
                 state: "failed",
                 errorMessage: message,
               },
@@ -1609,14 +1615,10 @@ export function makeOpenCodeAdapter(
           detail: `Unknown pending permission request: ${requestId}`,
         });
       }
-      if (!OPENCODE_APPROVAL_DECISIONS.includes(decision)) {
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "respondToRequest",
-          issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
-        });
-      }
 
+      // Decisions outside the advertised set still resolve: shipped clients
+      // render Cancel from their default option set, and
+      // toOpenCodePermissionReply maps everything unrecognized to a reject.
       yield* runOpenCodeSdk("permission.reply", () =>
         context.client.permission.reply({
           requestID: requestId,

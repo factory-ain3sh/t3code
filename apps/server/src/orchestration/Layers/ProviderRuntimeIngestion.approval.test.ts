@@ -10,8 +10,13 @@ import { describe, expect, it } from "vite-plus/test";
 import { runtimeEventToActivities } from "./ProviderRuntimeIngestion.ts";
 
 describe("runtimeEventToActivities approval details", () => {
-  it("preserves approval details and supported decisions", () => {
+  it("preserves approval details and approval options", () => {
     const detail = `bun run release -- ${"long-argument ".repeat(20)}\nsecond line`;
+    const options = [
+      { decision: "accept", label: "Approve" },
+      { decision: "decline", label: "Decline" },
+      { decision: "cancel", label: "Cancel" },
+    ] as const;
     const event = {
       type: "request.opened",
       eventId: EventId.make("evt-request-opened"),
@@ -21,7 +26,7 @@ describe("runtimeEventToActivities approval details", () => {
       requestId: RuntimeRequestId.make("approval-1"),
       payload: {
         requestType: "command_execution_approval",
-        supportedDecisions: ["accept", "decline", "cancel"],
+        options,
         detail,
       },
     } satisfies ProviderRuntimeEvent;
@@ -29,11 +34,44 @@ describe("runtimeEventToActivities approval details", () => {
     const [activity] = runtimeEventToActivities(event);
 
     expect(activity?.kind).toBe("approval.requested");
-    expect((activity?.payload as Record<string, unknown> | undefined)?.supportedDecisions).toEqual([
-      "accept",
-      "decline",
-      "cancel",
-    ]);
+    expect((activity?.payload as Record<string, unknown> | undefined)?.options).toEqual(options);
     expect((activity?.payload as Record<string, unknown> | undefined)?.detail).toBe(detail);
+  });
+
+  it("keeps app details and approval options available to remote clients", () => {
+    const options = [
+      { decision: "decline", label: "Decline" },
+      { decision: "acceptAlways", label: "Always allow Safari" },
+      { decision: "accept", label: "Approve" },
+    ] as const;
+    const event = {
+      type: "request.opened",
+      eventId: EventId.make("evt-mcp-elicitation"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-08-24T00:00:00.000Z",
+      threadId: ThreadId.make("thread-1"),
+      requestId: RuntimeRequestId.make("approval-safari"),
+      payload: {
+        requestType: "mcp_elicitation_approval",
+        detail: "Allow ChatGPT to use Safari?",
+        appName: "Safari",
+        options,
+      },
+    } satisfies ProviderRuntimeEvent;
+
+    const [activity] = runtimeEventToActivities(event);
+
+    expect(activity).toMatchObject({
+      kind: "approval.requested",
+      summary: "App access approval requested",
+      payload: {
+        requestId: "approval-safari",
+        requestKind: "mcp-elicitation",
+        requestType: "mcp_elicitation_approval",
+        detail: "Allow ChatGPT to use Safari?",
+        appName: "Safari",
+        options,
+      },
+    });
   });
 });

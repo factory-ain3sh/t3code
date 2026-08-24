@@ -1,14 +1,14 @@
 import {
   approvalRequestKindFromPayload,
-  supportedApprovalDecisionsFromPayload,
-  type ApprovalRequestKind,
+  approvalOptionsFromPayload,
 } from "@t3tools/client-runtime/approvalRequests";
 import { ApprovalRequestId, isToolLifecycleItemType } from "@t3tools/contracts";
 import type {
   OrchestrationLatestTurn,
   OrchestrationThread,
   OrchestrationThreadActivity,
-  ProviderApprovalDecision,
+  ProviderApprovalOption,
+  ProviderRequestKind,
   ToolLifecycleItemType,
   TurnId,
   UserInputQuestion,
@@ -20,10 +20,11 @@ import * as Order from "effect/Order";
 
 export interface PendingApproval {
   readonly requestId: ApprovalRequestId;
-  readonly requestKind: ApprovalRequestKind;
+  readonly requestKind: ProviderRequestKind;
   readonly createdAt: string;
   readonly detail?: string;
-  readonly supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
+  readonly appName?: string;
+  readonly options?: ReadonlyArray<ProviderApprovalOption>;
 }
 
 export interface PendingUserInput {
@@ -1361,16 +1362,18 @@ export function derivePendingApprovals(
         : null;
     const requestId = parseApprovalRequestId(payload?.requestId);
     const requestKind = approvalRequestKindFromPayload(payload);
-    const supportedDecisions = supportedApprovalDecisionsFromPayload(payload);
     const detail = typeof payload?.detail === "string" ? payload.detail : undefined;
+    const appName = typeof payload?.appName === "string" ? payload.appName : undefined;
+    const options = approvalOptionsFromPayload(payload);
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {
       openByRequestId.set(requestId, {
         requestId,
         requestKind,
         createdAt: activity.createdAt,
-        supportedDecisions,
         ...(detail ? { detail } : {}),
+        ...(appName ? { appName } : {}),
+        ...(options ? { options } : {}),
       });
       continue;
     }

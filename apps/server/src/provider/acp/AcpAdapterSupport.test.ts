@@ -4,13 +4,13 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import { ProviderDriverKind } from "@t3tools/contracts";
 
 import {
+  acpApprovalOptions,
   mapAcpToAdapterError,
   selectAcpPermissionOptionId,
-  supportedAcpApprovalDecisions,
 } from "./AcpAdapterSupport.ts";
 
 describe("AcpAdapterSupport", () => {
-  it("derives supported decisions from the options the ACP request offered", () => {
+  it("derives approval options from the options the ACP request offered", () => {
     const request = {
       sessionId: "session-1",
       toolCall: {
@@ -23,7 +23,11 @@ describe("AcpAdapterSupport", () => {
       ],
     } as EffectAcpSchema.RequestPermissionRequest;
 
-    expect(supportedAcpApprovalDecisions(request)).toEqual(["accept", "decline", "cancel"]);
+    expect(acpApprovalOptions(request)).toEqual([
+      { decision: "accept", label: "Allow once" },
+      { decision: "decline", label: "Reject" },
+      { decision: "cancel", label: "Cancel" },
+    ]);
     expect(selectAcpPermissionOptionId(request, "accept")).toBe("once");
     expect(selectAcpPermissionOptionId(request, "acceptForSession")).toBeUndefined();
   });

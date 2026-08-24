@@ -377,9 +377,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     event: ProviderRuntimeEvent,
   ) => {
     if (event.sessionLease === undefined) {
+      // Completions gate checkpoint capture and message finalization, so the
+      // ownership check is mandatory for them: an adapter that forgets to
+      // stamp its lease fails loudly here instead of publishing stale work.
+      if (event.type === "turn.completed") {
+        return Effect.logWarning("Dropped an unleased turn.completed runtime event.", {
+          provider: source.provider,
+          providerInstanceId: source.instanceId,
+          threadId: event.threadId,
+        }).pipe(Effect.as(false));
+      }
       return Effect.succeed(true);
     }
-    return directory.getBinding(event.threadId).pipe(
+    const matchesBinding = directory.getBinding(event.threadId).pipe(
       Effect.map((binding) => {
         const current = Option.getOrUndefined(binding);
         return (
@@ -387,6 +397,28 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           current.sessionLease === event.sessionLease
         );
       }),
+    );
+    return matchesBinding.pipe(
+      Effect.flatMap((matches) =>
+        matches
+          ? Effect.succeed(true)
+          : // A mismatch can be a freshly minted lease that start/recovery has
+            // not persisted yet (the adapter returned, the upsert has not
+            // landed). Wait for the thread's lifecycle lock to free, re-read
+            // once, and only then treat the event as genuinely stale.
+            withSessionLifecycleLock(event.threadId, Effect.void).pipe(
+              Effect.andThen(matchesBinding),
+              Effect.tap((matchesNow) =>
+                matchesNow
+                  ? Effect.void
+                  : Effect.logDebug("Dropped a provider runtime event with a stale lease.", {
+                      provider: source.provider,
+                      threadId: event.threadId,
+                      eventType: event.type,
+                    }),
+              ),
+            ),
+      ),
       Effect.catch((error) =>
         Effect.logWarning("Failed to validate provider runtime event ownership.", {
           provider: source.provider,
@@ -586,6 +618,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     readonly threadId: ThreadId;
     readonly operation: string;
     readonly allowRecovery: boolean;
+    /**
+     * Whether the caller already holds this thread's session lifecycle lock.
+     * Recovery mutates the binding, so an unlocked caller acquires the lock
+     * for the recovery step; otherwise a delayed locked stop can persist a
+     * null lease over the recovery upsert and strand a live session whose
+     * leased events all fail the ownership check.
+     */
+    readonly lifecycleLockHeld: boolean;
   }) {
     const bindingOption = yield* directory.getBinding(input.threadId);
     const binding = Option.getOrUndefined(bindingOption);
@@ -619,10 +659,45 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       } as const;
     }
 
-    const recovered = yield* recoverSessionForThread({
-      binding,
-      operation: input.operation,
+    const recoverLocked = Effect.gen(function* () {
+      // Re-check under the lock: a concurrent start or another recovery may
+      // have brought the session back while we waited.
+      const hasSessionNow = yield* adapter.hasSession(input.threadId);
+      if (hasSessionNow) {
+        return undefined;
+      }
+      const freshBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+      if (!freshBinding) {
+        return yield* toValidationError(
+          input.operation,
+          `Cannot route thread '${input.threadId}' because no persisted provider binding exists.`,
+        );
+      }
+      if (freshBinding.providerInstanceId !== instanceId) {
+        return yield* toValidationError(
+          input.operation,
+          `Thread '${input.threadId}' was rebound to another provider instance while routing.`,
+        );
+      }
+      return yield* recoverSessionForThread({
+        binding: freshBinding,
+        operation: input.operation,
+      });
     });
+
+    const recoveredOrActive = yield* input.lifecycleLockHeld
+      ? recoverLocked
+      : withSessionLifecycleLock(input.threadId, recoverLocked);
+    if (recoveredOrActive === undefined) {
+      return {
+        adapter,
+        instanceId,
+        threadId: input.threadId,
+        runtimeMode: binding.runtimeMode,
+        isActive: true,
+      } as const;
+    }
+    const recovered = recoveredOrActive;
     return {
       adapter: recovered.adapter,
       instanceId,
@@ -868,6 +943,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.sendTurn",
           allowRecovery: true,
+          lifecycleLockHeld: true,
         });
         metricProvider = routed.adapter.provider;
         metricModel = input.modelSelection?.model;
@@ -937,6 +1013,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.interruptTurn",
           allowRecovery: true,
+          lifecycleLockHeld: false,
         });
         metricProvider = routed.adapter.provider;
         yield* Effect.annotateCurrentSpan({
@@ -974,6 +1051,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.respondToRequest",
           allowRecovery: true,
+          lifecycleLockHeld: false,
         });
         metricProvider = routed.adapter.provider;
         yield* Effect.annotateCurrentSpan({
@@ -1013,6 +1091,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         operation: "ProviderService.respondToUserInput",
         allowRecovery: true,
+        lifecycleLockHeld: false,
       });
       metricProvider = routed.adapter.provider;
       yield* Effect.annotateCurrentSpan({
@@ -1044,10 +1123,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return yield* withSessionLifecycleLock(
         input.threadId,
         Effect.gen(function* () {
+          if (input.expectedSessionLease !== undefined) {
+            const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+            if ((binding?.sessionLease ?? null) !== input.expectedSessionLease) {
+              yield* Effect.logDebug("provider.session.stop.skipped-lease-mismatch", {
+                threadId: input.threadId,
+              });
+              return;
+            }
+          }
           const routed = yield* resolveRoutableSession({
             threadId: input.threadId,
             operation: "ProviderService.stopSession",
             allowRecovery: false,
+            lifecycleLockHeld: true,
           });
           metricProvider = routed.adapter.provider;
           yield* Effect.annotateCurrentSpan({
@@ -1210,6 +1299,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         operation: "ProviderService.rollbackConversation",
         allowRecovery: true,
+        lifecycleLockHeld: true,
       });
       metricProvider = routed.adapter.provider;
       yield* Effect.annotateCurrentSpan({
@@ -1249,6 +1339,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         operation: "ProviderService.uploadFeedback",
         allowRecovery: false,
+        lifecycleLockHeld: false,
       });
       if (routed.adapter.uploadFeedback === undefined) {
         return yield* toValidationError(
@@ -1261,6 +1352,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.uploadFeedback",
           allowRecovery: true,
+          lifecycleLockHeld: false,
         });
       }
       const uploadFeedback = routed.adapter.uploadFeedback;

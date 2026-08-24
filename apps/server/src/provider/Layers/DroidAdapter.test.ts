@@ -28,7 +28,7 @@ import {
 
 import { ServerConfig } from "../../config.ts";
 import {
-  droidSupportedApprovalDecisions,
+  droidApprovalOptions,
   droidTokenUsageSnapshot,
   makeDroidAdapter,
   selectDroidPermissionOutcome,
@@ -50,11 +50,13 @@ it("derives Droid approval capabilities without escalating one-shot approval", (
     { label: "Cancel", outcome: "cancel" },
   ] as const;
 
-  assert.deepEqual(droidSupportedApprovalDecisions(options), ["acceptForSession", "decline"]);
-  assert.deepEqual(
-    droidSupportedApprovalDecisions([{ label: "Allow once", outcome: "proceed_once" }]),
-    ["accept"],
-  );
+  assert.deepEqual(droidApprovalOptions(options), [
+    { decision: "acceptForSession", label: "Always allow" },
+    { decision: "decline", label: "Cancel" },
+  ]);
+  assert.deepEqual(droidApprovalOptions([{ label: "Allow once", outcome: "proceed_once" }]), [
+    { decision: "accept", label: "Allow once" },
+  ]);
   assert.isUndefined(selectDroidPermissionOutcome(options, "accept"));
   assert.equal(selectDroidPermissionOutcome(options, "acceptForSession"), "proceed_always");
 });
@@ -638,7 +640,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const opened = yield* Deferred.await(requestOpened);
       assert.equal(String(opened.turnId), String(sentTurn.turnId));
       assert.equal(opened.payload.requestType, "exec_command_approval");
-      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline"]);
+      assert.deepEqual(opened.payload.options, [
+        { decision: "accept", label: "Allow once" },
+        { decision: "decline", label: "Deny" },
+      ]);
       assert.equal(opened.payload.detail, "echo mock");
       assert.deepInclude(opened.payload.args, {
         toolUses: [
@@ -769,7 +774,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
 
       const opened = yield* Deferred.await(requestOpened);
-      assert.deepEqual(opened.payload.supportedDecisions, ["accept"]);
+      assert.deepEqual(opened.payload.options, [{ decision: "accept", label: "Allow once" }]);
       yield* adapter.interruptTurn(threadId, sentTurn.turnId);
       const terminal = yield* Deferred.await(turnCompleted);
       const resolved = yield* Deferred.await(requestResolved);
@@ -1763,7 +1768,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       const opened = yield* Deferred.await(requestOpened);
       assert.equal(opened.payload.requestType, "plan_approval");
-      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline"]);
+      assert.deepEqual(opened.payload.options, [
+        { decision: "accept", label: "Implement" },
+        { decision: "decline", label: "Cancel" },
+      ]);
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),
@@ -1791,6 +1799,96 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         turnIds: [sentTurn.turnId],
       });
 
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not arm the spec-handoff claim window from a late approval", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-late-spec-approval");
+      const settleDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-late-spec-approval-")),
+      );
+      const settleFile = NodePath.join(settleDir, "settle");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_LATE_SPEC_SETTLE_FILE: settleFile,
+      });
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const firstTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "request.opened" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
+              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
+                ? Deferred.succeed(firstTurnCompleted, event).pipe(Effect.asVoid)
+                : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const specTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock late spec approval",
+        attachments: [],
+        interactionMode: "plan",
+      });
+      const opened = yield* Deferred.await(requestOpened);
+      // Release the mock's settle: the spec turn completes while the approval
+      // is still pending.
+      yield* Effect.promise(() => NodeFSP.writeFile(settleFile, ""));
+      yield* Deferred.await(firstTurnCompleted);
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(opened.requestId)),
+        "accept",
+      );
+
+      // A stale arm from the late approval would let the NEXT plan turn adopt
+      // a foreign successor envelope without any approval of its own.
+      const foreignCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const foreignFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed" &&
+        String(event.threadId) === String(threadId) &&
+        event.turnId !== undefined &&
+        String(event.turnId) !== String(specTurn.turnId)
+          ? Deferred.succeed(foreignCompleted, event).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      const foreignTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock foreign spec envelope",
+        attachments: [],
+        interactionMode: "plan",
+      });
+      yield* Deferred.await(foreignCompleted);
+
+      const sessions = yield* adapter.listSessions();
+      const threadText = eventsForThread(runtimeEvents, threadId)
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta)
+        .join("");
+
+      assert.notInclude(threadText, "late implementation successor");
+      assert.notInclude(threadText, "unapproved implementation successor");
+      assert.deepStrictEqual(sessions[0]?.resumeCursor, {
+        schemaVersion: 2,
+        sessionId: "mock-session-1",
+        turnIds: [specTurn.turnId, foreignTurn.turnId],
+      });
+
+      yield* Fiber.interrupt(foreignFiber);
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
     }),

@@ -35,7 +35,11 @@ describe("AcpCoreRuntimeEvents", () => {
         turnId,
         requestId: RuntimeRequestId.make("request-1"),
         permissionRequest,
-        supportedDecisions: ["accept", "decline", "cancel"],
+        options: [
+          { decision: "accept", label: "Approve" },
+          { decision: "decline", label: "Decline" },
+          { decision: "cancel", label: "Cancel" },
+        ],
         detail: "cat package.json",
         args: { command: ["cat", "package.json"] },
         source: "acp.jsonrpc",
@@ -46,7 +50,11 @@ describe("AcpCoreRuntimeEvents", () => {
       type: "request.opened",
       payload: {
         requestType: "exec_command_approval",
-        supportedDecisions: ["accept", "decline", "cancel"],
+        options: [
+          { decision: "accept", label: "Approve" },
+          { decision: "decline", label: "Decline" },
+          { decision: "cancel", label: "Cancel" },
+        ],
         detail: "cat package.json",
       },
     });
@@ -87,7 +95,10 @@ describe("AcpCoreRuntimeEvents", () => {
       expect(
         makeAcpRequestOpenedEvent({
           ...request,
-          supportedDecisions: ["accept", "cancel"],
+          options: [
+            { decision: "accept", label: "Approve" },
+            { decision: "cancel", label: "Cancel" },
+          ],
           detail: kind,
           args: {},
           source: "acp.jsonrpc",
@@ -98,7 +109,10 @@ describe("AcpCoreRuntimeEvents", () => {
         type: "request.opened",
         payload: {
           requestType: "dynamic_tool_call",
-          supportedDecisions: ["accept", "cancel"],
+          options: [
+            { decision: "accept", label: "Approve" },
+            { decision: "cancel", label: "Cancel" },
+          ],
         },
       });
 

@@ -693,7 +693,7 @@ it.effect("preserves terminal notifications when tool progress delivery is satur
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 
-it.effect("backpressures text deltas without terminating the transport", () =>
+it.effect("resolves responses queued behind a lossless notification burst", () =>
   Effect.gen(function* () {
     const script = `
       process.stdin.setEncoding("utf8");
@@ -746,17 +746,14 @@ it.effect("backpressures text deltas without terminating the transport", () =>
       args: ["-e", script],
     });
 
-    const saturated = yield* Effect.result(
-      client.request("droid.list_models", {}, { timeoutMs: 50 }),
-    );
-    assert.equal(saturated._tag, "Failure");
-    if (saturated._tag === "Failure") {
-      assert.equal(saturated.failure.kind, "timeout");
-    }
+    // The response rides behind 65 lossless deltas; delivery must not depend
+    // on the notification consumer making progress.
+    const saturated = yield* client.request("droid.list_models", {}, { timeoutMs: 5_000 });
+    assert.deepStrictEqual(saturated, { queueSaturated: true });
 
     const notifications = yield* within(
       Stream.runCollect(client.notifications.pipe(Stream.take(65))),
-      "backpressured text deltas were not delivered",
+      "burst text deltas were not delivered",
     );
     assert.equal(notifications.length, 65);
     assert.isTrue(
@@ -772,7 +769,7 @@ it.effect("backpressures text deltas without terminating the transport", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 
-it.effect("backpressures server-request delivery without terminating the transport", () =>
+it.effect("resolves responses queued behind a server-request burst", () =>
   Effect.gen(function* () {
     const script = `
       process.stdin.setEncoding("utf8");
@@ -828,17 +825,14 @@ it.effect("backpressures server-request delivery without terminating the transpo
       args: ["-e", script],
     });
 
-    const saturated = yield* Effect.result(
-      client.request("droid.list_models", {}, { timeoutMs: 50 }),
-    );
-    assert.equal(saturated._tag, "Failure");
-    if (saturated._tag === "Failure") {
-      assert.equal(saturated.failure.kind, "timeout");
-    }
+    // The response rides behind 17 pending server requests; delivery must not
+    // depend on the server-request consumer making progress.
+    const saturated = yield* client.request("droid.list_models", {}, { timeoutMs: 5_000 });
+    assert.deepStrictEqual(saturated, { queueSaturated: true });
 
     const serverRequests = yield* within(
       Stream.runCollect(client.serverRequests.pipe(Stream.take(17))),
-      "backpressured server requests were not delivered",
+      "burst server requests were not delivered",
     );
     assert.equal(serverRequests.length, 17);
     assert.isTrue(serverRequests.every((request) => request.method === "droid.ask_user"));
@@ -913,6 +907,97 @@ it.effect("terminates the transport when stdout closes before the process exits"
       isProcessAlive(processId),
       "transport exit was published before the Droid child terminated",
     );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("terminates the transport when a frame exceeds the incoming line cap", () =>
+  Effect.gen(function* () {
+    const script = `
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", () => {
+        process.stdout.write("x".repeat(2 * 1024 * 1024 + 64) + "\\n");
+      });
+      process.stdin.resume();
+      setInterval(() => {}, 1_000);
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const requestResult = yield* Effect.result(
+      client.request("droid.list_models", {}, { timeoutMs: undefined }),
+    );
+    assert.equal(requestResult._tag, "Failure");
+    if (requestResult._tag === "Failure") {
+      assert.equal(requestResult.failure.kind, "process-exit");
+    }
+
+    const exit = yield* within(client.exits, "oversized frame did not terminate the transport");
+    assert.include(exit.description, "Droid stdout stream failed");
+
+    const [notifications, serverRequests] = yield* within(
+      Effect.all([
+        Stream.runCollect(client.notifications),
+        Stream.runCollect(client.serverRequests),
+      ]),
+      "public streams did not end after the oversized frame",
+    );
+    assert.isEmpty(notifications);
+    assert.isEmpty(serverRequests);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("rejects a second answer to the same server request", () =>
+  Effect.gen(function* () {
+    const script = `
+      const request = {
+        jsonrpc: "2.0",
+        type: "request",
+        id: "ask-once",
+        method: "droid.ask_user",
+        params: {
+          toolCallId: "ask-1",
+          questions: [{
+            index: 0,
+            topic: "Scope",
+            question: "Which scope?",
+            options: ["workspace"]
+          }]
+        }
+      };
+      process.stdout.write(JSON.stringify(request) + "\\n");
+      process.stdin.resume();
+      setInterval(() => {}, 1_000);
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const serverRequests = yield* within(
+      Stream.runCollect(client.serverRequests.pipe(Stream.take(1))),
+      "server request was not delivered",
+    );
+    const serverRequest = serverRequests[0];
+    assert.isDefined(serverRequest);
+    if (serverRequest === undefined) {
+      return;
+    }
+
+    yield* within(
+      serverRequest.respond({ answers: {} }).pipe(Effect.orDie),
+      "first server-request answer did not send",
+    );
+
+    const second = yield* Effect.result(serverRequest.respond({ answers: {} }));
+    assert.equal(second._tag, "Failure");
+    if (second._tag === "Failure") {
+      assert.instanceOf(second.failure, DroidRpcError);
+      assert.equal(second.failure.kind, "duplicate-server-response");
+    }
+
+    yield* within(client.shutdown, "client shutdown did not complete");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 

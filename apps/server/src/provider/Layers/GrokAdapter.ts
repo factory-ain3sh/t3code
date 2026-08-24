@@ -43,7 +43,7 @@ import {
   mapAcpToAdapterError,
   selectAcpPermissionOptionId,
   selectAutoApprovedAcpPermissionOptionId,
-  supportedAcpApprovalDecisions,
+  acpApprovalOptions,
 } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
@@ -308,6 +308,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 threadId,
                 turnId,
                 payload: {
+                  ...(liveCtx.session.resumeCursor !== undefined
+                    ? { resumeCursor: liveCtx.session.resumeCursor }
+                    : {}),
                   state: "failed",
                   errorMessage: options.errorMessage,
                 },
@@ -321,6 +324,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 threadId,
                 turnId,
                 payload: {
+                  ...(liveCtx.session.resumeCursor !== undefined
+                    ? { resumeCursor: liveCtx.session.resumeCursor }
+                    : {}),
                   state: options.completedStopReason === "cancelled" ? "cancelled" : "completed",
                   stopReason: options.completedStopReason ?? null,
                 },
@@ -386,6 +392,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             threadId,
             turnId: settleTurnId,
             payload: {
+              ...(liveCtx.session.resumeCursor !== undefined
+                ? { resumeCursor: liveCtx.session.resumeCursor }
+                : {}),
               state: "failed",
               errorMessage: options.errorMessage,
             },
@@ -399,6 +408,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             threadId,
             turnId: settleTurnId,
             payload: {
+              ...(liveCtx.session.resumeCursor !== undefined
+                ? { resumeCursor: liveCtx.session.resumeCursor }
+                : {}),
               state: options.completedStopReason === "cancelled" ? "cancelled" : "completed",
               stopReason: options.completedStopReason ?? null,
             },
@@ -650,8 +662,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const decision = yield* Deferred.make<ProviderApprovalDecision>();
                   const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
-                  const supportedDecisions = supportedAcpApprovalDecisions(params);
-                  pendingApprovals.set(requestId, { decision, supportedDecisions });
+                  const approvalOptions = acpApprovalOptions(params);
+                  pendingApprovals.set(requestId, {
+                    decision,
+                    supportedDecisions: approvalOptions.map((option) => option.decision),
+                  });
                   yield* offerRuntimeEvent(
                     makeAcpRequestOpenedEvent({
                       stamp: yield* makeEventStamp(),
@@ -660,7 +675,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       turnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
-                      supportedDecisions,
+                      options: approvalOptions,
                       detail:
                         permissionRequest.detail ??
                         encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
@@ -1166,6 +1181,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   threadId: input.threadId,
                   turnId: prepared.turnId,
                   payload: {
+                    ...(ctx.session.resumeCursor !== undefined
+                      ? { resumeCursor: ctx.session.resumeCursor }
+                      : {}),
                     state: result.stopReason === "cancelled" ? "cancelled" : "completed",
                     stopReason: completedStopReason,
                   },

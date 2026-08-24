@@ -5,6 +5,7 @@ import {
   TurnId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
@@ -279,7 +280,62 @@ describe("ProviderSessionReaper", () => {
 
     await waitFor(() => harness.stopSession.mock.calls.length === 1);
 
-    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId });
+    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({
+      threadId,
+      expectedSessionLease: null,
+    });
+    expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
+  });
+
+  it("reaps stale leased sessions with their persisted lease as the expected lease", async () => {
+    const threadId = ThreadId.make("thread-reaper-stale-leased");
+    const sessionLease = ProviderSessionLease.make("lease-reaper-cas");
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        sessionLease,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-stale-leased",
+        },
+        runtimePayload: null,
+      }),
+    );
+
+    await startReaper();
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+
+    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({
+      threadId,
+      expectedSessionLease: sessionLease,
+    });
     expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
   });
 
@@ -559,9 +615,9 @@ describe("ProviderSessionReaper", () => {
 
     await waitFor(() => harness.stopSession.mock.calls.length === 2);
 
-    expect(harness.stopSession.mock.calls.map(([request]) => request.threadId)).toEqual([
-      failedThreadId,
-      reapedThreadId,
+    expect(harness.stopSession.mock.calls.map(([request]) => request)).toEqual([
+      { threadId: failedThreadId, expectedSessionLease: null },
+      { threadId: reapedThreadId, expectedSessionLease: null },
     ]);
   });
 
@@ -642,9 +698,9 @@ describe("ProviderSessionReaper", () => {
 
     await waitFor(() => harness.stopSession.mock.calls.length === 2);
 
-    expect(harness.stopSession.mock.calls.map(([request]) => request.threadId)).toEqual([
-      defectThreadId,
-      reapedThreadId,
+    expect(harness.stopSession.mock.calls.map(([request]) => request)).toEqual([
+      { threadId: defectThreadId, expectedSessionLease: null },
+      { threadId: reapedThreadId, expectedSessionLease: null },
     ]);
   });
 });

@@ -1,22 +1,22 @@
-import { PROVIDER_APPROVAL_DECISIONS, type ProviderApprovalDecision } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
-export type ApprovalRequestKind = "command" | "file-read" | "file-change" | "plan";
+import { ProviderApprovalOption, ProviderRequestKind } from "@t3tools/contracts";
+
+const isProviderRequestKind = Schema.is(ProviderRequestKind);
+const isProviderApprovalOption = Schema.is(ProviderApprovalOption);
 
 /**
- * Reads the client-facing approval kind from an orchestration activity payload.
- * Dynamic tool calls use the generic executable-action bucket so they remain
- * actionable on clients that do not render provider-specific tool kinds.
+ * Reads the client-facing approval kind from an orchestration activity
+ * payload: the server-stamped `requestKind` when present, otherwise derived
+ * from the raw provider request type. Dynamic tool calls use the generic
+ * executable-action bucket so they remain actionable on clients that do not
+ * render provider-specific tool kinds.
  */
 export function approvalRequestKindFromPayload(
   payload: Readonly<Record<string, unknown>> | null | undefined,
-): ApprovalRequestKind | null {
+): ProviderRequestKind | null {
   const requestKind = payload?.requestKind;
-  if (
-    requestKind === "command" ||
-    requestKind === "file-read" ||
-    requestKind === "file-change" ||
-    requestKind === "plan"
-  ) {
+  if (isProviderRequestKind(requestKind)) {
     return requestKind;
   }
 
@@ -32,26 +32,26 @@ export function approvalRequestKindFromPayload(
       return "file-change";
     case "plan_approval":
       return "plan";
+    case "mcp_elicitation_approval":
+      return "mcp-elicitation";
     default:
       return null;
   }
 }
 
 /**
- * Reads the decisions declared by the provider request. The default exists
- * only for approvals already persisted before this capability became part of
- * the activity payload.
+ * Reads the provider-declared approval options from an activity payload.
+ * Returns undefined when the payload carries none the client can act on
+ * (absent field, legacy persisted approvals, or every decision unknown to
+ * this client version), so callers fall back to their default option set.
  */
-export function supportedApprovalDecisionsFromPayload(
+export function approvalOptionsFromPayload(
   payload: Readonly<Record<string, unknown>> | null | undefined,
-): ReadonlyArray<ProviderApprovalDecision> {
-  const decisions = payload?.supportedDecisions;
-  if (!Array.isArray(decisions)) {
-    return PROVIDER_APPROVAL_DECISIONS;
+): ReadonlyArray<ProviderApprovalOption> | undefined {
+  const options = payload?.options;
+  if (!Array.isArray(options)) {
+    return undefined;
   }
-  return decisions.filter(
-    (decision): decision is ProviderApprovalDecision =>
-      typeof decision === "string" &&
-      PROVIDER_APPROVAL_DECISIONS.includes(decision as ProviderApprovalDecision),
-  );
+  const valid = options.filter(isProviderApprovalOption);
+  return valid.length > 0 ? valid : undefined;
 }

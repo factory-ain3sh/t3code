@@ -253,14 +253,20 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     },
   };
 
+  const publish = (event: LegacyProviderRuntimeEvent): void => {
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
+  };
+
   const emit = (event: LegacyProviderRuntimeEvent): void => {
     const sessionLease = sessions.get(event.threadId)?.sessionLease;
-    Effect.runSync(
-      PubSub.publish(runtimeEventPubSub, {
-        ...event,
-        ...(sessionLease === undefined ? {} : { sessionLease }),
-      } as unknown as ProviderRuntimeEvent),
-    );
+    publish(sessionLease === undefined ? event : { ...event, sessionLease });
+  };
+
+  // Publishes the event exactly as specified, without stamping the adapter's
+  // current session lease. Use for events whose lease (or lack of one) is the
+  // point of the test.
+  const emitRaw = (event: LegacyProviderRuntimeEvent): void => {
+    publish(event);
   };
 
   const updateSession = (
@@ -280,6 +286,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   return {
     adapter,
     emit,
+    emitRaw,
     updateSession,
     startSession,
     sendTurn,
@@ -735,12 +742,22 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
     );
 
     yield* Effect.gen(function* () {
-      yield* ProviderService.ProviderService;
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-canonical-thread-segment");
+      // A turn.completed event only survives ingestion when it carries the
+      // live session lease, so the session must exist before the adapter
+      // emits.
+      yield* provider.startSession(threadId, {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
       yield* advanceTestClock(10);
       codex.emit({
         eventId: asEventId("evt-canonical-thread-segment"),
         provider: ProviderDriverKind.make("codex"),
-        threadId: asThreadId("thread-canonical-thread-segment"),
+        threadId,
         createdAt: "2026-01-01T00:00:00.000Z",
         type: "turn.completed",
         payload: {
@@ -2425,6 +2442,254 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
             operation: "send",
           }),
           true,
+        );
+      }),
+  );
+});
+
+const ownership = makeProviderServiceLayer();
+ownership.layer("ProviderServiceLive ownership", (it) => {
+  it.effect("skips stopping a session when the expected lease does not match", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-stop-lease-mismatch");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const bindingBefore = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(bindingBefore), true);
+      if (Option.isNone(bindingBefore)) {
+        return;
+      }
+      const activeLease = bindingBefore.value.sessionLease;
+      assert.notEqual(activeLease, null);
+      if (activeLease === null || activeLease === undefined) {
+        return;
+      }
+
+      ownership.codex.stopSession.mockClear();
+      yield* provider.stopSession({
+        threadId,
+        expectedSessionLease: ProviderSessionLease.make("some-other-lease"),
+      });
+
+      // A mismatched expectation turns the stop into a no-op: the adapter
+      // keeps its session and the binding keeps its lease and status.
+      assert.equal(ownership.codex.stopSession.mock.calls.length, 0);
+      const bindingAfterSkip = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(bindingAfterSkip), true);
+      if (Option.isSome(bindingAfterSkip)) {
+        assert.equal(bindingAfterSkip.value.sessionLease, activeLease);
+        assert.notEqual(bindingAfterSkip.value.status, "stopped");
+      }
+
+      yield* provider.stopSession({ threadId, expectedSessionLease: activeLease });
+
+      assert.equal(ownership.codex.stopSession.mock.calls.length, 1);
+      const bindingAfterStop = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(bindingAfterStop), true);
+      if (Option.isSome(bindingAfterStop)) {
+        assert.equal(bindingAfterStop.value.sessionLease, null);
+        assert.equal(bindingAfterStop.value.status, "stopped");
+      }
+
+      // Omitting the expectation stops unconditionally.
+      const bareThreadId = asThreadId("thread-stop-no-expectation");
+      yield* provider.startSession(bareThreadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: bareThreadId,
+        runtimeMode: "full-access",
+      });
+      ownership.codex.stopSession.mockClear();
+      yield* provider.stopSession({ threadId: bareThreadId });
+
+      assert.equal(ownership.codex.stopSession.mock.calls.length, 1);
+      const bindingAfterBareStop = yield* directory.getBinding(bareThreadId);
+      assert.equal(Option.isSome(bindingAfterBareStop), true);
+      if (Option.isSome(bindingAfterBareStop)) {
+        assert.equal(bindingAfterBareStop.value.sessionLease, null);
+        assert.equal(bindingAfterBareStop.value.status, "stopped");
+      }
+    }),
+  );
+
+  it.effect("drops unleased turn.completed events at ingestion", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-unleased-turn-completion");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const receivedRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+      const consumer = yield* Stream.take(provider.streamEvents, 2).pipe(
+        Stream.runForEach((event) => Ref.update(receivedRef, (current) => [...current, event])),
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(50);
+
+      // Unleased completions are dropped outright; other unleased event types
+      // still pass through, as do completions stamped with the live lease.
+      ownership.codex.emitRaw({
+        type: "turn.completed",
+        eventId: asEventId("evt-unleased-completion"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-unleased-completion"),
+        status: "completed",
+      });
+      ownership.codex.emitRaw({
+        type: "message.delta",
+        eventId: asEventId("evt-unleased-delta"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-unleased-completion"),
+        delta: "hello",
+      });
+      ownership.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-leased-completion"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-unleased-completion"),
+        status: "completed",
+      });
+
+      yield* Fiber.join(consumer);
+      const received = yield* Ref.get(receivedRef);
+      assert.deepEqual(
+        received.map((event) => event.eventId),
+        [asEventId("evt-unleased-delta"), asEventId("evt-leased-completion")],
+      );
+    }),
+  );
+
+  it.effect(
+    "re-validates a leased event after an in-flight lifecycle operation persists the lease",
+    () =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const threadId = asThreadId("thread-inflight-lease-revalidation");
+
+        yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        const receivedRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+        const consumer = yield* Stream.take(provider.streamEvents, 2).pipe(
+          Stream.runForEach((event) => Ref.update(receivedRef, (current) => [...current, event])),
+          Effect.forkChild,
+        );
+        yield* advanceTestClock(50);
+
+        const inFlightLease = ProviderSessionLease.make("lease-inflight-upsert");
+        const staleLease = ProviderSessionLease.make("lease-never-persisted");
+
+        // Hold the lifecycle lock the way startSession does between the
+        // adapter returning a fresh lease and the directory upsert landing.
+        const firstLockHeld = yield* Deferred.make<void>();
+        const releaseFirstLock = yield* Deferred.make<void>();
+        const firstLock = yield* provider
+          .withSessionLifecycleLock(
+            threadId,
+            Deferred.succeed(firstLockHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFirstLock)),
+            ),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(firstLockHeld);
+
+        // The adapter emitted with a lease the binding does not carry yet.
+        ownership.codex.emitRaw({
+          type: "message.delta",
+          sessionLease: inFlightLease,
+          eventId: asEventId("evt-inflight-lease"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          turnId: asTurnId("turn-inflight-lease"),
+          delta: "in-flight",
+        });
+        yield* advanceTestClock(10);
+
+        // Nothing may publish while the lifecycle operation is still in
+        // flight: ingestion must wait for the lock and re-validate.
+        assert.equal((yield* Ref.get(receivedRef)).length, 0);
+
+        // The in-flight lifecycle operation persists the lease before
+        // releasing the lock, so ingestion's re-validation must pass.
+        yield* directory.upsert({
+          threadId,
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          sessionLease: inFlightLease,
+        });
+        yield* Deferred.succeed(releaseFirstLock, undefined);
+        yield* Fiber.join(firstLock);
+
+        // Inverse: a lease that never lands is dropped once the lock frees.
+        const secondLockHeld = yield* Deferred.make<void>();
+        const releaseSecondLock = yield* Deferred.make<void>();
+        const secondLock = yield* provider
+          .withSessionLifecycleLock(
+            threadId,
+            Deferred.succeed(secondLockHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseSecondLock)),
+            ),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(secondLockHeld);
+
+        ownership.codex.emitRaw({
+          type: "message.delta",
+          sessionLease: staleLease,
+          eventId: asEventId("evt-stale-lease"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          turnId: asTurnId("turn-inflight-lease"),
+          delta: "stale",
+        });
+        yield* advanceTestClock(10);
+        yield* Deferred.succeed(releaseSecondLock, undefined);
+        yield* Fiber.join(secondLock);
+
+        // A following event under the now-persisted lease proves the stale
+        // one was dropped rather than merely delayed.
+        ownership.codex.emitRaw({
+          type: "message.delta",
+          sessionLease: inFlightLease,
+          eventId: asEventId("evt-current-lease"),
+          provider: CODEX_DRIVER,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          turnId: asTurnId("turn-inflight-lease"),
+          delta: "current",
+        });
+
+        yield* Fiber.join(consumer);
+        const received = yield* Ref.get(receivedRef);
+        assert.deepEqual(
+          received.map((event) => event.eventId),
+          [asEventId("evt-inflight-lease"), asEventId("evt-current-lease")],
         );
       }),
   );
