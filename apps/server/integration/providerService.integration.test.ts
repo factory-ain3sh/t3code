@@ -1,5 +1,5 @@
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
-import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { ProviderDriverKind, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts/settings";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, assert } from "@effect/vitest";
@@ -291,7 +291,7 @@ it.live("rolls back provider conversation state only", () =>
       });
       assert.equal((session.threadId ?? "").length > 0, true);
 
-      yield* runTurn({
+      const firstTurnEvents = yield* runTurn({
         provider,
         harness: fixture.harness,
         threadId: session.threadId,
@@ -317,7 +317,11 @@ it.live("rolls back provider conversation state only", () =>
 
       yield* provider.rollbackConversation({
         threadId: session.threadId,
-        numTurns: 1,
+        turnIds: [
+          TurnId.make(
+            String(firstTurnEvents.find((event) => event.type === "turn.started")?.turnId),
+          ),
+        ],
       });
 
       const rollbackCalls = fixture.harness.getRollbackCalls(session.threadId);

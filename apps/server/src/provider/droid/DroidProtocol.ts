@@ -280,25 +280,7 @@ const CreateMessage = Schema.Struct({
 
 export const DroidAgentTurnCompleted = Schema.Struct({
   type: Schema.Literal("agent_turn_completed"),
-  reason: Schema.Literals([
-    "completed",
-    "cancelled",
-    "permission_rejected",
-    "error",
-    "process_exit",
-    "spec_handoff",
-    "structured_output_missing",
-    "structured_output_invalid",
-    "structured_output_schema_invalid",
-    "model_usage_exhausted",
-    "model_authentication_failed",
-    "model_request_rejected",
-    "model_provider_unreachable",
-    "model_provider_unavailable",
-    "prompt_rejected",
-    "completion_persistence_failed",
-    "no_approver_available",
-  ]),
+  reason: Schema.String,
   turnId: Schema.optional(Schema.String),
   tokenUsage: DroidTokenUsage,
   cumulativeTokenUsage: Schema.optional(DroidTokenUsage),
@@ -359,35 +341,14 @@ const KnownDroidSessionNotification = Schema.Union([
   Schema.Struct({ type: Schema.Literal("structured_output") }),
 ]);
 
-const knownNotificationTypes = new Set([
-  "assistant_text_delta",
-  "assistant_text_complete",
-  "thinking_text_delta",
-  "thinking_text_complete",
-  "tool_call",
-  "tool_result",
-  "tool_progress_update",
-  "tool_execution_phase_changed",
-  "create_message",
-  "droid_working_state_changed",
-  "agent_turn_completed",
-  "session_token_usage_changed",
-  "session_compacted",
-  "error",
-  "llm_retry",
-  "session_title_updated",
-  "child_session_available",
-  "permission_resolved",
-  "queued_messages_discarded",
-  "mcp_status_changed",
-  "settings_updated",
-  "structured_output",
-]);
+export const knownDroidSessionNotificationTypes: ReadonlySet<string> = new Set(
+  KnownDroidSessionNotification.members.map((member) => member.fields.type.literal),
+);
 
 const DroidUnknownNotificationPayload = Schema.Record(Schema.String, Schema.Unknown).check(
   Schema.makeFilter(
     (input) =>
-      (typeof input.type === "string" && !knownNotificationTypes.has(input.type)) ||
+      (typeof input.type === "string" && !knownDroidSessionNotificationTypes.has(input.type)) ||
       "Expected an unknown Droid notification type",
   ),
 );

@@ -2,6 +2,7 @@ import * as Option from "effect/Option";
 import * as Arr from "effect/Array";
 import {
   approvalRequestKindFromPayload,
+  supportedApprovalDecisionsFromPayload,
   type ApprovalRequestKind,
 } from "@t3tools/client-runtime/approvalRequests";
 import { isBackgroundTaskActivity } from "@t3tools/client-runtime/state/subagentRuntime";
@@ -11,6 +12,7 @@ import {
   type OrchestrationLatestTurn,
   type OrchestrationThreadActivity,
   type OrchestrationProposedPlanId,
+  type ProviderApprovalDecision,
   ProviderDriverKind,
   type ToolLifecycleItemType,
   type UserInputQuestion,
@@ -122,6 +124,7 @@ export interface PendingApproval {
   requestKind: ApprovalRequestKind;
   createdAt: string;
   detail?: string;
+  supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
 }
 
 export interface PendingUserInput {
@@ -409,6 +412,7 @@ export function derivePendingApprovals(
         ? ApprovalRequestId.make(payload.requestId)
         : null;
     const requestKind = approvalRequestKindFromPayload(payload);
+    const supportedDecisions = supportedApprovalDecisionsFromPayload(payload);
     const detail = payload && typeof payload.detail === "string" ? payload.detail : undefined;
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {
@@ -416,6 +420,7 @@ export function derivePendingApprovals(
         requestId,
         requestKind,
         createdAt: activity.createdAt,
+        supportedDecisions,
         ...(detail ? { detail } : {}),
       });
       continue;

@@ -1,8 +1,12 @@
 import {
+  CheckpointRef,
   CommandId,
-  type CheckpointRef,
   EventId,
+  IsoDateTime,
   MessageId,
+  NonNegativeInt,
+  ProviderDriverKind,
+  ProviderInstanceId,
   type ProjectId,
   ThreadId,
   TurnId,
@@ -16,7 +20,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import type * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
@@ -28,13 +32,12 @@ import {
 } from "../../checkpointing/Utils.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { CheckpointReactor, type CheckpointReactorShape } from "../Services/CheckpointReactor.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
-import type { CheckpointStoreError } from "../../checkpointing/Errors.ts";
-import type { OrchestrationDispatchError } from "../Errors.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
@@ -49,7 +52,43 @@ type ReactorInput =
   | {
       readonly source: "domain";
       readonly event: OrchestrationEvent;
+    }
+  | {
+      readonly source: "recovery";
+      readonly intent: CheckpointRevertIntent;
     };
+
+const CheckpointRevertIntent = Schema.Struct({
+  commandId: CommandId,
+  threadId: ThreadId,
+  provider: ProviderDriverKind,
+  providerInstanceId: ProviderInstanceId,
+  cwd: Schema.String,
+  turnCount: NonNegativeInt,
+  turnIds: Schema.Array(TurnId),
+  anchorTurnId: Schema.optional(TurnId),
+  checkpointRef: CheckpointRef,
+  staleCheckpointRefs: Schema.Array(CheckpointRef),
+  createdAt: IsoDateTime,
+});
+type CheckpointRevertIntent = typeof CheckpointRevertIntent.Type;
+
+const decodeCheckpointRevertIntent = Schema.decodeUnknownOption(CheckpointRevertIntent);
+
+function checkpointRevertIntentFromRuntimePayload(
+  runtimePayload: unknown,
+): Option.Option<CheckpointRevertIntent> {
+  if (
+    runtimePayload === null ||
+    typeof runtimePayload !== "object" ||
+    Array.isArray(runtimePayload)
+  ) {
+    return Option.none();
+  }
+  return decodeCheckpointRevertIntent(
+    (runtimePayload as Record<string, unknown>).checkpointRevertIntent,
+  );
+}
 
 function toTurnId(value: string | undefined): TurnId | null {
   return value === undefined ? null : TurnId.make(String(value));
@@ -84,6 +123,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const receiptBus = yield* RuntimeReceiptBus;
   const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
@@ -154,11 +194,23 @@ const make = Effect.gen(function* () {
 
   const resolveSessionRuntimeForThread = Effect.fn("resolveSessionRuntimeForThread")(function* (
     threadId: ThreadId,
-  ): Effect.fn.Return<Option.Option<{ readonly threadId: ThreadId; readonly cwd: string }>> {
+  ): Effect.fn.Return<
+    Option.Option<{
+      readonly threadId: ThreadId;
+      readonly provider: ProviderDriverKind;
+      readonly providerInstanceId: ProviderInstanceId;
+      readonly cwd: string;
+    }>
+  > {
     const sessions = yield* providerService.listSessions();
     const session = sessions.find((entry) => entry.threadId === threadId);
-    return session?.cwd
-      ? Option.some({ threadId: session.threadId, cwd: session.cwd })
+    return session?.cwd && session.providerInstanceId
+      ? Option.some({
+          threadId: session.threadId,
+          provider: session.provider,
+          providerInstanceId: session.providerInstanceId,
+          cwd: session.cwd,
+        })
       : Option.none();
   });
 
@@ -687,6 +739,70 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const persistCheckpointRevertIntent = (intent: CheckpointRevertIntent) =>
+    providerSessionDirectory.upsert({
+      threadId: intent.threadId,
+      provider: intent.provider,
+      providerInstanceId: intent.providerInstanceId,
+      runtimePayload: { checkpointRevertIntent: intent },
+    });
+
+  const clearCheckpointRevertIntent = (intent: CheckpointRevertIntent, resumeCursor?: unknown) =>
+    providerSessionDirectory.upsert({
+      threadId: intent.threadId,
+      provider: intent.provider,
+      providerInstanceId: intent.providerInstanceId,
+      ...(resumeCursor !== undefined ? { resumeCursor } : {}),
+      runtimePayload: { checkpointRevertIntent: null },
+    });
+
+  const executeCheckpointRevert = Effect.fn("executeCheckpointRevert")(function* (
+    intent: CheckpointRevertIntent,
+  ) {
+    const restored = yield* checkpointStore.restoreCheckpoint({
+      cwd: intent.cwd,
+      checkpointRef: intent.checkpointRef,
+      fallbackToHead: intent.turnCount === 0,
+    });
+    if (!restored) {
+      yield* clearCheckpointRevertIntent(intent);
+      yield* appendRevertFailureActivity({
+        threadId: intent.threadId,
+        turnCount: intent.turnCount,
+        detail: `Filesystem checkpoint is unavailable for turn ${intent.turnCount}.`,
+        createdAt: intent.createdAt,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+
+    // Refresh the workspace entry index so the @-mention file picker
+    // reflects the reverted filesystem state.
+    yield* workspaceEntries.refresh(intent.cwd);
+
+    const snapshot = yield* providerService.rollbackConversation({
+      threadId: intent.threadId,
+      turnIds: intent.turnIds,
+      ...(intent.anchorTurnId !== undefined ? { anchorTurnId: intent.anchorTurnId } : {}),
+    });
+
+    if (intent.staleCheckpointRefs.length > 0) {
+      yield* checkpointStore.deleteCheckpointRefs({
+        cwd: intent.cwd,
+        checkpointRefs: intent.staleCheckpointRefs,
+      });
+    }
+
+    yield* orchestrationEngine.dispatch({
+      type: "thread.revert.complete",
+      commandId: intent.commandId,
+      threadId: intent.threadId,
+      turnCount: intent.turnCount,
+      createdAt: intent.createdAt,
+    });
+
+    yield* clearCheckpointRevertIntent(intent, snapshot.resumeCursor);
+  });
+
   const handleRevertRequested = Effect.fn("handleRevertRequested")(function* (
     event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
   ) {
@@ -723,7 +839,10 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const currentTurnCount = thread.checkpoints.reduce(
+    const orderedCheckpoints = [...thread.checkpoints].sort(
+      (left, right) => left.checkpointTurnCount - right.checkpointTurnCount,
+    );
+    const currentTurnCount = orderedCheckpoints.reduce(
       (maxTurnCount, checkpoint) => Math.max(maxTurnCount, checkpoint.checkpointTurnCount),
       0,
     );
@@ -741,7 +860,7 @@ const make = Effect.gen(function* () {
     const targetCheckpointRef =
       event.payload.turnCount === 0
         ? checkpointRefForThreadTurn(event.payload.threadId, 0)
-        : thread.checkpoints.find(
+        : orderedCheckpoints.find(
             (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
           )?.checkpointRef;
 
@@ -755,12 +874,11 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const restored = yield* checkpointStore.restoreCheckpoint({
+    const checkpointExists = yield* checkpointStore.hasCheckpointRef({
       cwd: sessionRuntime.value.cwd,
       checkpointRef: targetCheckpointRef,
-      fallbackToHead: event.payload.turnCount === 0,
     });
-    if (!restored) {
+    if (!checkpointExists && event.payload.turnCount !== 0) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
@@ -770,51 +888,27 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    // Refresh the workspace entry index so the @-mention file picker
-    // reflects the reverted filesystem state.
-    yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
+    const staleCheckpoints = orderedCheckpoints.filter(
+      (checkpoint) => checkpoint.checkpointTurnCount > event.payload.turnCount,
+    );
+    const intent: CheckpointRevertIntent = {
+      commandId: CommandId.make(`server:checkpoint-revert-complete:${String(event.eventId)}`),
+      threadId: event.payload.threadId,
+      provider: sessionRuntime.value.provider,
+      providerInstanceId: sessionRuntime.value.providerInstanceId,
+      cwd: sessionRuntime.value.cwd,
+      turnCount: event.payload.turnCount,
+      turnIds: orderedCheckpoints
+        .filter((checkpoint) => checkpoint.checkpointTurnCount <= event.payload.turnCount)
+        .map((checkpoint) => checkpoint.turnId),
+      ...(staleCheckpoints[0] !== undefined ? { anchorTurnId: staleCheckpoints[0].turnId } : {}),
+      checkpointRef: targetCheckpointRef,
+      staleCheckpointRefs: staleCheckpoints.map((checkpoint) => checkpoint.checkpointRef),
+      createdAt: now,
+    };
 
-    const rolledBackTurns = Math.max(0, currentTurnCount - event.payload.turnCount);
-    if (rolledBackTurns > 0) {
-      yield* providerService.rollbackConversation({
-        threadId: sessionRuntime.value.threadId,
-        numTurns: rolledBackTurns,
-      });
-    }
-
-    const staleCheckpointRefs: Array<CheckpointRef> = [];
-    for (const checkpoint of thread.checkpoints) {
-      if (checkpoint.checkpointTurnCount > event.payload.turnCount) {
-        staleCheckpointRefs.push(checkpoint.checkpointRef);
-      }
-    }
-
-    if (staleCheckpointRefs.length > 0) {
-      yield* checkpointStore.deleteCheckpointRefs({
-        cwd: sessionRuntime.value.cwd,
-        checkpointRefs: staleCheckpointRefs,
-      });
-    }
-
-    yield* orchestrationEngine
-      .dispatch({
-        type: "thread.revert.complete",
-        commandId: yield* serverCommandId("checkpoint-revert-complete"),
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        createdAt: now,
-      })
-      .pipe(
-        Effect.catch((error) =>
-          appendRevertFailureActivity({
-            threadId: event.payload.threadId,
-            turnCount: event.payload.turnCount,
-            detail: error.message,
-            createdAt: now,
-          }),
-        ),
-        Effect.asVoid,
-      );
+    yield* persistCheckpointRevertIntent(intent);
+    yield* executeCheckpointRevert(intent);
   });
 
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (event: OrchestrationEvent) {
@@ -887,14 +981,16 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const processInput = (
-    input: ReactorInput,
-  ): Effect.Effect<
-    void,
-    CheckpointStoreError | OrchestrationDispatchError | PlatformError.PlatformError,
-    never
-  > =>
-    input.source === "domain" ? processDomainEvent(input.event) : processRuntimeEvent(input.event);
+  const processInput = Effect.fn("CheckpointReactor.processInput")(function* (input: ReactorInput) {
+    switch (input.source) {
+      case "domain":
+        return yield* processDomainEvent(input.event);
+      case "runtime":
+        return yield* processRuntimeEvent(input.event);
+      case "recovery":
+        return yield* executeCheckpointRevert(input.intent);
+    }
+  });
 
   const processInputSafely = (input: ReactorInput) =>
     processInput(input).pipe(
@@ -904,7 +1000,8 @@ const make = Effect.gen(function* () {
         }
         return Effect.logWarning("checkpoint reactor failed to process input", {
           source: input.source,
-          eventType: input.event.type,
+          eventType:
+            input.source === "recovery" ? "thread.checkpoint-revert-recovery" : input.event.type,
           cause: Cause.pretty(cause),
         });
       }),
@@ -913,6 +1010,20 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processInputSafely);
 
   const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {
+    const bindings = yield* providerSessionDirectory.listBindings().pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to list provider sessions for checkpoint recovery.", {
+          cause: error,
+        }).pipe(Effect.as([])),
+      ),
+    );
+    for (const binding of bindings) {
+      const intent = checkpointRevertIntentFromRuntimePayload(binding.runtimePayload);
+      if (Option.isSome(intent)) {
+        yield* worker.enqueue({ source: "recovery", intent: intent.value });
+      }
+    }
+
     yield* forkParked(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
         if (

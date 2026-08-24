@@ -30,6 +30,7 @@ import {
   type ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderInstanceId,
+  PROVIDER_APPROVAL_DECISIONS,
   type ModelSelection,
   ProviderItemId,
   type ProviderRuntimeEvent,
@@ -1760,6 +1761,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         id: turn.id,
         items: [...turn.items],
       })),
+      ...(context.session.resumeCursor !== undefined
+        ? { resumeCursor: context.session.resumeCursor }
+        : {}),
     };
   });
 
@@ -3691,7 +3695,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     // Same reason as the approvals above: a request nobody can answer any more
     // must not stay open, or the thread can never be settled.
-    for (const pending of [...context.pendingUserInputs.values()]) {
+    for (const pending of context.pendingUserInputs.values()) {
       yield* pending.cancel;
     }
 
@@ -4022,6 +4026,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           requestId: asRuntimeRequestId(requestId),
           payload: {
             requestType,
+            supportedDecisions: PROVIDER_APPROVAL_DECISIONS,
             detail,
             args: {
               toolName,
@@ -4485,10 +4490,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   );
 
   const rollbackThread: ClaudeAdapterShape["rollbackThread"] = Effect.fn("rollbackThread")(
-    function* (threadId, numTurns) {
+    function* (threadId, target) {
       const context = yield* requireSession(threadId);
-      const nextLength = Math.max(0, context.turns.length - numTurns);
-      context.turns.splice(nextLength);
+      if (context.turns.length < target.turnIds.length) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: `Cannot roll back to ${target.turnIds.length} turns from ${context.turns.length}.`,
+        });
+      }
+      context.turns.splice(target.turnIds.length);
       yield* updateResumeCursor(context);
       return yield* snapshotThread(context);
     },

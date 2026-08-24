@@ -18,6 +18,13 @@ const emitUnknownNotification = process.env.T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICAT
 const omitUsageNotification = process.env.T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION === "1";
 const startRaceDir = process.env.T3_DROID_MOCK_START_RACE_DIR;
 
+if (startRaceDir) {
+  NodeFS.writeFileSync(NodePath.join(startRaceDir, `pid-${process.pid}`), String(process.pid));
+  process.once("exit", () => {
+    NodeFS.writeFileSync(NodePath.join(startRaceDir, `exit-${process.pid}`), "");
+  });
+}
+
 const initializedSessionId = "mock-session-1";
 const knownLoadSessionId = "mock-session-known";
 const rewoundSessionId = "mock-session-rewound";
@@ -225,6 +232,31 @@ async function runTurn(params: {
   }
 
   if (params.text === "mock spec handoff") {
+    const result = (await requestClient("droid.request_permission", {
+      toolUses: [
+        {
+          toolUse: {
+            type: "tool_use",
+            id: `exit-spec-tool-${turnId}`,
+            input: { plan: "Implement the approved plan." },
+            name: "ExitSpecMode",
+          },
+          details: {
+            type: "exit_spec_mode",
+            plan: "Implement the approved plan.",
+            title: "Approved plan",
+          },
+        },
+      ],
+      options: [
+        { label: "Implement", value: "proceed_once" },
+        { label: "Cancel", value: "cancel" },
+      ],
+    })) as { selectedOption?: unknown };
+    if (result.selectedOption === "cancel") {
+      emitTurnCompleted("permission_rejected", turnId);
+      return;
+    }
     notifyForSession(specSuccessorSessionId, {
       type: "assistant_text_delta",
       messageId: `assistant-successor-${turnId}`,
@@ -238,6 +270,22 @@ async function runTurn(params: {
     });
     emitTerminalForSession(specSuccessorSessionId, "completed", `successor-${turnId}`);
     emitTurnCompleted("spec_handoff", turnId);
+    return;
+  }
+
+  if (params.text === "mock foreign spec envelope") {
+    notifyForSession(specSuccessorSessionId, {
+      type: "assistant_text_delta",
+      messageId: `assistant-foreign-${turnId}`,
+      blockIndex: 0,
+      textDelta: "unapproved implementation successor",
+    });
+    emitTerminalForSession(specSuccessorSessionId, "completed", `foreign-${turnId}`);
+  }
+
+  if (params.text === "mock future terminal reason") {
+    emitTurnCompleted("future_terminal_reason", turnId);
+    emitTerminalForSession(currentSessionId, "completed", turnId);
     return;
   }
 
@@ -506,7 +554,7 @@ async function runTurn(params: {
     blockIndex: 1,
   });
 
-  if (hangTurn) {
+  if (hangTurn || params.text === "mock hang this turn") {
     return;
   }
   emitTurnCompleted("completed", turnId);

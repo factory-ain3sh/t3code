@@ -196,9 +196,18 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const rollbackThread = vi.fn(
     (
       threadId: ThreadId,
-      _numTurns: number,
-    ): Effect.Effect<{ threadId: ThreadId; turns: readonly [] }, ProviderAdapterError> =>
-      Effect.succeed({ threadId, turns: [] }),
+      target: { readonly turnIds: ReadonlyArray<TurnId> },
+    ): Effect.Effect<
+      {
+        threadId: ThreadId;
+        turns: ReadonlyArray<{ id: TurnId; items: readonly [] }>;
+      },
+      ProviderAdapterError
+    > =>
+      Effect.succeed({
+        threadId,
+        turns: target.turnIds.map((id) => ({ id, items: [] })),
+      }),
   );
 
   const uploadFeedback = vi.fn(
@@ -219,7 +228,6 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     provider,
     capabilities: {
       sessionModelSwitch: "in-session",
-      ...(provider === DROID_DRIVER ? { resumeCursorChangesDuringTurn: true } : {}),
     },
     startSession,
     sendTurn,
@@ -905,7 +913,7 @@ it.effect(
         const provider = yield* ProviderService.ProviderService;
         yield* provider.rollbackConversation({
           threadId: startedSession.threadId,
-          numTurns: 1,
+          turnIds: [],
         });
       }).pipe(Effect.provide(secondProviderLayer));
 
@@ -927,7 +935,7 @@ it.effect(
       assert.equal(secondCodex.rollbackThread.mock.calls.length, 1);
       const rollbackCall = secondCodex.rollbackThread.mock.calls[0];
       assert.equal(typeof rollbackCall?.[0], "string");
-      assert.equal(rollbackCall?.[1], 1);
+      assert.deepEqual(rollbackCall?.[1], { turnIds: [] });
 
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -988,7 +996,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       yield* provider.rollbackConversation({
         threadId: session.threadId,
-        numTurns: 0,
+        turnIds: [asTurnId("turn-1")],
       });
 
       yield* provider.stopSession({ threadId: session.threadId });
@@ -1172,7 +1180,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       yield* provider.rollbackConversation({
         threadId: initial.threadId,
-        numTurns: 1,
+        turnIds: [],
       });
 
       assert.equal(routing.codex.startSession.mock.calls.length, 1);
@@ -1192,11 +1200,11 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }
       assert.equal(routing.codex.rollbackThread.mock.calls.length, 1);
       const rollbackCall = routing.codex.rollbackThread.mock.calls[0];
-      assert.equal(rollbackCall?.[1], 1);
+      assert.deepEqual(rollbackCall?.[1], { turnIds: [] });
     }),
   );
 
-  it.effect("persists the post-rollback snapshot even when the resume cursor is unchanged", () =>
+  it.effect("does not rewrite the binding when rollback returns no resume cursor", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
@@ -1214,12 +1222,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }
 
       yield* advanceTestClock(50);
-      yield* provider.rollbackConversation({ threadId, numTurns: 1 });
+      yield* provider.rollbackConversation({ threadId, turnIds: [] });
 
       const afterRollback = yield* runtimeRepository.getByThreadId({ threadId });
       assert.equal(Option.isSome(afterRollback), true);
       if (Option.isSome(afterRollback)) {
-        assert.notEqual(afterRollback.value.lastSeenAt, beforeRollback.value.lastSeenAt);
+        assert.equal(afterRollback.value.lastSeenAt, beforeRollback.value.lastSeenAt);
         assert.deepEqual(afterRollback.value.resumeCursor, session.resumeCursor);
       }
     }),
@@ -1799,7 +1807,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("skips completed-turn snapshot writes while the resume cursor is unchanged", () =>
+  it.effect("skips completed-turn cursor writes when the event carries no cursor", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
@@ -1817,13 +1825,6 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         return;
       }
 
-      fanout.droid.updateSession(threadId, (current) => ({
-        ...current,
-        resumeCursor:
-          current.resumeCursor !== null && typeof current.resumeCursor === "object"
-            ? { ...current.resumeCursor }
-            : current.resumeCursor,
-      }));
       for (const eventId of ["evt-snapshot-unchanged-1", "evt-snapshot-unchanged-2"]) {
         fanout.droid.emit({
           type: "turn.completed",
@@ -1847,7 +1848,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
-  it.effect("persists a completed-turn snapshot when the resume cursor changes", () =>
+  it.effect("persists the resume cursor carried by turn completion", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
@@ -1861,10 +1862,6 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       const changedResumeCursor = {
         opaque: `resume-successor-${String(threadId)}`,
       };
-      fanout.droid.updateSession(threadId, (current) => ({
-        ...current,
-        resumeCursor: changedResumeCursor,
-      }));
       fanout.droid.emit({
         type: "turn.completed",
         eventId: asEventId("evt-snapshot-changed"),
@@ -1872,7 +1869,10 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         createdAt: "2026-01-01T00:00:00.000Z",
         threadId,
         turnId: asTurnId("turn-snapshot-changed"),
-        status: "completed",
+        payload: {
+          state: "completed",
+          resumeCursor: changedResumeCursor,
+        },
       });
       yield* advanceTestClock(50);
 
@@ -1888,6 +1888,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
   it.effect("persists a dynamic resume cursor before publishing turn completion", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
       const threadId = asThreadId("thread-snapshot-before-terminal");
       yield* provider.startSession(threadId, {
         provider: DROID_DRIVER,
@@ -1895,30 +1896,20 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         threadId,
         runtimeMode: "full-access",
       });
-      fanout.droid.updateSession(threadId, (current) => ({
-        ...current,
-        resumeCursor: { opaque: "successor-before-terminal" },
-      }));
-
-      const snapshotStarted = yield* Deferred.make<void>();
-      const releaseSnapshot = yield* Deferred.make<void>();
-      const terminalPublished = yield* Deferred.make<void>();
-      const listSessionsImplementation = fanout.droid.listSessions.getMockImplementation();
-      if (listSessionsImplementation === undefined) {
-        return yield* Effect.die("Droid fake listSessions implementation is missing");
-      }
-      fanout.droid.listSessions.mockImplementation(() =>
-        Deferred.succeed(snapshotStarted, undefined).pipe(
-          Effect.andThen(Deferred.await(releaseSnapshot)),
-          Effect.andThen(listSessionsImplementation()),
-        ),
-      );
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => fanout.droid.listSessions.mockImplementation(listSessionsImplementation)),
-      );
+      const expectedCursor = { opaque: "successor-before-terminal" };
+      const persistedBeforeTerminal = yield* Deferred.make<boolean>();
       const runtimeEventsFiber = yield* Stream.runForEach(provider.streamEvents, (event) =>
         event.type === "turn.completed" && event.threadId === threadId
-          ? Deferred.succeed(terminalPublished, undefined).pipe(Effect.asVoid)
+          ? runtimeRepository.getByThreadId({ threadId }).pipe(
+              Effect.flatMap((binding) =>
+                Deferred.succeed(
+                  persistedBeforeTerminal,
+                  Option.isSome(binding) &&
+                    JSON.stringify(binding.value.resumeCursor) === JSON.stringify(expectedCursor),
+                ),
+              ),
+              Effect.asVoid,
+            )
           : Effect.void,
       ).pipe(Effect.forkChild);
       yield* advanceTestClock(50);
@@ -1930,15 +1921,12 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         createdAt: "2026-01-01T00:00:00.000Z",
         threadId,
         turnId: asTurnId("turn-snapshot-before-terminal"),
-        status: "completed",
+        payload: {
+          state: "completed",
+          resumeCursor: expectedCursor,
+        },
       });
-      yield* Deferred.await(snapshotStarted);
-      yield* advanceTestClock(1);
-
-      assert.equal(Option.isNone(yield* Deferred.poll(terminalPublished)), true);
-
-      yield* Deferred.succeed(releaseSnapshot, undefined);
-      yield* Deferred.await(terminalPublished);
+      assert.equal(yield* Deferred.await(persistedBeforeTerminal), true);
       yield* Fiber.interrupt(runtimeEventsFiber);
     }),
   );
@@ -2098,7 +2086,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       });
       yield* provider.rollbackConversation({
         threadId: session.threadId,
-        numTurns: 1,
+        turnIds: [],
       });
       yield* provider.stopSession({ threadId: session.threadId });
 

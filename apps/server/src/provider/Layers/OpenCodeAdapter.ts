@@ -3,6 +3,7 @@ import {
   type OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
+  PROVIDER_APPROVAL_DECISIONS,
   type ProviderRuntimeEvent,
   type ProviderSession,
   RuntimeItemId,
@@ -967,6 +968,7 @@ export function makeOpenCodeAdapter(
             type: "request.opened",
             payload: {
               requestType: mapPermissionToRequestType(event.properties.permission),
+              supportedDecisions: PROVIDER_APPROVAL_DECISIONS,
               detail:
                 event.properties.patterns.length > 0
                   ? event.properties.patterns.join("\n")
@@ -1676,7 +1678,7 @@ export function makeOpenCodeAdapter(
     );
 
     const rollbackThread: OpenCodeAdapterShape["rollbackThread"] = Effect.fn("rollbackThread")(
-      function* (threadId, numTurns) {
+      function* (threadId, target) {
         const context = yield* ensureSessionContext(sessions, threadId);
         const messages = yield* runOpenCodeSdk("session.messages", () =>
           context.client.session.messages({
@@ -1687,12 +1689,22 @@ export function makeOpenCodeAdapter(
         const assistantMessages = (messages.data ?? []).filter(
           (entry) => entry.info.role === "assistant",
         );
-        const targetIndex = assistantMessages.length - numTurns - 1;
-        const target = targetIndex >= 0 ? assistantMessages[targetIndex] : null;
+        if (assistantMessages.length < target.turnIds.length) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "rollbackThread",
+            issue: `Cannot roll back to ${target.turnIds.length} turns from ${assistantMessages.length}.`,
+          });
+        }
+        if (assistantMessages.length === target.turnIds.length) {
+          return yield* readThread(threadId);
+        }
+        const anchor =
+          target.turnIds.length > 0 ? assistantMessages[target.turnIds.length - 1] : null;
         yield* runOpenCodeSdk("session.revert", () =>
           context.client.session.revert({
             sessionID: context.openCodeSessionId,
-            ...(target ? { messageID: target.info.id } : {}),
+            ...(anchor ? { messageID: anchor.info.id } : {}),
           }),
         ).pipe(Effect.mapError(toRequestError));
 

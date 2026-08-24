@@ -14,6 +14,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
+import { ProviderApprovalDecision } from "./orchestration.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
@@ -367,6 +368,7 @@ export type TurnStartedPayload = typeof TurnStartedPayload.Type;
 const TurnCompletedPayload = Schema.Struct({
   state: RuntimeTurnState,
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
+  resumeCursor: Schema.optional(Schema.Unknown),
   usage: Schema.optional(Schema.Unknown),
   modelUsage: Schema.optional(UnknownRecordSchema),
   totalCostUsd: Schema.optional(Schema.Number),
@@ -432,6 +434,7 @@ export type ContentDeltaPayload = typeof ContentDeltaPayload.Type;
 
 const RequestOpenedPayload = Schema.Struct({
   requestType: CanonicalRequestType,
+  supportedDecisions: Schema.Array(ProviderApprovalDecision).check(Schema.isNonEmpty()),
   detail: Schema.optional(TrimmedNonEmptyStringSchema),
   args: Schema.optional(Schema.Unknown),
 });

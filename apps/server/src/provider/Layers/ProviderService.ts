@@ -11,8 +11,8 @@
  */
 import {
   ModelSelection,
-  NonNegativeInt,
   ThreadId,
+  TurnId,
   ProviderInterruptTurnInput,
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
@@ -28,7 +28,6 @@ import {
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -85,7 +84,8 @@ type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["S
 
 const ProviderRollbackConversationInput = Schema.Struct({
   threadId: ThreadId,
-  numTurns: NonNegativeInt,
+  turnIds: Schema.Array(TurnId),
+  anchorTurnId: Schema.optional(TurnId),
 });
 
 function toValidationError(
@@ -313,40 +313,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ),
         );
 
-  const persistedResumeCursors = yield* Ref.make(
-    new Map<
-      ThreadId,
-      {
-        readonly providerInstanceId: ProviderInstanceId;
-        readonly resumeCursor: unknown | null;
-      }
-    >(),
-  );
-  const rememberPersistedResumeCursor = (
-    providerInstanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    resumeCursor: unknown | null,
-  ) =>
-    Ref.update(persistedResumeCursors, (current) => {
-      const persistedSession = current.get(threadId);
-      if (
-        persistedSession?.providerInstanceId === providerInstanceId &&
-        Equal.equals(persistedSession.resumeCursor, resumeCursor)
-      ) {
-        return current;
-      }
-      const next = new Map(current);
-      next.set(threadId, { providerInstanceId, resumeCursor });
-      return next;
-    });
-  const forgetPersistedResumeCursor = (threadId: ThreadId) =>
-    Ref.update(persistedResumeCursors, (current) => {
-      if (!current.has(threadId)) return current;
-      const next = new Map(current);
-      next.delete(threadId);
-      return next;
-    });
-
   const upsertSessionBinding = (
     session: ProviderSession,
     threadId: ThreadId,
@@ -370,45 +336,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
         runtimePayload: toRuntimePayloadFromSession(session, extra),
       });
-      yield* rememberPersistedResumeCursor(
-        providerInstanceId,
-        threadId,
-        session.resumeCursor ?? null,
-      );
     });
 
-  // Adapters can change their resume cursor mid-session (droid compaction and
-  // rewind mint successor sessions). Persist changed snapshots when a turn
-  // settles so the durable binding follows the live conversation without
-  // rewriting stable cursors for every provider.
-  const persistSessionSnapshot = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    instanceId: ProviderInstanceId,
-    threadId: ThreadId,
-    force = false,
+  const persistEventResumeCursor = (
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+    },
+    event: ProviderRuntimeEvent,
   ) =>
-    adapter.listSessions().pipe(
-      Effect.flatMap((activeSessions) => {
-        const live = activeSessions.find((session) => session.threadId === threadId);
-        if (!live) {
-          return forgetPersistedResumeCursor(threadId);
-        }
-        const liveResumeCursor = live.resumeCursor ?? null;
-        return Ref.get(persistedResumeCursors).pipe(
-          Effect.flatMap((persisted) => {
-            const persistedSession = persisted.get(threadId);
-            return !force &&
-              persistedSession?.providerInstanceId === instanceId &&
-              Equal.equals(persistedSession.resumeCursor, liveResumeCursor)
-              ? Effect.void
-              : upsertSessionBinding({ ...live, providerInstanceId: instanceId }, threadId);
-          }),
-        );
-      }),
-      Effect.catchCause((cause) =>
-        Effect.logWarning("provider.session.snapshot-persist-failed", { threadId, cause }),
-      ),
-    );
+    event.type === "turn.completed" && event.payload?.resumeCursor !== undefined
+      ? directory.upsert({
+          threadId: event.threadId,
+          provider: source.provider,
+          providerInstanceId: source.instanceId,
+          resumeCursor: event.payload.resumeCursor,
+        })
+      : Effect.void;
 
   const processRuntimeEvent = (
     source: {
@@ -419,10 +363,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
-        increment(providerRuntimeEventsTotal, {
-          provider: canonicalEvent.provider,
-          eventType: canonicalEvent.type,
-        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
+        persistEventResumeCursor(source, canonicalEvent).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Failed to persist provider resume cursor.", {
+              provider: source.provider,
+              providerInstanceId: source.instanceId,
+              threadId: canonicalEvent.threadId,
+              cause: error,
+            }),
+          ),
+          Effect.andThen(
+            increment(providerRuntimeEventsTotal, {
+              provider: canonicalEvent.provider,
+              eventType: canonicalEvent.type,
+            }),
+          ),
+          Effect.andThen(publishRuntimeEvent(canonicalEvent)),
+        ),
       ),
     );
 
@@ -461,22 +418,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       next.set(id, adapter);
       if (previous.get(id) !== adapter) {
         yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          (event.type === "session.exited"
-            ? forgetPersistedResumeCursor(event.threadId)
-            : event.type === "turn.completed" &&
-                adapter.capabilities.resumeCursorChangesDuringTurn === true
-              ? persistSessionSnapshot(adapter, id, event.threadId)
-              : Effect.void
-          ).pipe(
-            Effect.andThen(
-              processRuntimeEvent(
-                {
-                  instanceId: id,
-                  provider: adapter.provider,
-                },
-                event,
-              ),
-            ),
+          processRuntimeEvent(
+            {
+              instanceId: id,
+              provider: adapter.provider,
+            },
+            event,
           ),
         ).pipe(Effect.forkScoped);
       }
@@ -882,9 +829,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           lastRuntimeEventAt: yield* nowIso,
         },
       });
-      if (turn.resumeCursor !== undefined) {
-        yield* rememberPersistedResumeCursor(routed.instanceId, input.threadId, turn.resumeCursor);
-      }
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
@@ -1046,7 +990,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           yield* routed.adapter.stopSession(routed.threadId);
         }
         yield* clearMcpSession(input.threadId);
-        yield* forgetPersistedResumeCursor(input.threadId);
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,
@@ -1172,9 +1115,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       schema: ProviderRollbackConversationInput,
       payload: rawInput,
     });
-    if (input.numTurns === 0) {
-      return;
-    }
     let metricProvider = "unknown";
     return yield* Effect.gen(function* () {
       const routed = yield* resolveRoutableSession({
@@ -1187,16 +1127,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.operation": "rollback-conversation",
         "provider.kind": routed.adapter.provider,
         "provider.thread_id": input.threadId,
-        "provider.rollback_turns": input.numTurns,
+        "provider.rollback_target_turn_count": input.turnIds.length,
       });
-      yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
-      // A rollback can re-anchor the provider on a forked session; persist the
-      // adapter's post-rollback snapshot so the resume cursor follows it.
-      yield* persistSessionSnapshot(routed.adapter, routed.instanceId, routed.threadId, true);
+      const snapshot = yield* routed.adapter.rollbackThread(routed.threadId, {
+        turnIds: input.turnIds,
+        ...(input.anchorTurnId !== undefined ? { anchorTurnId: input.anchorTurnId } : {}),
+      });
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
-        turns: input.numTurns,
+        targetTurnCount: input.turnIds.length,
       });
+      return snapshot;
     }).pipe(
       withMetrics({
         counter: providerTurnsTotal,

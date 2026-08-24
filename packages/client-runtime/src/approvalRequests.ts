@@ -1,3 +1,5 @@
+import { PROVIDER_APPROVAL_DECISIONS, type ProviderApprovalDecision } from "@t3tools/contracts";
+
 export type ApprovalRequestKind = "command" | "file-read" | "file-change" | "plan";
 
 /**
@@ -33,4 +35,23 @@ export function approvalRequestKindFromPayload(
     default:
       return null;
   }
+}
+
+/**
+ * Reads the decisions declared by the provider request. The default exists
+ * only for approvals already persisted before this capability became part of
+ * the activity payload.
+ */
+export function supportedApprovalDecisionsFromPayload(
+  payload: Readonly<Record<string, unknown>> | null | undefined,
+): ReadonlyArray<ProviderApprovalDecision> {
+  const decisions = payload?.supportedDecisions;
+  if (!Array.isArray(decisions)) {
+    return PROVIDER_APPROVAL_DECISIONS;
+  }
+  return decisions.filter(
+    (decision): decision is ProviderApprovalDecision =>
+      typeof decision === "string" &&
+      PROVIDER_APPROVAL_DECISIONS.includes(decision as ProviderApprovalDecision),
+  );
 }

@@ -20,13 +20,34 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
-import { droidTokenUsageSnapshot, makeDroidAdapter } from "./DroidAdapter.ts";
+import {
+  droidSupportedApprovalDecisions,
+  droidTokenUsageSnapshot,
+  makeDroidAdapter,
+  selectDroidPermissionOutcome,
+} from "./DroidAdapter.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
+
+it("derives Droid approval capabilities without escalating one-shot approval", () => {
+  const options = [
+    { label: "Always allow", outcome: "proceed_always" },
+    { label: "Cancel", outcome: "cancel" },
+  ];
+
+  assert.deepEqual(droidSupportedApprovalDecisions(options), [
+    "acceptForSession",
+    "decline",
+    "cancel",
+  ]);
+  assert.isUndefined(selectDroidPermissionOutcome(options, "accept"));
+  assert.equal(selectDroidPermissionOutcome(options, "acceptForSession"), "proceed_always");
+});
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
@@ -109,6 +130,18 @@ async function waitForFile(filePath: string) {
     });
     void NodeFSP.access(filePath).then(finish, () => {});
   });
+}
+
+function isProcessAlive(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 it("counts cache creation as processed spend but not live context", () => {
@@ -317,6 +350,12 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { adapter, readDebugState } = yield* makeDroidScenario({
         T3_DROID_MOCK_START_RACE_DIR: coordinationDir,
       });
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
 
       yield* startDroidSession(adapter, threadId, "full-access");
 
@@ -368,9 +407,48 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       yield* Fiber.join(replacementStart);
       yield* Fiber.join(stopAllFiber);
-      yield* Fiber.join(heldTurn);
+      const sentTurn = yield* Fiber.join(heldTurn);
 
       assert.isFalse(yield* adapter.hasSession(threadId));
+      const threadEvents = eventsForThread(runtimeEvents, threadId);
+      assert.lengthOf(
+        threadEvents.filter(
+          (event) =>
+            event.type === "turn.completed" &&
+            event.turnId !== undefined &&
+            String(event.turnId) === String(sentTurn.turnId),
+        ),
+        1,
+        "the queued start/stop race must settle the turn it actually opened exactly once",
+      );
+      assert.isTrue(
+        threadEvents
+          .filter((event) => event.type === "turn.completed")
+          .every(
+            (event) =>
+              event.turnId !== undefined && String(event.turnId) === String(sentTurn.turnId),
+          ),
+        "the queued start/stop race must not settle a replacement turn",
+      );
+
+      const processFiles = yield* Effect.promise(() => NodeFSP.readdir(coordinationDir));
+      const processIds = processFiles
+        .filter((file) => file.startsWith("pid-"))
+        .map((file) => Number(file.slice("pid-".length)));
+      assert.lengthOf(processIds, 2, "the initial and replacement Droid processes were tracked");
+      assert.includeMembers(
+        processFiles,
+        processIds.map((processId) => `exit-${processId}`),
+        "stopAll must wait for every tracked Droid process to exit",
+      );
+      for (const processId of processIds) {
+        assert.isFalse(
+          isProcessAlive(processId),
+          `Droid process ${processId} is still running after stopAll`,
+        );
+      }
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
     }),
   );
 
@@ -536,6 +614,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const opened = yield* Deferred.await(requestOpened);
       assert.equal(String(opened.turnId), String(sentTurn.turnId));
       assert.equal(opened.payload.requestType, "exec_command_approval");
+      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline", "cancel"]);
       assert.equal(opened.payload.detail, "echo mock");
       assert.deepInclude(opened.payload.args, {
         toolUses: [
@@ -895,6 +974,62 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("starts and completes a retry after interrupting a hung Droid turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-interrupt-retry");
+      const { adapter } = yield* makeDroidScenario();
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const firstTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const secondTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(firstTurnCompleted, event).pipe(
+                  Effect.flatMap((wasFirst) =>
+                    wasFirst ? Effect.void : Deferred.succeed(secondTurnCompleted, event),
+                  ),
+                  Effect.asVoid,
+                )
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const interruptedTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock hang this turn",
+        attachments: [],
+      });
+      yield* adapter.interruptTurn(threadId, interruptedTurn.turnId);
+      const interruptedTerminal = yield* Deferred.await(firstTurnCompleted);
+
+      const retryTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "retry after interrupt",
+        attachments: [],
+      });
+      const retryTerminal = yield* Deferred.await(secondTurnCompleted);
+
+      assert.equal(String(interruptedTerminal.turnId), String(interruptedTurn.turnId));
+      assert.equal(interruptedTerminal.payload.state, "cancelled");
+      assert.equal(String(retryTerminal.turnId), String(retryTurn.turnId));
+      assert.equal(retryTerminal.payload.state, "completed");
+      assert.lengthOf(
+        eventsForThread(runtimeEvents, threadId).filter((event) => event.type === "turn.completed"),
+        2,
+      );
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("loads a known Droid resume cursor into a ready session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-known");
@@ -1101,14 +1236,17 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
+      const firstTurn = yield* adapter.sendTurn({
         threadId,
         input: "first turn to roll back",
         attachments: [],
       });
       yield* Deferred.await(firstTurnCompleted);
 
-      const snapshot = yield* adapter.rollbackThread(threadId, 1);
+      const snapshot = yield* adapter.rollbackThread(threadId, {
+        turnIds: [],
+        anchorTurnId: firstTurn.turnId,
+      });
       assert.deepEqual(snapshot.turns, []);
 
       // The live process re-anchored on the fork: the resume cursor points at
@@ -1127,7 +1265,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       // Rolling back past the turns tracked in this process is refused
       // rather than mis-anchored (rollback of the post-rewind turn is fine,
       // two turns is not).
-      const tooDeep = yield* Effect.flip(adapter.rollbackThread(threadId, 2));
+      const tooDeep = yield* Effect.flip(
+        adapter.rollbackThread(threadId, {
+          turnIds: [nextTurn.turnId, TurnId.make("missing-turn")],
+        }),
+      );
       assert.equal(tooDeep._tag, "ProviderAdapterRequestError");
 
       yield* Fiber.interrupt(runtimeEventsFiber);
@@ -1162,13 +1304,16 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       ).pipe(Effect.forkChild);
 
       yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
+      const firstTurn = yield* adapter.sendTurn({
         threadId,
         input: "turn before straggler rewind",
         attachments: [],
       });
       yield* Deferred.await(firstTurnCompleted);
-      yield* adapter.rollbackThread(threadId, 1);
+      yield* adapter.rollbackThread(threadId, {
+        turnIds: [],
+        anchorTurnId: firstTurn.turnId,
+      });
 
       const nextTurn = yield* adapter.sendTurn({
         threadId,
@@ -1260,6 +1405,8 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const threadId = ThreadId.make("droid-spec-handoff");
       const { adapter } = yield* makeDroidScenario();
       const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
@@ -1267,9 +1414,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           runtimeEvents.push(event);
         }).pipe(
           Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
+            event.type === "request.opened" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
+              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
+                ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+                : Effect.void,
           ),
         ),
       ).pipe(Effect.forkChild);
@@ -1281,6 +1430,14 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         attachments: [],
         interactionMode: "plan",
       });
+      const opened = yield* Deferred.await(requestOpened);
+      assert.equal(opened.payload.requestType, "plan_approval");
+      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline", "cancel"]);
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(opened.requestId)),
+        "accept",
+      );
       const terminal = yield* Deferred.await(turnCompleted);
       const sessions = yield* adapter.listSessions();
       const successorText = eventsForThread(runtimeEvents, threadId)
@@ -1301,6 +1458,103 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         schemaVersion: 1,
         sessionId: "mock-session-spec-successor",
       });
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a foreign spec envelope without an approved handoff", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-unapproved-spec-envelope");
+      const { adapter } = yield* makeDroidScenario();
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock foreign spec envelope",
+        attachments: [],
+        interactionMode: "plan",
+      });
+      const terminal = yield* Deferred.await(turnCompleted);
+      const sessions = yield* adapter.listSessions();
+      const assistantText = eventsForThread(runtimeEvents, threadId)
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" &&
+            event.turnId !== undefined &&
+            String(event.turnId) === String(sentTurn.turnId) &&
+            event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta)
+        .join("");
+
+      assert.notInclude(assistantText, "unapproved implementation successor");
+      assert.include(assistantText, "hello from droid mock");
+      assert.equal(terminal.payload.state, "completed");
+      assert.deepStrictEqual(sessions[0]?.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "mock-session-1",
+      });
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("settles an unknown Droid terminal reason exactly once", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-future-terminal-reason");
+      const { adapter } = yield* makeDroidScenario();
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock future terminal reason",
+        attachments: [],
+      });
+      const terminal = yield* Deferred.await(turnCompleted);
+      const turnTerminals = eventsForThread(runtimeEvents, threadId).filter(
+        (event) =>
+          event.type === "turn.completed" &&
+          event.turnId !== undefined &&
+          String(event.turnId) === String(sentTurn.turnId),
+      );
+
+      assert.equal(terminal.payload.state, "failed");
+      assert.equal(
+        terminal.payload.state === "failed" ? terminal.payload.errorMessage : undefined,
+        "Droid turn ended with reason 'future_terminal_reason'.",
+      );
+      assert.lengthOf(turnTerminals, 1);
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
@@ -1617,7 +1871,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
-  it.effect("refuses to guess rollback anchors from resumed steering messages", () =>
+  it.effect("uses an explicit rollback anchor after resuming a Droid session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-rollback");
       const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_LOAD_STEERING_MESSAGES: "1" });
@@ -1629,12 +1883,16 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         runtimeMode: "full-access",
         resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
       });
-      const error = yield* Effect.flip(adapter.rollbackThread(threadId, 1));
+      const snapshot = yield* adapter.rollbackThread(threadId, {
+        turnIds: [],
+        anchorTurnId: TurnId.make("persisted-anchor"),
+      });
 
-      assert.equal(error._tag, "ProviderAdapterRequestError");
-      if (error._tag === "ProviderAdapterRequestError") {
-        assert.include(error.detail, "only 0 tracked in this session");
-      }
+      assert.deepEqual(snapshot.turns, []);
+      assert.deepStrictEqual(snapshot.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "mock-session-rewound",
+      });
 
       yield* adapter.stopSession(threadId);
     }),

@@ -5,6 +5,7 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpSchema from "effect-acp/schema";
 
 import {
   ProviderAdapterRequestError,
@@ -43,14 +44,42 @@ export function mapAcpToAdapterError(
   });
 }
 
-export function acpPermissionOutcome(decision: ProviderApprovalDecision): string {
-  switch (decision) {
-    case "acceptForSession":
-      return "allow-always";
-    case "accept":
-      return "allow-once";
-    case "decline":
-    default:
-      return "reject-once";
+export function selectAcpPermissionOptionId(
+  request: EffectAcpSchema.RequestPermissionRequest,
+  decision: Exclude<ProviderApprovalDecision, "cancel">,
+): string | undefined {
+  const kind =
+    decision === "acceptForSession"
+      ? "allow_always"
+      : decision === "accept"
+        ? "allow_once"
+        : "reject_once";
+  const option = request.options.find((entry) => entry.kind === kind);
+  return option?.optionId.trim() || undefined;
+}
+
+export function supportedAcpApprovalDecisions(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): ReadonlyArray<ProviderApprovalDecision> {
+  const decisions: ProviderApprovalDecision[] = [];
+  if (selectAcpPermissionOptionId(request, "accept") !== undefined) {
+    decisions.push("accept");
   }
+  if (selectAcpPermissionOptionId(request, "acceptForSession") !== undefined) {
+    decisions.push("acceptForSession");
+  }
+  if (selectAcpPermissionOptionId(request, "decline") !== undefined) {
+    decisions.push("decline");
+  }
+  decisions.push("cancel");
+  return decisions;
+}
+
+export function selectAutoApprovedAcpPermissionOptionId(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): string | undefined {
+  return (
+    selectAcpPermissionOptionId(request, "acceptForSession") ??
+    selectAcpPermissionOptionId(request, "accept")
+  );
 }

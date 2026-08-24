@@ -410,6 +410,28 @@ it.effect("fails registration after exit and ends every public stream", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 
+it.effect("terminates the transport when stdout closes before the process exits", () =>
+  Effect.gen(function* () {
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", "process.stdout.end(); setInterval(() => {}, 1_000)"],
+    });
+
+    const exit = yield* within(client.exits, "stdout closure did not terminate the transport");
+    assert.equal(exit.code, null);
+    assert.equal(exit.description, "Droid stdout stream closed before the process exited");
+
+    const requestResult = yield* Effect.result(
+      client.request("droid.list_models", {}, { timeoutMs: undefined }),
+    );
+    assert.equal(requestResult._tag, "Failure");
+    if (requestResult._tag === "Failure") {
+      assert.equal(requestResult.failure.kind, "process-exit");
+      assert.deepStrictEqual(requestResult.failure.data, exit);
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
 it.effect("logs a response that arrives after its request timed out", () => {
   const logs: CapturedLog[] = [];
   return withCapturedLogs(

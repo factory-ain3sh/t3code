@@ -21,6 +21,7 @@ describe("runtimeEventToActivities approval details", () => {
       requestId: RuntimeRequestId.make("approval-1"),
       payload: {
         requestType: "command_execution_approval",
+        supportedDecisions: ["accept", "decline", "cancel"],
         detail,
       },
     } satisfies ProviderRuntimeEvent;

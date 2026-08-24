@@ -41,7 +41,12 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import {
+  mapAcpToAdapterError,
+  selectAcpPermissionOptionId,
+  selectAutoApprovedAcpPermissionOptionId,
+  supportedAcpApprovalDecisions,
+} from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -88,6 +93,7 @@ export interface GrokAdapterLiveOptions {
 
 interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+  readonly supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
 }
 
 type PendingUserInputResolution =
@@ -177,29 +183,6 @@ function parseGrokResume(raw: unknown): { sessionId: string } | undefined {
   if (raw.schemaVersion !== GROK_RESUME_VERSION) return undefined;
   if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
   return { sessionId: raw.sessionId.trim() };
-}
-
-function selectPermissionOptionId(
-  request: EffectAcpSchema.RequestPermissionRequest,
-  decision: Exclude<ProviderApprovalDecision, "cancel">,
-): string | undefined {
-  const kind =
-    decision === "acceptForSession"
-      ? "allow_always"
-      : decision === "accept"
-        ? "allow_once"
-        : "reject_once";
-  const option = request.options.find((entry) => entry.kind === kind);
-  return option?.optionId.trim() || undefined;
-}
-
-function selectAutoApprovedPermissionOption(
-  request: EffectAcpSchema.RequestPermissionRequest,
-): string | undefined {
-  return (
-    selectPermissionOptionId(request, "acceptForSession") ??
-    selectPermissionOptionId(request, "accept")
-  );
 }
 
 function completedStopReasonFromPromptResponse(
@@ -668,7 +651,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 Effect.gen(function* () {
                   yield* logNative(input.threadId, "session/request_permission", params);
                   if (input.runtimeMode === "full-access") {
-                    const autoApprovedOptionId = selectAutoApprovedPermissionOption(params);
+                    const autoApprovedOptionId = selectAutoApprovedAcpPermissionOptionId(params);
                     if (autoApprovedOptionId !== undefined) {
                       return {
                         outcome: {
@@ -683,7 +666,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const decision = yield* Deferred.make<ProviderApprovalDecision>();
                   const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
-                  pendingApprovals.set(requestId, { decision });
+                  const supportedDecisions = supportedAcpApprovalDecisions(params);
+                  pendingApprovals.set(requestId, { decision, supportedDecisions });
                   yield* offerRuntimeEvent(
                     makeAcpRequestOpenedEvent({
                       stamp: yield* makeEventStamp(),
@@ -692,6 +676,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       turnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
+                      supportedDecisions,
                       detail:
                         permissionRequest.detail ??
                         encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
@@ -716,7 +701,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     }),
                   );
                   const selectedOptionId =
-                    resolved === "cancel" ? undefined : selectPermissionOptionId(params, resolved);
+                    resolved === "cancel"
+                      ? undefined
+                      : selectAcpPermissionOptionId(params, resolved);
                   return {
                     outcome: selectedOptionId
                       ? {
@@ -1376,6 +1363,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             detail: `Unknown pending approval request: ${requestId}`,
           });
         }
+        if (!pending.supportedDecisions.includes(decision)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "respondToRequest",
+            issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
+          });
+        }
         yield* Deferred.succeed(pending.decision, decision);
       });
 
@@ -1403,15 +1397,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         return { threadId, turns: ctx.turns };
       });
 
-    const rollbackThread: GrokAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+    const rollbackThread: GrokAdapterShape["rollbackThread"] = (threadId, target) =>
       Effect.gen(function* () {
-        yield* requireSession(threadId);
-        if (!Number.isInteger(numTurns) || numTurns < 1) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "rollbackThread",
-            issue: "numTurns must be an integer >= 1.",
-          });
+        const ctx = yield* requireSession(threadId);
+        if (ctx.turns.length === target.turnIds.length) {
+          return { threadId, turns: ctx.turns };
         }
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,

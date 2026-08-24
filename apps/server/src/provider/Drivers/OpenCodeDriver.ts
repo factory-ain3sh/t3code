@@ -173,7 +173,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build OpenCode snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build OpenCode snapshot.",
               cause,
             }),
         ),

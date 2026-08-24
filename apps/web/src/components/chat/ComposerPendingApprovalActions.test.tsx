@@ -9,6 +9,7 @@ describe("ComposerPendingApprovalActions", () => {
     const markup = renderToStaticMarkup(
       <ComposerPendingApprovalActions
         requestId={ApprovalRequestId.make("approval-1")}
+        supportedDecisions={["accept", "acceptForSession", "decline", "cancel"]}
         isResponding={false}
         onRespondToApproval={async () => undefined}
       />,
@@ -20,5 +21,21 @@ describe("ComposerPendingApprovalActions", () => {
     expect(markup).toContain("h-5");
     expect(markup).toContain("sm:text-[11px]");
     expect(markup).not.toContain("sm:h-6");
+  });
+
+  it("hides decisions the provider request did not offer", () => {
+    const markup = renderToStaticMarkup(
+      <ComposerPendingApprovalActions
+        requestId={ApprovalRequestId.make("approval-2")}
+        supportedDecisions={["accept", "decline"]}
+        isResponding={false}
+        onRespondToApproval={async () => undefined}
+      />,
+    );
+
+    expect(markup).toContain(">Approve<");
+    expect(markup).toContain(">Decline<");
+    expect(markup).not.toContain("Always allow this session");
+    expect(markup).not.toContain(">Cancel<");
   });
 });

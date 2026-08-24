@@ -132,12 +132,13 @@ export const ProviderRequestKind = Schema.Literals(["command", "file-read", "fil
 export type ProviderRequestKind = typeof ProviderRequestKind.Type;
 export const AssistantDeliveryMode = Schema.Literals(["buffered", "streaming"]);
 export type AssistantDeliveryMode = typeof AssistantDeliveryMode.Type;
-export const ProviderApprovalDecision = Schema.Literals([
+export const PROVIDER_APPROVAL_DECISIONS = [
   "accept",
   "acceptForSession",
   "decline",
   "cancel",
-]);
+] as const;
+export const ProviderApprovalDecision = Schema.Literals(PROVIDER_APPROVAL_DECISIONS);
 export type ProviderApprovalDecision = typeof ProviderApprovalDecision.Type;
 export const ProviderUserInputAnswers = Schema.Record(Schema.String, Schema.Unknown);
 export type ProviderUserInputAnswers = typeof ProviderUserInputAnswers.Type;

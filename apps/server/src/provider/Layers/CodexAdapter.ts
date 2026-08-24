@@ -14,6 +14,7 @@ import {
   ProviderDriverKind,
   type ProviderEvent,
   ProviderInstanceId,
+  PROVIDER_APPROVAL_DECISIONS,
   type ProviderRuntimeEvent,
   type ProviderRequestKind,
   type ThreadTokenUsageSnapshot,
@@ -848,6 +849,7 @@ function mapToRuntimeEvents(
         type: "request.opened",
         payload: {
           requestType: toRequestTypeFromMethod(event.method),
+          supportedDecisions: PROVIDER_APPROVAL_DECISIONS,
           ...(detail ? { detail } : {}),
           ...(event.payload !== undefined ? { args: event.payload } : {}),
         },
@@ -1866,21 +1868,26 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       })),
     );
 
-  const rollbackThread: CodexAdapterShape["rollbackThread"] = (threadId, numTurns) => {
-    if (!Number.isInteger(numTurns) || numTurns < 1) {
-      return Effect.fail(
-        new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "rollbackThread",
-          issue: "numTurns must be an integer >= 1.",
-        }),
-      );
-    }
-
+  const rollbackThread: CodexAdapterShape["rollbackThread"] = (threadId, target) => {
     return requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.rollbackThread(numTurns)),
+      Effect.flatMap((session) =>
+        Effect.gen(function* () {
+          const snapshot = yield* session.runtime.readThread;
+          if (snapshot.turns.length < target.turnIds.length) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: `Cannot roll back to ${target.turnIds.length} turns from ${snapshot.turns.length}.`,
+            });
+          }
+          return snapshot.turns.length === target.turnIds.length
+            ? snapshot
+            : yield* session.runtime.rollbackThread(snapshot.turns.length - target.turnIds.length);
+        }),
+      ),
       Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
+        cause._tag === "ProviderAdapterSessionNotFoundError" ||
+        cause._tag === "ProviderAdapterValidationError"
           ? cause
           : mapCodexRuntimeError(threadId, "thread/rollback", cause),
       ),

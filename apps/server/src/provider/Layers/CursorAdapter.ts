@@ -49,7 +49,12 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import {
+  mapAcpToAdapterError,
+  selectAcpPermissionOptionId,
+  selectAutoApprovedAcpPermissionOptionId,
+  supportedAcpApprovalDecisions,
+} from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -116,6 +121,7 @@ export interface CursorAdapterLiveOptions {
 interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
   readonly kind: string | "unknown";
+  readonly supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
 }
 
 interface PendingUserInput {
@@ -292,22 +298,6 @@ function applyRequestedSessionConfiguration<E>(input: {
       ),
     );
   });
-}
-
-function selectAutoApprovedPermissionOption(
-  request: EffectAcpSchema.RequestPermissionRequest,
-): string | undefined {
-  const allowAlwaysOption = request.options.find((option) => option.kind === "allow_always");
-  if (typeof allowAlwaysOption?.optionId === "string" && allowAlwaysOption.optionId.trim()) {
-    return allowAlwaysOption.optionId.trim();
-  }
-
-  const allowOnceOption = request.options.find((option) => option.kind === "allow_once");
-  if (typeof allowOnceOption?.optionId === "string" && allowOnceOption.optionId.trim()) {
-    return allowOnceOption.optionId.trim();
-  }
-
-  return undefined;
 }
 
 export function makeCursorAdapter(
@@ -673,7 +663,7 @@ export function makeCursorAdapter(
                     "acp.jsonrpc",
                   );
                   if (input.runtimeMode === "full-access") {
-                    const autoApprovedOptionId = selectAutoApprovedPermissionOption(params);
+                    const autoApprovedOptionId = selectAutoApprovedAcpPermissionOptionId(params);
                     if (autoApprovedOptionId !== undefined) {
                       return {
                         outcome: {
@@ -687,9 +677,11 @@ export function makeCursorAdapter(
                   const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const decision = yield* Deferred.make<ProviderApprovalDecision>();
+                  const supportedDecisions = supportedAcpApprovalDecisions(params);
                   pendingApprovals.set(requestId, {
                     decision,
                     kind: permissionRequest.kind,
+                    supportedDecisions,
                   });
                   yield* offerRuntimeEvent(
                     makeAcpRequestOpenedEvent({
@@ -699,6 +691,7 @@ export function makeCursorAdapter(
                       turnId: ctx?.activeTurnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
+                      supportedDecisions,
                       detail:
                         permissionRequest.detail ??
                         encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
@@ -722,14 +715,17 @@ export function makeCursorAdapter(
                       decision: resolved,
                     }),
                   );
+                  const selectedOptionId =
+                    resolved === "cancel"
+                      ? undefined
+                      : selectAcpPermissionOptionId(params, resolved);
                   return {
-                    outcome:
-                      resolved === "cancel"
-                        ? ({ outcome: "cancelled" } as const)
-                        : {
-                            outcome: "selected" as const,
-                            optionId: acpPermissionOutcome(resolved),
-                          },
+                    outcome: selectedOptionId
+                      ? {
+                          outcome: "selected" as const,
+                          optionId: selectedOptionId,
+                        }
+                      : ({ outcome: "cancelled" } as const),
                   };
                 }),
               ),
@@ -1093,6 +1089,13 @@ export function makeCursorAdapter(
             detail: `Unknown pending approval request: ${requestId}`,
           });
         }
+        if (!pending.supportedDecisions.includes(decision)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "respondToRequest",
+            issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
+          });
+        }
         yield* Deferred.succeed(pending.decision, decision);
       });
 
@@ -1120,18 +1123,17 @@ export function makeCursorAdapter(
         return { threadId, turns: ctx.turns };
       });
 
-    const rollbackThread: CursorAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+    const rollbackThread: CursorAdapterShape["rollbackThread"] = (threadId, target) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
-        if (!Number.isInteger(numTurns) || numTurns < 1) {
+        if (ctx.turns.length < target.turnIds.length) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "rollbackThread",
-            issue: "numTurns must be an integer >= 1.",
+            issue: `Cannot roll back to ${target.turnIds.length} turns from ${ctx.turns.length}.`,
           });
         }
-        const nextLength = Math.max(0, ctx.turns.length - numTurns);
-        ctx.turns.splice(nextLength);
+        ctx.turns.splice(target.turnIds.length);
         return { threadId, turns: ctx.turns };
       });
 

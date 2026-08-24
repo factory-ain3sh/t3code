@@ -134,7 +134,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: cause.message,
+              detail: "Failed to prepare Codex home.",
               cause,
             }),
         ),
@@ -192,7 +192,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build Codex snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build Codex snapshot.",
               cause,
             }),
         ),

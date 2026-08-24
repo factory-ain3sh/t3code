@@ -95,6 +95,7 @@ interface ThreadLockEntry {
 
 interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+  readonly supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
 }
 
 type PendingUserInputResolution =
@@ -118,6 +119,8 @@ interface DroidSessionContext {
   activeTurnId: TurnId | undefined;
   /** Turns already interrupted; late completions must not resurrect them. */
   readonly interruptedTurnIds: Set<TurnId>;
+  /** Explicit rewind anchors already applied by this live process. */
+  readonly appliedRollbackAnchors: Set<TurnId>;
   /**
    * Message ids accepted into the current logical t3 turn. A sendTurn while
    * this is non-empty is a steer: droid may either coalesce it into the active
@@ -142,6 +145,8 @@ interface DroidSessionContext {
    * adopted as the live session id when that terminal settles the turn.
    */
   specSuccessorSessionId: string | undefined;
+  /** The current turn approved an exit_spec_mode handoff. */
+  specHandoffApproved: boolean;
   /** Live-context meter from the most recent session_token_usage_changed. */
   lastCallTokenUsage: DroidLastCallTokenUsage | undefined;
   lastEmittedTokenUsage: ThreadTokenUsageSnapshot | undefined;
@@ -223,8 +228,7 @@ export function droidCanonicalRequestType(
 
 /**
  * Pick the droid confirmation outcome for a t3 approval decision. The reply
- * must be one of the outcomes the request offered; anything else is treated
- * as cancel by the CLI, so unmatched preferences fall back explicitly.
+ * must be one of the outcomes the request offered.
  */
 export function selectDroidPermissionOutcome(
   options: ReadonlyArray<DroidPermissionOption>,
@@ -233,19 +237,36 @@ export function selectDroidPermissionOutcome(
   const outcomes = options
     .map((option) => option.outcome.trim())
     .filter((outcome): outcome is string => Boolean(outcome));
-  const preference =
-    decision === "acceptForSession"
-      ? ["proceed_always", "proceed_always_file", "proceed_always_tools", "proceed_always_server"]
-      : decision === "accept"
-        ? ["proceed_once"]
-        : ["cancel"];
-  for (const preferred of preference) {
-    if (outcomes.includes(preferred)) return preferred;
+  const persistentOutcomes = new Set([
+    "proceed_always",
+    "proceed_always_file",
+    "proceed_always_tools",
+    "proceed_always_server",
+  ]);
+  switch (decision) {
+    case "accept":
+      return outcomes.find((outcome) => outcome !== "cancel" && !persistentOutcomes.has(outcome));
+    case "acceptForSession":
+      return outcomes.find((outcome) => persistentOutcomes.has(outcome));
+    case "decline":
+      return outcomes.includes("cancel") ? "cancel" : undefined;
   }
-  if (decision === "decline") return outcomes.includes("cancel") ? "cancel" : undefined;
-  // Approvals with bespoke outcome sets (spec exit, autonomy raises) still
-  // proceed on the first non-cancel option droid offered.
-  return outcomes.find((outcome) => outcome !== "cancel");
+}
+
+export function droidSupportedApprovalDecisions(
+  options: ReadonlyArray<DroidPermissionOption>,
+): ReadonlyArray<ProviderApprovalDecision> {
+  const decisions: ProviderApprovalDecision[] = [];
+  if (selectDroidPermissionOutcome(options, "accept") !== undefined) {
+    decisions.push("accept");
+  }
+  if (selectDroidPermissionOutcome(options, "acceptForSession") !== undefined) {
+    decisions.push("acceptForSession");
+  }
+  if (selectDroidPermissionOutcome(options, "decline") !== undefined) {
+    decisions.push("decline", "cancel");
+  }
+  return decisions;
 }
 
 /**
@@ -666,6 +687,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         ctx.toolUseNames.clear();
         ctx.pendingTurnMessageIds.clear();
         ctx.persistedPendingTurnMessageIds.clear();
+        ctx.specSuccessorSessionId = undefined;
+        ctx.specHandoffApproved = false;
         ctx.activeTurnId = undefined;
         const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
         ctx.session = { ...readySession, status: "ready", updatedAt: yield* nowIso };
@@ -677,8 +700,20 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           turnId,
           payload:
             outcome.state === "failed"
-              ? { state: "failed", errorMessage: outcome.errorMessage }
-              : { state: outcome.state, stopReason: outcome.stopReason },
+              ? {
+                  state: "failed",
+                  errorMessage: outcome.errorMessage,
+                  ...(ctx.session.resumeCursor !== undefined
+                    ? { resumeCursor: ctx.session.resumeCursor }
+                    : {}),
+                }
+              : {
+                  state: outcome.state,
+                  stopReason: outcome.stopReason,
+                  ...(ctx.session.resumeCursor !== undefined
+                    ? { resumeCursor: ctx.session.resumeCursor }
+                    : {}),
+                },
         });
       });
 
@@ -997,7 +1032,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
         const turnId = ctx.activeTurnId;
-        ctx.pendingApprovals.set(requestId, { decision });
+        const supportedDecisions = droidSupportedApprovalDecisions(params.options);
+        ctx.pendingApprovals.set(requestId, { decision, supportedDecisions });
         const requestType = droidCanonicalRequestType(primaryToolUse?.details.type);
         yield* offerRuntimeEvent({
           type: "request.opened",
@@ -1008,6 +1044,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           requestId: runtimeRequestId,
           payload: {
             requestType,
+            supportedDecisions,
             detail:
               droidPermissionDetail(params) ??
               encodeJsonStringForDiagnostics(request.rawParams)?.slice(0, 2000) ??
@@ -1032,10 +1069,28 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           payload: { requestType, decision: resolved },
         });
         const selectedOutcome =
-          resolved === "cancel"
-            ? "cancel"
-            : (selectDroidPermissionOutcome(params.options, resolved) ?? "cancel");
-        yield* request.respond({ selectedOption: selectedOutcome });
+          resolved === "cancel" ? "cancel" : selectDroidPermissionOutcome(params.options, resolved);
+        if (selectedOutcome === undefined) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "respondToRequest",
+            issue: `Approval decision '${resolved}' is not supported by request '${requestId}'.`,
+          });
+        }
+        const approvedSpecHandoff =
+          primaryToolUse?.details.type === "exit_spec_mode" && selectedOutcome !== "cancel";
+        if (approvedSpecHandoff) {
+          ctx.specHandoffApproved = true;
+        }
+        yield* request.respond({ selectedOption: selectedOutcome }).pipe(
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              if (approvedSpecHandoff) {
+                ctx.specHandoffApproved = false;
+              }
+            }),
+          ),
+        );
       });
 
     const handleAskUserRequest = (
@@ -1098,10 +1153,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       });
 
     const handleServerRequest = (ctx: DroidSessionContext, request: DroidServerRequest) => {
-      const handler =
-        request.method === "droid.request_permission"
-          ? handlePermissionRequest(ctx, request)
-          : handleAskUserRequest(ctx, request);
+      const handler = Effect.gen(function* () {
+        if (request.method === "droid.request_permission") {
+          return yield* handlePermissionRequest(ctx, request);
+        }
+        return yield* handleAskUserRequest(ctx, request);
+      });
       // Each HITL request parks on a Deferred until a client answers, so it
       // must not block the request stream; failures answer the RPC so the
       // CLI never hangs on t3.
@@ -1125,6 +1182,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         if (ctx.stopped) return;
         ctx.stopped = true;
         yield* completeAllOpenChildTasks(ctx);
+        const activeTurnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
+        if (activeTurnId !== undefined) {
+          yield* settleTurn(ctx, activeTurnId, {
+            state: "cancelled",
+            stopReason: "cancelled",
+          });
+        }
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
@@ -1346,12 +1410,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             turns: [],
             activeTurnId: undefined,
             interruptedTurnIds: new Set(),
+            appliedRollbackAnchors: new Set(),
             pendingTurnMessageIds: new Set(),
             persistedPendingTurnMessageIds: new Set(),
             openItemIds: new Set(),
             toolUseNames: new Map(),
             childSessions: new Map(),
             specSuccessorSessionId: undefined,
+            specHandoffApproved: false,
             lastCallTokenUsage:
               initialized.kind === "loaded" ? initialized.result.lastCallTokenUsage : undefined,
             lastEmittedTokenUsage: undefined,
@@ -1382,6 +1448,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   const isSpecSuccessor =
                     ctx.activeTurnId !== undefined &&
                     ctx.currentInteractionMode === "spec" &&
+                    ctx.specHandoffApproved &&
                     (ctx.specSuccessorSessionId === undefined ||
                       ctx.specSuccessorSessionId === envelope.sessionId);
                   if (!isSpecSuccessor) {
@@ -1672,7 +1739,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         });
         if (observed._tag === "Ignore") return;
 
-        yield* withThreadLock(
+        const ctx = yield* withThreadLock(
           threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(threadId);
@@ -1687,7 +1754,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             }
             yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
             yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
-            yield* Effect.ignore(requestViaRpc(ctx, "droid.interrupt_session", {}));
             if (interruptedTurnId !== undefined) {
               // Settle immediately; the late cancelled completion notification
               // is dropped by settleTurn's cleared-active-turn guard.
@@ -1697,7 +1763,16 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               });
               ctx.interruptedTurnIds.delete(interruptedTurnId);
             }
+            return ctx;
           }),
+        );
+        if (ctx === undefined) return;
+        // The local turn is terminal before the provider interrupt begins.
+        // Run the best-effort RPC in the session scope so its timeout cannot
+        // hold the thread lock or block a replacement turn.
+        yield* requestViaRpc(ctx, "droid.interrupt_session", {}).pipe(
+          Effect.ignore,
+          Effect.forkIn(ctx.scope),
         );
       });
 
@@ -1714,6 +1789,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             provider: PROVIDER,
             method: "droid.request_permission",
             detail: `Unknown pending approval request: ${requestId}`,
+          });
+        }
+        if (!pending.supportedDecisions.includes(decision)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "respondToRequest",
+            issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
           });
         }
         ctx.pendingApprovals.delete(requestId);
@@ -1742,25 +1824,24 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     const readThread: DroidAdapterShape["readThread"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
-        return { threadId, turns: ctx.turns };
+        return {
+          threadId,
+          turns: ctx.turns,
+          ...(ctx.session.resumeCursor !== undefined
+            ? { resumeCursor: ctx.session.resumeCursor }
+            : {}),
+        };
       });
 
     // Rewind forks the droid session before the first discarded user message
     // (t3 turn ids are those message ids) and re-anchors the live process on
     // the fork. File arrays stay empty: t3's checkpoint refs own filesystem
     // restoration, droid only rolls conversation state back.
-    const rollbackThread: DroidAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+    const rollbackThread: DroidAdapterShape["rollbackThread"] = (threadId, target) =>
       withThreadLock(
         threadId,
         Effect.gen(function* () {
           const ctx = yield* requireSession(threadId);
-          if (!Number.isInteger(numTurns) || numTurns < 1) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "rollbackThread",
-              issue: "numTurns must be an integer >= 1.",
-            });
-          }
           if (ctx.activeTurnId !== undefined) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
@@ -1768,19 +1849,32 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               issue: "Cannot roll back while a turn is running.",
             });
           }
-          const anchorIndex = ctx.turns.length - numTurns;
-          const anchor = ctx.turns[anchorIndex];
-          if (anchorIndex < 0 || anchor === undefined) {
+          if (
+            ctx.turns.length === target.turnIds.length &&
+            ctx.turns.every((turn, index) => turn.id === target.turnIds[index]) &&
+            (target.anchorTurnId === undefined ||
+              ctx.appliedRollbackAnchors.has(target.anchorTurnId))
+          ) {
+            return {
+              threadId,
+              turns: ctx.turns,
+              ...(ctx.session.resumeCursor !== undefined
+                ? { resumeCursor: ctx.session.resumeCursor }
+                : {}),
+            };
+          }
+          const anchor = ctx.turns[target.turnIds.length]?.id ?? target.anchorTurnId;
+          if (anchor === undefined) {
             return yield* new ProviderAdapterRequestError({
               provider: PROVIDER,
               method: "droid.execute_rewind",
-              detail: `Cannot roll back ${numTurns} turn(s); only ${ctx.turns.length} tracked in this session.`,
+              detail: `Cannot roll back to ${target.turnIds.length} turn(s) without the first discarded turn id.`,
             });
           }
           const rewound = yield* decodeExecuteRewindResult(
             yield* requestViaRpc(ctx, "droid.execute_rewind", {
               sessionId: ctx.droidSessionId,
-              messageId: String(anchor.id),
+              messageId: String(anchor),
               filesToRestore: [],
               filesToDelete: [],
               forkTitle: "T3 Code checkpoint revert",
@@ -1805,7 +1899,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ...droidMcpServersParam(threadId),
           });
           ctx.droidSessionId = rewound.newSessionId;
-          ctx.turns = ctx.turns.slice(0, anchorIndex);
+          ctx.turns = target.turnIds.map((id) => ({ id, items: [] }));
+          ctx.appliedRollbackAnchors.add(anchor);
           ctx.session = {
             ...ctx.session,
             resumeCursor: {
@@ -1814,7 +1909,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             },
             updatedAt: yield* nowIso,
           };
-          return { threadId, turns: ctx.turns };
+          return {
+            threadId,
+            turns: ctx.turns,
+            ...(ctx.session.resumeCursor !== undefined
+              ? { resumeCursor: ctx.session.resumeCursor }
+              : {}),
+          };
         }),
       );
 
@@ -1876,7 +1977,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
-        resumeCursorChangesDuringTurn: true,
       },
       startSession,
       sendTurn,

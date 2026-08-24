@@ -192,6 +192,7 @@ describe("derivePendingApprovals", () => {
         payload: {
           requestId: "req-plan-approval",
           requestType: "plan_approval",
+          supportedDecisions: ["accept", "decline"],
           detail: "1. Map plan approvals\n2. Render the approval card",
         },
       }),
@@ -201,6 +202,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-plan-approval",
         requestKind: "plan",
+        supportedDecisions: ["accept", "decline"],
         createdAt: "2026-04-01T00:00:01.000Z",
         detail: "1. Map plan approvals\n2. Render the approval card",
       },
@@ -227,6 +229,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-dynamic-tool",
         requestKind: "command",
+        supportedDecisions: ["accept", "acceptForSession", "decline", "cancel"],
         createdAt: "2026-04-01T00:00:01.000Z",
         detail: "Search the web",
       },

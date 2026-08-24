@@ -98,6 +98,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-1",
         requestKind: "command",
+        supportedDecisions: ["accept", "acceptForSession", "decline", "cancel"],
         createdAt: "2026-02-23T00:00:01.000Z",
         detail: "bun run lint",
       },
@@ -115,6 +116,7 @@ describe("derivePendingApprovals", () => {
         payload: {
           requestId: "req-request-type",
           requestType: "command_execution_approval",
+          supportedDecisions: ["accept", "cancel"],
           detail: "pwd",
         },
       }),
@@ -124,6 +126,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-request-type",
         requestKind: "command",
+        supportedDecisions: ["accept", "cancel"],
         createdAt: "2026-02-23T00:00:01.000Z",
         detail: "pwd",
       },
@@ -150,6 +153,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-plan-approval",
         requestKind: "plan",
+        supportedDecisions: ["accept", "acceptForSession", "decline", "cancel"],
         createdAt: "2026-02-23T00:00:01.000Z",
         detail: "1. Map plan approvals\n2. Render the approval UI",
       },
@@ -176,6 +180,7 @@ describe("derivePendingApprovals", () => {
       {
         requestId: "req-dynamic-tool",
         requestKind: "command",
+        supportedDecisions: ["accept", "acceptForSession", "decline", "cancel"],
         createdAt: "2026-02-23T00:00:01.000Z",
         detail: "Search the web",
       },

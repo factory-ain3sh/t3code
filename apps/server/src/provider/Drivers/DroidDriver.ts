@@ -172,7 +172,7 @@ export const DroidDriver: ProviderDriver<DroidSettings, DroidDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build Droid snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build Droid snapshot.",
               cause,
             }),
         ),

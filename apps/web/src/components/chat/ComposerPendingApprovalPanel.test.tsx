@@ -13,6 +13,7 @@ describe("ComposerPendingApprovalPanel", () => {
           requestId: ApprovalRequestId.make("approval-1"),
           requestKind: "command",
           createdAt: "2026-07-18T00:00:00.000Z",
+          supportedDecisions: ["accept", "decline", "cancel"],
           detail,
         }}
         pendingCount={1}
@@ -42,6 +43,7 @@ describe("ComposerPendingApprovalPanel", () => {
           requestId: ApprovalRequestId.make("approval-2"),
           requestKind: "file-read",
           createdAt: "2026-07-18T00:00:00.000Z",
+          supportedDecisions: ["accept", "decline", "cancel"],
           detail: "",
         }}
         pendingCount={1}

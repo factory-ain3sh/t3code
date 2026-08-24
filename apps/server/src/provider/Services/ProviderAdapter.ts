@@ -32,10 +32,6 @@ export interface ProviderAdapterCapabilities {
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
-  /**
-   * Declares that a settled turn can replace the session's resume cursor.
-   */
-  readonly resumeCursorChangesDuringTurn?: boolean;
 }
 
 export interface ProviderThreadTurnSnapshot {
@@ -46,6 +42,12 @@ export interface ProviderThreadTurnSnapshot {
 export interface ProviderThreadSnapshot {
   readonly threadId: ThreadId;
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
+  readonly resumeCursor?: unknown;
+}
+
+export interface ProviderThreadRollbackTarget {
+  readonly turnIds: ReadonlyArray<TurnId>;
+  readonly anchorTurnId?: TurnId;
 }
 
 export interface ProviderAdapterShape<TError> {
@@ -113,11 +115,11 @@ export interface ProviderAdapterShape<TError> {
   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
 
   /**
-   * Roll back a provider thread by N turns.
+   * Roll back a provider thread to one absolute target.
    */
   readonly rollbackThread: (
     threadId: ThreadId,
-    numTurns: number,
+    target: ProviderThreadRollbackTarget,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
 
   /**

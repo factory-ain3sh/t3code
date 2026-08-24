@@ -447,27 +447,27 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
 
     const rollbackThread: ProviderAdapterShape<ProviderAdapterError>["rollbackThread"] = (
       threadId,
-      numTurns,
+      target,
     ) => {
       const state = sessions.get(threadId);
       if (!state) {
         return missingSessionEffect(provider, threadId);
       }
-      if (!Number.isInteger(numTurns) || numTurns < 0 || numTurns > state.snapshot.turns.length) {
+      if (target.turnIds.length > state.snapshot.turns.length) {
         return Effect.fail(
           new ProviderAdapterValidationError({
             provider,
             operation: "rollbackThread",
-            issue: "numTurns must be an integer between 0 and current turn count.",
+            issue: "Rollback target exceeds the current turn count.",
           }),
         );
       }
 
       return Effect.sync(() => {
-        state.rollbackCalls.push(numTurns);
+        state.rollbackCalls.push(target.turnIds.length);
         state.snapshot = {
           threadId: state.snapshot.threadId,
-          turns: state.snapshot.turns.slice(0, state.snapshot.turns.length - numTurns),
+          turns: state.snapshot.turns.slice(0, target.turnIds.length),
         };
         state.turnCount = state.snapshot.turns.length;
         return state.snapshot;

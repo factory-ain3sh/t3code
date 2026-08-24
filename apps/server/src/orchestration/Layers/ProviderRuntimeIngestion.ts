@@ -393,6 +393,7 @@ export function runtimeEventToActivities(
             requestId: toApprovalRequestId(event.requestId),
             ...(requestKind ? { requestKind } : {}),
             requestType: event.payload.requestType,
+            supportedDecisions: event.payload.supportedDecisions,
             ...(event.payload.detail ? { detail: event.payload.detail } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,

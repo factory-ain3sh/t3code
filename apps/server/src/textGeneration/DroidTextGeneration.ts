@@ -243,6 +243,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
       const { prompt, outputSchema } = buildBranchNamePrompt({
         message: input.message,
         attachments: input.attachments,
+        policy: input.policy,
       });
 
       const generated = yield* runDroidJson({
@@ -264,6 +265,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         message: input.message,
         previousTitle: input.previousTitle,
         attachments: input.attachments,
+        policy: input.policy,
       });
 
       const generated = yield* runDroidJson({

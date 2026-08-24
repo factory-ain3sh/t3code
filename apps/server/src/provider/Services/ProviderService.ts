@@ -24,6 +24,7 @@ import type {
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
   ThreadId,
+  TurnId,
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -31,7 +32,7 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
-import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type { ProviderAdapterCapabilities, ProviderThreadSnapshot } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -100,12 +101,13 @@ export interface ProviderServiceShape {
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderServiceError>;
 
   /**
-   * Roll back provider conversation state by a number of turns.
+   * Roll back provider conversation state to one absolute target.
    */
   readonly rollbackConversation: (input: {
     readonly threadId: ThreadId;
-    readonly numTurns: number;
-  }) => Effect.Effect<void, ProviderServiceError>;
+    readonly turnIds: ReadonlyArray<TurnId>;
+    readonly anchorTurnId?: TurnId;
+  }) => Effect.Effect<ProviderThreadSnapshot, ProviderServiceError>;
 
   /**
    * Upload a thread and return the provider's shareable feedback identifier.

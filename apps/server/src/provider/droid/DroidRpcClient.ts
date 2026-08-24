@@ -28,6 +28,12 @@ const defaultRequestTimeoutMs = 30_000;
 const gracefulShutdownTimeout = Duration.seconds(2);
 const timedOutRequestRetentionLimit = 256;
 const diagnosticTextLimit = 2000;
+const outgoingQueueCapacity = 2;
+const notificationQueueCapacity = 64;
+const serverRequestQueueCapacity = 16;
+const maxOutgoingMessageBytes = 128 * 1024 * 1024;
+const maxIncomingLineBytes = 2 * 1024 * 1024;
+const stdoutExitObservationGrace = Duration.millis(100);
 
 export interface DroidRpcSpawnInput {
   readonly command: string;
@@ -62,6 +68,9 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
     "rpc",
     "process-exit",
     "duplicate-response",
+    "duplicate-server-response",
+    "message-too-large",
+    "frame-too-large",
   ]),
   method: Schema.optionalKey(Schema.String),
   requestId: Schema.optionalKey(Schema.String),
@@ -71,6 +80,8 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
   rpcMessage: Schema.optionalKey(Schema.String),
   timeoutMs: Schema.optionalKey(Schema.Number),
   exitDescription: Schema.optionalKey(Schema.String),
+  actualBytes: Schema.optionalKey(Schema.Number),
+  limitBytes: Schema.optionalKey(Schema.Number),
 }) {
   override get message() {
     switch (this.kind) {
@@ -88,6 +99,12 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
           : `Droid process exited while ${this.method} was pending`;
       case "duplicate-response":
         return `Droid request ${this.method} responded after timing out`;
+      case "duplicate-server-response":
+        return `Droid server request ${this.method} was answered more than once`;
+      case "message-too-large":
+        return `Droid JSON-RPC message is ${this.actualBytes} bytes; limit is ${this.limitBytes}`;
+      case "frame-too-large":
+        return `Droid JSON-RPC line exceeded the ${this.limitBytes} byte limit`;
     }
   }
 }
@@ -188,6 +205,60 @@ interface TimedOutRequest {
 
 type RequestState = PendingRequest | TimedOutRequest;
 
+interface LineFramingState {
+  readonly buffer: string;
+  readonly bytes: number;
+}
+
+function splitJsonRpcLines(
+  stream: Stream.Stream<string, unknown>,
+): Stream.Stream<string, unknown | DroidRpcError> {
+  return stream.pipe(
+    Stream.mapAccumEffect(
+      (): LineFramingState => ({ buffer: "", bytes: 0 }),
+      (state, chunk) =>
+        Effect.gen(function* () {
+          const lines: string[] = [];
+          let buffer = state.buffer;
+          let bytes = state.bytes;
+          let cursor = 0;
+          const delimiters = /\r\n|\r|\n/g;
+          for (const delimiter of chunk.matchAll(delimiters)) {
+            const index = delimiter.index;
+            const segment = chunk.slice(cursor, index);
+            buffer += segment;
+            bytes += Buffer.byteLength(segment, "utf8");
+            if (bytes > maxIncomingLineBytes) {
+              return yield* new DroidRpcError({
+                kind: "frame-too-large",
+                actualBytes: bytes,
+                limitBytes: maxIncomingLineBytes,
+              });
+            }
+            lines.push(buffer);
+            buffer = "";
+            bytes = 0;
+            cursor = index + delimiter[0].length;
+          }
+          const remainder = chunk.slice(cursor);
+          buffer += remainder;
+          bytes += Buffer.byteLength(remainder, "utf8");
+          if (bytes > maxIncomingLineBytes) {
+            return yield* new DroidRpcError({
+              kind: "frame-too-large",
+              actualBytes: bytes,
+              limitBytes: maxIncomingLineBytes,
+            });
+          }
+          return [{ buffer, bytes }, lines] as const;
+        }),
+      {
+        onHalt: (state) => (state.buffer.length > 0 ? [state.buffer] : []),
+      },
+    ),
+  );
+}
+
 function markRequestTimedOut(
   pending: ReadonlyMap<string, RequestState>,
   requestId: string,
@@ -269,12 +340,13 @@ export const makeDroidRpcClient = (
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeScope = yield* Scope.Scope;
-    const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
-    const notificationPubSub = yield* Queue.unbounded<
-      DroidNotificationEnvelope,
-      Cause.Done<void>
-    >();
-    const serverRequestPubSub = yield* Queue.unbounded<DroidServerRequest, Cause.Done<void>>();
+    const outgoing = yield* Queue.bounded<string, Cause.Done<void>>(outgoingQueueCapacity);
+    const notificationPubSub = yield* Queue.bounded<DroidNotificationEnvelope, Cause.Done<void>>(
+      notificationQueueCapacity,
+    );
+    const serverRequestPubSub = yield* Queue.bounded<DroidServerRequest, Cause.Done<void>>(
+      serverRequestQueueCapacity,
+    );
     const lifecycle = yield* SynchronizedRef.make<DroidRpcLifecycle>({
       _tag: "Running",
       pending: new Map(),
@@ -336,6 +408,18 @@ export const makeDroidRpcClient = (
               cause,
             }),
         ),
+        Effect.flatMap((encoded) => {
+          const actualBytes = Buffer.byteLength(encoded, "utf8");
+          return actualBytes <= maxOutgoingMessageBytes
+            ? Effect.succeed(encoded)
+            : Effect.fail(
+                new DroidRpcError({
+                  kind: "message-too-large",
+                  actualBytes,
+                  limitBytes: maxOutgoingMessageBytes,
+                }),
+              );
+        }),
         Effect.flatMap((encoded) => Queue.offer(outgoing, encoded)),
         Effect.flatMap((offered) =>
           offered
@@ -406,21 +490,43 @@ export const makeDroidRpcClient = (
         yield* Deferred.succeed(requestState.deferred, message.result);
       });
 
-    const makeServerRequestBase = (id: string, sessionId: string | undefined) => ({
-      id,
-      sessionId,
-      respond: (result: unknown) =>
-        sendResponse(id, {
-          _tag: "Success",
-          value: result,
-        }),
-      fail: (code: number, message: string) =>
-        sendResponse(id, {
-          _tag: "Failure",
-          code,
-          message,
-        }),
-    });
+    const makeServerRequestBase = (id: string, method: string, sessionId: string | undefined) =>
+      Effect.gen(function* () {
+        const answered = yield* Ref.make(false);
+        const answerOnce = (
+          result:
+            | { readonly _tag: "Success"; readonly value: unknown }
+            | { readonly _tag: "Failure"; readonly code: number; readonly message: string },
+        ) =>
+          Ref.getAndSet(answered, true).pipe(
+            Effect.flatMap((alreadyAnswered) =>
+              alreadyAnswered
+                ? Effect.fail(
+                    new DroidRpcError({
+                      kind: "duplicate-server-response",
+                      method,
+                      requestId: id,
+                    }),
+                  )
+                : sendResponse(id, result),
+            ),
+          );
+        return {
+          id,
+          sessionId,
+          respond: (result: unknown) =>
+            answerOnce({
+              _tag: "Success",
+              value: result,
+            }),
+          fail: (code: number, message: string) =>
+            answerOnce({
+              _tag: "Failure",
+              code,
+              message,
+            }),
+        };
+      });
 
     const publishServerRequest = (request: DroidServerRequest) =>
       Queue.offer(serverRequestPubSub, request).pipe(Effect.asVoid);
@@ -449,8 +555,9 @@ export const makeDroidRpcClient = (
             }).pipe(Effect.ignore);
             return;
           }
+          const requestBase = yield* makeServerRequestBase(id, message.method, sessionId);
           yield* publishServerRequest({
-            ...makeServerRequestBase(id, sessionId),
+            ...requestBase,
             method: message.method,
             params: decoded.success,
             rawParams: message.params,
@@ -470,8 +577,9 @@ export const makeDroidRpcClient = (
             }).pipe(Effect.ignore);
             return;
           }
+          const requestBase = yield* makeServerRequestBase(id, message.method, sessionId);
           yield* publishServerRequest({
-            ...makeServerRequestBase(id, sessionId),
+            ...requestBase,
             method: message.method,
             params: decoded.success,
           });
@@ -529,26 +637,6 @@ export const makeDroidRpcClient = (
         : handleMessage(parsed.message);
     };
 
-    const stdoutFiber = yield* child.stdout.pipe(
-      Stream.decodeText(),
-      Stream.splitLines,
-      Stream.filter((line) => line.trim().length > 0),
-      Stream.runForEach(handleLine),
-      Effect.catch((cause) => publishDiagnostic("Droid stdout stream failed", { cause })),
-      Effect.forkIn(runtimeScope),
-    );
-
-    const stderrFiber = yield* child.stderr.pipe(
-      Stream.decodeText(),
-      Stream.runForEach((output) =>
-        output.trim().length === 0
-          ? Effect.void
-          : publishDiagnostic(`Droid stderr: ${output.trim()}`),
-      ),
-      Effect.catch(() => Effect.void),
-      Effect.forkIn(runtimeScope),
-    );
-
     const processExitError = (
       exit: DroidProcessExit,
       method: string,
@@ -561,6 +649,21 @@ export const makeDroidRpcClient = (
         ...(requestId === undefined ? { exitDescription: exit.description } : {}),
         data: exit,
       });
+
+    const observeChildExit = child.exitCode.pipe(
+      Effect.match({
+        onFailure: (cause) =>
+          ({
+            code: null,
+            description: `Droid process exit status was unavailable: ${String(cause)}`,
+          }) satisfies DroidProcessExit,
+        onSuccess: (code) =>
+          ({
+            code: Number(code),
+            description: `Droid process exited with code ${Number(code)}`,
+          }) satisfies DroidProcessExit,
+      }),
+    );
 
     const beginProcessExit = (exit: DroidProcessExit) =>
       SynchronizedRef.modify(lifecycle, (state) => {
@@ -585,49 +688,93 @@ export const makeDroidRpcClient = (
         if (state._tag === "Exited") {
           return [undefined, state] as const;
         }
+        const finalExit =
+          state._tag === "ShuttingDown" && state.exit !== undefined ? state.exit : exit;
         const pending = Array.from(state.pending.entries()).filter(
           (entry): entry is [string, PendingRequest] => entry[1]._tag === "Pending",
         );
-        return [pending, { _tag: "Exited", exit }] as const;
+        return [
+          { finalExit, pending },
+          { _tag: "Exited", exit: finalExit },
+        ] as const;
       }).pipe(
-        Effect.flatMap((pending) =>
-          pending === undefined
+        Effect.flatMap((transition) =>
+          transition === undefined
             ? Effect.void
             : Effect.forEach(
-                pending,
+                transition.pending,
                 ([requestId, request]) =>
                   Deferred.fail(
                     request.deferred,
-                    processExitError(exit, request.method, requestId),
+                    processExitError(transition.finalExit, request.method, requestId),
                   ),
                 { discard: true },
-              ),
+              ).pipe(Effect.as(transition.finalExit)),
         ),
       );
 
-    yield* child.exitCode.pipe(
-      Effect.match({
+    const finalizeTransportExit = (exit: DroidProcessExit) =>
+      Effect.gen(function* () {
+        yield* Queue.end(outgoing);
+        const finalExit = yield* finishProcessExit(exit);
+        if (finalExit === undefined) return;
+        yield* Effect.all([Queue.end(notificationPubSub), Queue.end(serverRequestPubSub)], {
+          discard: true,
+        });
+        yield* Deferred.succeed(exitDeferred, finalExit);
+      });
+
+    const stdoutFiber = yield* child.stdout.pipe(
+      Stream.decodeText(),
+      splitJsonRpcLines,
+      Stream.filter((line) => line.trim().length > 0),
+      Stream.runForEach(handleLine),
+      Effect.matchCauseEffect({
         onFailure: (cause) =>
-          ({
-            code: null,
-            description: `Droid process exit status was unavailable: ${String(cause)}`,
-          }) satisfies DroidProcessExit,
-        onSuccess: (code) =>
-          ({
-            code: Number(code),
-            description: `Droid process exited with code ${Number(code)}`,
-          }) satisfies DroidProcessExit,
+          publishDiagnostic("Droid stdout stream failed", { cause }).pipe(
+            Effect.andThen(
+              finalizeTransportExit({
+                code: null,
+                description: `Droid stdout stream failed: ${Cause.pretty(cause)}`,
+              }),
+            ),
+          ),
+        onSuccess: () =>
+          observeChildExit.pipe(
+            Effect.timeoutOption(stdoutExitObservationGrace),
+            Effect.flatMap(
+              Option.match({
+                onNone: () =>
+                  finalizeTransportExit({
+                    code: null,
+                    description: "Droid stdout stream closed before the process exited",
+                  }),
+                onSome: finalizeTransportExit,
+              }),
+            ),
+          ),
       }),
+      Effect.forkIn(runtimeScope),
+    );
+
+    const stderrFiber = yield* child.stderr.pipe(
+      Stream.decodeText(),
+      Stream.runForEach((output) =>
+        output.trim().length === 0
+          ? Effect.void
+          : publishDiagnostic(`Droid stderr: ${output.trim()}`),
+      ),
+      Effect.catch(() => Effect.void),
+      Effect.forkIn(runtimeScope),
+    );
+
+    yield* observeChildExit.pipe(
       Effect.flatMap((exit) =>
         Effect.gen(function* () {
           yield* beginProcessExit(exit);
           yield* Fiber.await(stdoutFiber);
           yield* Fiber.await(stderrFiber);
-          yield* finishProcessExit(exit);
-          yield* Effect.all([Queue.end(notificationPubSub), Queue.end(serverRequestPubSub)], {
-            discard: true,
-          });
-          yield* Deferred.succeed(exitDeferred, exit);
+          yield* finalizeTransportExit(exit);
         }),
       ),
       Effect.forkIn(runtimeScope),

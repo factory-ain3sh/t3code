@@ -9,6 +9,7 @@ import {
   DroidPermissionRequest,
   DroidSessionNotification,
   DroidSkillInfo,
+  knownDroidSessionNotificationTypes,
 } from "./DroidProtocol.ts";
 
 const decodeNotification = Schema.decodeUnknownSync(DroidSessionNotification);
@@ -141,6 +142,13 @@ const fixtures: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
 ];
 
 describe("DroidSessionNotification", () => {
+  it("keeps the known-type guard in parity with every schema member", () => {
+    assert.deepStrictEqual(
+      [...knownDroidSessionNotificationTypes].sort(),
+      [...new Set([...fixtures.map(([type]) => type), "tool_progress_update"])].sort(),
+    );
+  });
+
   for (const [type, fixture] of fixtures) {
     it(`decodes ${type}`, () => {
       const decoded = decodeNotification(fixture);
@@ -156,6 +164,20 @@ describe("DroidSessionNotification", () => {
 
     assert.equal(decoded.type, "__unknown__");
     assert.deepStrictEqual(decoded, { type: "__unknown__" });
+  });
+
+  it("preserves future terminal reasons for adapter-level failure projection", () => {
+    const decoded = decodeNotification({
+      type: "agent_turn_completed",
+      reason: "future_terminal_reason",
+      turnId: "turn-future",
+      tokenUsage: usage,
+    });
+
+    assert.equal(decoded.type, "agent_turn_completed");
+    if (decoded.type === "agent_turn_completed") {
+      assert.equal(decoded.reason, "future_terminal_reason");
+    }
   });
 
   it("decodes ignored notifications from their discriminator alone", () => {
@@ -276,17 +298,6 @@ describe("DroidSessionNotification", () => {
     if (decoded.type === "agent_turn_completed") {
       assert.equal(decoded.reason, "spec_handoff");
     }
-  });
-
-  it("rejects completion reasons outside the protocol enum", () => {
-    assert.throws(() =>
-      decodeNotification({
-        type: "agent_turn_completed",
-        reason: "future_reason",
-        turnId: "future-turn",
-        tokenUsage: usage,
-      }),
-    );
   });
 });
 
