@@ -11,7 +11,7 @@ import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shar
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 
-import { makeDroidRpcClient } from "../provider/droid/DroidRpcClient.ts";
+import { makeDroidExecRpcClient } from "../provider/droid/DroidRpcClient.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
@@ -62,9 +62,8 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
           detail,
           ...(cause !== undefined ? { cause } : {}),
         });
-      const rpc = yield* makeDroidRpcClient({
-        command: droidSettings.binaryPath,
-        args: ["exec", "--input-format", "stream-jsonrpc", "--output-format", "stream-jsonrpc"],
+      const rpc = yield* makeDroidExecRpcClient({
+        binaryPath: droidSettings.binaryPath,
         cwd,
         env: environment,
       }).pipe(

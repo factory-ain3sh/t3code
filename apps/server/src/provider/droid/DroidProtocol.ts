@@ -197,9 +197,28 @@ export const DroidToolConfirmationDetails = Schema.Union([
 ]);
 export type DroidToolConfirmationDetails = typeof DroidToolConfirmationDetails.Type;
 
+export const DroidPermissionOutcome = Schema.Literals([
+  "proceed_once",
+  "proceed_always",
+  "proceed_always_file",
+  "proceed_auto_run",
+  "proceed_auto_run_low",
+  "proceed_auto_run_medium",
+  "proceed_auto_run_high",
+  "proceed_new_session",
+  "proceed_new_session_low",
+  "proceed_new_session_medium",
+  "proceed_new_session_high",
+  "proceed_edit",
+  "proceed_always_tools",
+  "proceed_always_server",
+  "cancel",
+]);
+export type DroidPermissionOutcome = typeof DroidPermissionOutcome.Type;
+
 export const DroidPermissionOption = Schema.Struct({
   label: Schema.String,
-  outcome: Schema.String,
+  outcome: DroidPermissionOutcome,
 }).pipe(
   Schema.encodeKeys({
     outcome: "value",

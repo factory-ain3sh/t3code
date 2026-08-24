@@ -17,6 +17,7 @@ import {
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
   ProviderSessionStartInput,
   ThreadId,
   TurnId,
@@ -45,7 +46,7 @@ import {
   ProviderValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type { ProviderAdapterSession, ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -94,13 +95,14 @@ type LegacyProviderRuntimeEvent = {
 };
 
 function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
-  const sessions = new Map<ThreadId, ProviderSession>();
+  const sessions = new Map<ThreadId, ProviderAdapterSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  let nextSessionLease = 0;
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
       const now = "2026-01-01T00:00:00.000Z";
-      const session: ProviderSession = {
+      const session: ProviderAdapterSession = {
         provider,
         ...(input.providerInstanceId !== undefined
           ? { providerInstanceId: input.providerInstanceId }
@@ -108,6 +110,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
         status: "ready",
         runtimeMode: input.runtimeMode,
         threadId: input.threadId,
+        sessionLease: ProviderSessionLease.make(`lease-${++nextSessionLease}`),
         resumeCursor: input.resumeCursor ?? {
           opaque: `resume-${String(input.threadId)}`,
         },
@@ -169,7 +172,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   );
 
   const listSessions = vi.fn(
-    (): Effect.Effect<ReadonlyArray<ProviderSession>> =>
+    (): Effect.Effect<ReadonlyArray<ProviderAdapterSession>> =>
       Effect.sync(() => Array.from(sessions.values())),
   );
 
@@ -247,7 +250,13 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   };
 
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
+    const sessionLease = sessions.get(event.threadId)?.sessionLease;
+    Effect.runSync(
+      PubSub.publish(runtimeEventPubSub, {
+        ...event,
+        ...(sessionLease === undefined ? {} : { sessionLease }),
+      } as unknown as ProviderRuntimeEvent),
+    );
   };
 
   const updateSession = (
@@ -258,7 +267,10 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     if (!existing) {
       return;
     }
-    sessions.set(threadId, update(existing));
+    sessions.set(threadId, {
+      ...update(existing),
+      sessionLease: existing.sessionLease,
+    });
   };
 
   return {
@@ -1384,6 +1396,101 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("does not persist a delayed stop over a replacement session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-stop-replacement-overlap");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const stopEntered = yield* Deferred.make<void>();
+      const allowStop = yield* Deferred.make<void>();
+      routing.codex.stopSession.mockImplementationOnce(() =>
+        Deferred.succeed(stopEntered, undefined).pipe(Effect.andThen(Deferred.await(allowStop))),
+      );
+
+      const delayedStop = yield* provider.stopSession({ threadId }).pipe(Effect.forkChild);
+      yield* Deferred.await(stopEntered);
+
+      const replacementStart = yield* provider
+        .startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.succeed(allowStop, undefined);
+      yield* Fiber.join(delayedStop);
+      yield* Fiber.join(replacementStart);
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        assert.equal(binding.value.provider, CLAUDE_AGENT_DRIVER);
+        assert.equal(binding.value.providerInstanceId, claudeAgentInstanceId);
+        assert.notEqual(binding.value.sessionLease, null);
+        assert.equal(binding.value.status, "running");
+      }
+    }),
+  );
+
+  it.effect("serializes overlapping replacement session starts per thread", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-start-replacement-overlap");
+      const startEntered = yield* Deferred.make<void>();
+      const allowStart = yield* Deferred.make<void>();
+
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        Deferred.succeed(startEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowStart)),
+          Effect.andThen(
+            Effect.suspend(() => routing.codex.adapter.startSession(input)).pipe(Effect.orDie),
+          ),
+        ),
+      );
+
+      const originalStart = yield* provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(startEntered);
+      const replacementStart = yield* provider
+        .startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Deferred.succeed(allowStart, undefined);
+      yield* Fiber.join(originalStart);
+      yield* Fiber.join(replacementStart);
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        assert.equal(binding.value.provider, CLAUDE_AGENT_DRIVER);
+        assert.equal(binding.value.providerInstanceId, claudeAgentInstanceId);
+        assert.notEqual(binding.value.sessionLease, null);
+        assert.equal(binding.value.status, "running");
+      }
+    }),
+  );
+
   it.effect("recovers stale sessions for sendTurn using persisted cwd", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1885,6 +1992,66 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
     }),
   );
 
+  it.effect("suppresses stale completion from a replaced session under the same instance", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-stale-terminal-cursor");
+      yield* provider.startSession(threadId, {
+        provider: DROID_DRIVER,
+        providerInstanceId: droidInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalRuntime = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(originalRuntime), true);
+      if (Option.isNone(originalRuntime)) {
+        return;
+      }
+
+      const replacementCursor = { opaque: "replacement-cursor" };
+      const replacementLease = ProviderSessionLease.make("lease-replacement");
+      const publishedEvents: ProviderRuntimeEvent[] = [];
+      const eventFiber = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        Effect.sync(() => publishedEvents.push(event)),
+      ).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      yield* directory.upsert({
+        threadId,
+        provider: DROID_DRIVER,
+        providerInstanceId: droidInstanceId,
+        sessionLease: replacementLease,
+        resumeCursor: replacementCursor,
+      });
+
+      fanout.droid.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-stale-terminal-cursor"),
+        provider: DROID_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-stale-terminal-cursor"),
+        payload: {
+          state: "completed",
+          resumeCursor: { opaque: "stale-cursor" },
+        },
+      });
+      yield* advanceTestClock(50);
+
+      const persisted = yield* runtimeRepository.getByThreadId({ threadId });
+      assert.equal(Option.isSome(persisted), true);
+      if (Option.isSome(persisted)) {
+        assert.equal(persisted.value.providerInstanceId, droidInstanceId);
+        assert.equal(persisted.value.sessionLease, replacementLease);
+        assert.deepEqual(persisted.value.resumeCursor, replacementCursor);
+      }
+      assert.notEqual(originalRuntime.value.sessionLease, replacementLease);
+      assert.isEmpty(publishedEvents);
+      yield* Fiber.interrupt(eventFiber);
+    }),
+  );
+
   it.effect("persists a dynamic resume cursor before publishing turn completion", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -2257,13 +2424,14 @@ validation.layer("ProviderServiceLive validation", (it) => {
           const now = "2026-01-01T00:00:00.000Z";
           return {
             provider: ProviderDriverKind.make("codex"),
+            sessionLease: ProviderSessionLease.make("lease-missing-provider-thread"),
             status: "ready",
             threadId: input.threadId,
             runtimeMode: input.runtimeMode,
             cwd: input.cwd ?? process.cwd(),
             createdAt: now,
             updatedAt: now,
-          } satisfies ProviderSession;
+          } satisfies ProviderAdapterSession;
         }),
       );
 

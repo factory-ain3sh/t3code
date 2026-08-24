@@ -9,6 +9,7 @@ import {
   ProviderRuntimeEvent,
   ProviderSession,
   ProviderInstanceId,
+  ProviderSessionLease,
 } from "@t3tools/contracts";
 import {
   CommandId,
@@ -29,6 +30,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -86,26 +88,40 @@ function createProviderServiceHarness(
   hasSession = true,
   sessionCwd = cwd,
   providerName: ProviderSession["provider"] = ProviderDriverKind.make("codex"),
+  onRollbackConversation?: (input: {
+    readonly threadId: ThreadId;
+    readonly turnIds: ReadonlyArray<TurnId>;
+    readonly anchorTurnId?: TurnId;
+  }) => Effect.Effect<void>,
+  rollbackResumeCursor?: unknown,
 ) {
   const now = "2026-01-01T00:00:00.000Z";
+  let sessionAvailable = hasSession;
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const runtimeEventSubscriptionReady = Effect.runSync(Deferred.make<void>());
+  const sessionLifecycleLock = Effect.runSync(Semaphore.make(1));
   const rollbackConversation = vi.fn(
     (input: {
       readonly threadId: ThreadId;
       readonly turnIds: ReadonlyArray<TurnId>;
       readonly anchorTurnId?: TurnId;
     }) =>
-      Effect.succeed({
-        threadId: input.threadId,
-        turns: input.turnIds.map((id) => ({ id, items: [] })),
+      Effect.gen(function* () {
+        if (onRollbackConversation) {
+          yield* onRollbackConversation(input);
+        }
+        return {
+          threadId: input.threadId,
+          turns: input.turnIds.map((id) => ({ id, items: [] })),
+          ...(rollbackResumeCursor !== undefined ? { resumeCursor: rollbackResumeCursor } : {}),
+        };
       }),
   );
 
   const unsupported = <A>() =>
     Effect.die(new Error("Unsupported provider call in test")) as Effect.Effect<A, never>;
   const listSessions = () =>
-    hasSession
+    sessionAvailable
       ? Effect.succeed([
           {
             provider: providerName,
@@ -119,6 +135,21 @@ function createProviderServiceHarness(
           },
         ] satisfies ReadonlyArray<ProviderSession>)
       : Effect.succeed([] as ReadonlyArray<ProviderSession>);
+  const recoverSession = vi.fn(() =>
+    Effect.sync(() => {
+      sessionAvailable = true;
+      return {
+        provider: providerName,
+        providerInstanceId: ProviderInstanceId.make(providerName),
+        status: "ready",
+        runtimeMode: "full-access",
+        threadId: ThreadId.make("thread-1"),
+        cwd: sessionCwd,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies ProviderSession;
+    }),
+  );
   const service: ProviderServiceShape = {
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
@@ -127,6 +158,8 @@ function createProviderServiceHarness(
     respondToUserInput: () => unsupported(),
     stopSession: () => unsupported(),
     listSessions,
+    recoverSession,
+    withSessionLifecycleLock: (_threadId, effect) => sessionLifecycleLock.withPermit(effect),
     getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
     getInstanceInfo: (instanceId) =>
       Effect.succeed({
@@ -157,6 +190,7 @@ function createProviderServiceHarness(
   return {
     service,
     rollbackConversation,
+    recoverSession,
     emit,
     awaitSubscription: Deferred.await(runtimeEventSubscriptionReady),
   };
@@ -252,6 +286,14 @@ function gitShowFileAtRef(cwd: string, ref: string, filePath: string): string {
   return runGit(cwd, ["show", `${ref}:${filePath}`]);
 }
 
+function makeGate() {
+  let open!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { open, promise };
+}
+
 async function waitForGitRefExists(cwd: string, ref: string, timeoutMs = 15_000) {
   const deadline = (await Effect.runPromise(Clock.currentTimeMillis)) + timeoutMs;
   const poll = async (): Promise<void> => {
@@ -307,14 +349,29 @@ describe("CheckpointReactor", () => {
     readonly providerName?: ProviderDriverKind;
     readonly gitStatusRefreshCalls?: Array<string>;
     readonly pendingRevertRecovery?: boolean;
+    readonly replacementBeforeRecovery?: boolean;
+    readonly onRollbackConversation?: (input: {
+      readonly threadId: ThreadId;
+      readonly turnIds: ReadonlyArray<TurnId>;
+      readonly anchorTurnId?: TurnId;
+    }) => Effect.Effect<void>;
+    readonly rollbackResumeCursor?: unknown;
+    readonly persistedSessionBinding?: boolean;
+    readonly replaceBindingDuringRollback?: boolean;
   }) {
     const cwd = createGitRepository();
     tempDirs.push(cwd);
+    let replaceBindingDuringRollback: Effect.Effect<void> = Effect.void;
     const provider = createProviderServiceHarness(
       cwd,
       options?.hasSession ?? true,
       options?.providerSessionCwd ?? cwd,
       options?.providerName ?? ProviderDriverKind.make("codex"),
+      (input) =>
+        (options?.onRollbackConversation?.(input) ?? Effect.void).pipe(
+          Effect.andThen(Effect.suspend(() => replaceBindingDuringRollback)),
+        ),
+      options?.rollbackResumeCursor,
     );
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
@@ -391,9 +448,36 @@ describe("CheckpointReactor", () => {
     const checkpointStore = await managedRuntime.runPromise(
       Effect.service(CheckpointStore.CheckpointStore),
     );
+    if (options?.replaceBindingDuringRollback) {
+      replaceBindingDuringRollback = providerSessionDirectory
+        .upsert({
+          threadId: ThreadId.make("thread-1"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-b"),
+          resumeCursor: { sessionId: "session-a" },
+          runtimePayload: { cwd },
+        })
+        .pipe(Effect.orDie);
+    }
     const drain = () => Effect.runPromise(reactor.drain);
 
     const createdAt = "2026-01-01T00:00:00.000Z";
+    const sessionLease = ProviderSessionLease.make("lease-a");
+    if (options?.persistedSessionBinding ?? options?.hasSession ?? true) {
+      await runtime.runPromise(
+        providerSessionDirectory.upsert({
+          threadId: ThreadId.make("thread-1"),
+          provider: options?.providerName ?? ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make(
+            options?.providerName ?? ProviderDriverKind.make("codex"),
+          ),
+          sessionLease,
+          resumeCursor: { sessionId: "session-a" },
+          runtimePayload: { cwd: options?.providerSessionCwd ?? cwd },
+        }),
+      );
+    }
     await Effect.runPromise(
       engine.dispatch({
         type: "project.create",
@@ -479,12 +563,14 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           provider: ProviderDriverKind.make("codex"),
           providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease,
           runtimePayload: {
             checkpointRevertIntent: {
               commandId: CommandId.make("server:checkpoint-revert-complete:recovery"),
               threadId: ThreadId.make("thread-1"),
               provider: ProviderDriverKind.make("codex"),
               providerInstanceId: ProviderInstanceId.make("codex"),
+              sessionLease,
               cwd,
               turnCount: 1,
               turnIds: [asTurnId("turn-1")],
@@ -494,6 +580,19 @@ describe("CheckpointReactor", () => {
               createdAt,
             },
           },
+        }),
+      );
+    }
+
+    if (options?.replacementBeforeRecovery) {
+      await runtime.runPromise(
+        providerSessionDirectory.upsert({
+          threadId: ThreadId.make("thread-1"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-b"),
+          resumeCursor: { sessionId: "session-b" },
+          runtimePayload: { owner: "b" },
         }),
       );
     }
@@ -509,6 +608,8 @@ describe("CheckpointReactor", () => {
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       provider,
       providerSessionDirectory,
+      runtime: managedRuntime,
+      sessionLease,
       cwd,
       drain,
     };
@@ -588,6 +689,28 @@ describe("CheckpointReactor", () => {
         "README.md",
       ),
     ).toBe("v2\n");
+  });
+
+  it("ignores lifecycle events emitted by a stale provider session incarnation", async () => {
+    const harness = await createHarness({ seedFilesystemCheckpoints: false });
+
+    NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "stale\n", "utf8");
+    harness.provider.emit({
+      type: "turn.completed",
+      eventId: EventId.make("evt-turn-completed-stale-lease"),
+      provider: ProviderDriverKind.make("codex"),
+      sessionLease: ProviderSessionLease.make("lease-stale"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-stale"),
+      payload: { state: "completed" },
+    });
+
+    await harness.drain();
+
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1)),
+    ).toBe(false);
   });
 
   it("refreshes local git status state on turn completion using the session cwd", async () => {
@@ -1237,6 +1360,165 @@ describe("CheckpointReactor", () => {
     if (Option.isSome(binding)) {
       expect(binding.value.runtimePayload).toMatchObject({
         checkpointRevertIntent: null,
+      });
+    }
+  });
+
+  it("persists a recovered rewind cursor against the replacement session lease", async () => {
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      replaceBindingDuringRollback: true,
+      rollbackResumeCursor: { sessionId: "session-rewound" },
+    });
+
+    await harness.drain();
+
+    const binding = await Effect.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value).toMatchObject({
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        resumeCursor: { sessionId: "session-rewound" },
+      });
+      expect(binding.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: null,
+      });
+    }
+  });
+
+  it("recovers a stopped persisted session before a requested checkpoint revert", async () => {
+    const harness = await createHarness({
+      hasSession: false,
+      persistedSessionBinding: true,
+    });
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-recovery-diff-1"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-1"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 1,
+      createdAt,
+    });
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-recovery-diff-2"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-2"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 2,
+      createdAt,
+    });
+    await harness.dispatch({
+      type: "thread.checkpoint.revert",
+      commandId: CommandId.make("cmd-recovery-revert"),
+      threadId: ThreadId.make("thread-1"),
+      turnCount: 1,
+      createdAt,
+    });
+
+    await harness.drain();
+
+    expect(harness.provider.recoverSession).toHaveBeenCalledWith(ThreadId.make("thread-1"));
+    expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+  });
+
+  it("does not replay a recovered revert intent after the session owner was replaced", async () => {
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      replacementBeforeRecovery: true,
+    });
+
+    await harness.drain();
+
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v3\n");
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2)),
+    ).toBe(true);
+
+    const binding = await Effect.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value).toMatchObject({
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        resumeCursor: { sessionId: "session-b" },
+      });
+      expect(binding.value.runtimePayload).toEqual({ owner: "b" });
+    }
+  });
+
+  it("does not clear a replacement owner's binding after an in-flight recovered revert", async () => {
+    const rollbackEntered = makeGate();
+    const allowRollback = makeGate();
+    let verifyRollbackOwnership: Effect.Effect<void> = Effect.void;
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      onRollbackConversation: () =>
+        Effect.sync(rollbackEntered.open).pipe(
+          Effect.andThen(Effect.promise(() => allowRollback.promise)),
+          Effect.andThen(Effect.suspend(() => verifyRollbackOwnership)),
+        ),
+    });
+
+    await rollbackEntered.promise;
+    verifyRollbackOwnership = harness.providerSessionDirectory
+      .getBinding(ThreadId.make("thread-1"))
+      .pipe(
+        Effect.tap((binding) =>
+          Effect.sync(() => {
+            expect(Option.isSome(binding)).toBe(true);
+            if (Option.isSome(binding)) {
+              expect(binding.value.sessionLease).toBe(ProviderSessionLease.make("lease-a"));
+            }
+          }),
+        ),
+        Effect.asVoid,
+        Effect.orDie,
+      );
+    const replacement = harness.runtime.runPromise(
+      harness.provider.service.withSessionLifecycleLock(
+        ThreadId.make("thread-1"),
+        harness.providerSessionDirectory.upsert({
+          threadId: ThreadId.make("thread-1"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex-b"),
+          sessionLease: ProviderSessionLease.make("lease-b"),
+          resumeCursor: { sessionId: "session-b" },
+          runtimePayload: { owner: "b" },
+        }),
+      ),
+    );
+    allowRollback.open();
+    await replacement;
+    await harness.drain();
+
+    expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+    const binding = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value).toMatchObject({
+        providerInstanceId: ProviderInstanceId.make("codex-b"),
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        resumeCursor: { sessionId: "session-b" },
+        runtimePayload: { owner: "b" },
       });
     }
   });

@@ -14,6 +14,7 @@ import {
   ProviderDriverKind,
   type ProviderEvent,
   ProviderInstanceId,
+  ProviderSessionLease,
   PROVIDER_APPROVAL_DECISIONS,
   type ProviderRuntimeEvent,
   type ProviderRequestKind,
@@ -35,6 +36,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexErrors from "effect-codex-app-server/errors";
@@ -53,6 +55,12 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import {
+  makeRequireActiveProviderSession,
+  type ProviderAdapterSession,
+  type ProviderThreadRollbackTarget,
+  rollbackTargetMatchesTurnPrefix,
+} from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -62,6 +70,7 @@ import {
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeShape,
+  type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
@@ -73,6 +82,27 @@ const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
 const isCodexResumeCursorSchema = Schema.is(CodexResumeCursorSchema);
 
 const PROVIDER = ProviderDriverKind.make("codex");
+
+const validateCodexRollbackSnapshot = Effect.fn("validateCodexRollbackSnapshot")(function* (
+  snapshot: CodexThreadSnapshot,
+  target: ProviderThreadRollbackTarget,
+) {
+  if (snapshot.turns.length < target.turnIds.length) {
+    return yield* new ProviderAdapterValidationError({
+      provider: PROVIDER,
+      operation: "rollbackThread",
+      issue: `Cannot roll back to ${target.turnIds.length} turns from ${snapshot.turns.length}.`,
+    });
+  }
+  if (!rollbackTargetMatchesTurnPrefix(snapshot.turns, target)) {
+    return yield* new ProviderAdapterValidationError({
+      provider: PROVIDER,
+      operation: "rollbackThread",
+      issue: "Rollback target does not match the current thread history.",
+    });
+  }
+  return snapshot;
+});
 
 export interface CodexAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
@@ -90,6 +120,8 @@ export interface CodexAdapterLiveOptions {
 
 interface CodexAdapterSessionContext {
   readonly threadId: ThreadId;
+  readonly sessionLease: ProviderSessionLease;
+  readonly mutationLock: Semaphore.Semaphore;
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
@@ -1656,6 +1688,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         if (existing && !existing.stopped) {
           yield* Effect.suspend(() => stopSessionInternal(existing));
         }
+        const sessionLease = ProviderSessionLease.make(
+          yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "crypto/randomUUIDv4",
+                  detail: "Failed to generate Codex session lease.",
+                  cause,
+                }),
+            ),
+          ),
+        );
+        const mutationLock = yield* Semaphore.make(1);
 
         const serviceTier =
           input.modelSelection?.instanceId === boundInstanceId
@@ -1731,7 +1777,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               });
               return;
             }
-            yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
+            yield* Queue.offerAll(
+              runtimeEventQueue,
+              runtimeEvents.map((runtimeEvent) => ({
+                ...runtimeEvent,
+                sessionLease,
+              })),
+            );
           }),
         ).pipe(Effect.forkIn(sessionScope));
 
@@ -1756,6 +1808,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
         sessions.set(input.threadId, {
           threadId: input.threadId,
+          sessionLease,
+          mutationLock,
           scope: sessionScope,
           runtime,
           eventFiber,
@@ -1763,7 +1817,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         });
         sessionScopeTransferred = true;
 
-        return started;
+        return {
+          ...started,
+          sessionLease,
+        } satisfies ProviderAdapterSession;
       }),
     );
 
@@ -1815,34 +1872,29 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       input.modelSelection?.instanceId === boundInstanceId
         ? getCodexServiceTierOptionValue(input.modelSelection)
         : undefined;
-    return yield* session.runtime
-      .sendTurn({
-        ...(input.input !== undefined ? { input: input.input } : {}),
-        ...(input.modelSelection?.instanceId === boundInstanceId
-          ? { model: input.modelSelection.model }
-          : {}),
-        ...(reasoningEffort
-          ? {
-              effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
-            }
-          : {}),
-        ...(serviceTier ? { serviceTier } : {}),
-        ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
-        ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
-      })
+    return yield* session.mutationLock
+      .withPermit(
+        session.runtime.sendTurn({
+          ...(input.input !== undefined ? { input: input.input } : {}),
+          ...(input.modelSelection?.instanceId === boundInstanceId
+            ? { model: input.modelSelection.model }
+            : {}),
+          ...(reasoningEffort
+            ? {
+                effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
+              }
+            : {}),
+          ...(serviceTier ? { serviceTier } : {}),
+          ...(input.interactionMode !== undefined
+            ? { interactionMode: input.interactionMode }
+            : {}),
+          ...(codexAttachments.length > 0 ? { attachments: codexAttachments } : {}),
+        }),
+      )
       .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
   });
 
-  const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
-    const session = sessions.get(threadId);
-    if (!session || session.stopped) {
-      return yield* new ProviderAdapterSessionNotFoundError({
-        provider: PROVIDER,
-        threadId,
-      });
-    }
-    return session;
-  });
+  const requireSession = makeRequireActiveProviderSession(sessions, PROVIDER);
 
   const interruptTurn: CodexAdapterShape["interruptTurn"] = (threadId, turnId) =>
     requireSession(threadId).pipe(
@@ -1871,19 +1923,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const rollbackThread: CodexAdapterShape["rollbackThread"] = (threadId, target) => {
     return requireSession(threadId).pipe(
       Effect.flatMap((session) =>
-        Effect.gen(function* () {
-          const snapshot = yield* session.runtime.readThread;
-          if (snapshot.turns.length < target.turnIds.length) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "rollbackThread",
-              issue: `Cannot roll back to ${target.turnIds.length} turns from ${snapshot.turns.length}.`,
-            });
-          }
-          return snapshot.turns.length === target.turnIds.length
-            ? snapshot
-            : yield* session.runtime.rollbackThread(snapshot.turns.length - target.turnIds.length);
-        }),
+        session.mutationLock.withPermit(
+          Effect.gen(function* () {
+            const snapshot = yield* validateCodexRollbackSnapshot(
+              yield* session.runtime.readThread,
+              target,
+            );
+            return snapshot.turns.length === target.turnIds.length
+              ? snapshot
+              : yield* session.runtime.rollbackThread(
+                  snapshot.turns.length - target.turnIds.length,
+                );
+          }),
+        ),
       ),
       Effect.mapError((cause) =>
         cause._tag === "ProviderAdapterSessionNotFoundError" ||
@@ -1965,7 +2017,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
       Array.from(sessions.values()).filter((session) => !session.stopped),
-      (session) => session.runtime.getSession,
+      (session) =>
+        session.runtime.getSession.pipe(
+          Effect.map(
+            (providerSession) =>
+              ({
+                ...providerSession,
+                sessionLease: session.sessionLease,
+              }) satisfies ProviderAdapterSession,
+          ),
+        ),
       { concurrency: 1 },
     );
 

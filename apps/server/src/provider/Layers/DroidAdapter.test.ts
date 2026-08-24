@@ -38,7 +38,7 @@ it("derives Droid approval capabilities without escalating one-shot approval", (
   const options = [
     { label: "Always allow", outcome: "proceed_always" },
     { label: "Cancel", outcome: "cancel" },
-  ];
+  ] as const;
 
   assert.deepEqual(droidSupportedApprovalDecisions(options), [
     "acceptForSession",
@@ -257,6 +257,12 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "completed");
+      assert.equal(terminal.sessionLease, session.sessionLease);
+      assert.isTrue(
+        turnEvents
+          .filter((event) => event.type !== "turn.started" && event.type !== "turn.completed")
+          .every((event) => event.sessionLease === undefined),
+      );
 
       const usage = threadEvents.find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
@@ -663,6 +669,48 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("rejects Droid permissions with no supported decision before opening a request", () =>
+    Effect.forEach(["empty", "unknown"] as const, (permissionOptionsMode) =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make(`droid-permission-${permissionOptionsMode}`);
+        const { adapter, readDebugState } = yield* makeDroidScenario({
+          T3_DROID_MOCK_REQUEST_PERMISSION: "1",
+          T3_DROID_MOCK_PERMISSION_OPTIONS: permissionOptionsMode,
+        });
+        const firstApprovalOutcome =
+          yield* Deferred.make<
+            Extract<ProviderRuntimeEvent, { type: "request.opened" | "turn.completed" }>
+          >();
+        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+          if (
+            String(event.threadId) !== String(threadId) ||
+            (event.type !== "request.opened" && event.type !== "turn.completed")
+          ) {
+            return Effect.void;
+          }
+          return Deferred.succeed(firstApprovalOutcome, event).pipe(Effect.ignore);
+        }).pipe(Effect.forkChild);
+
+        yield* startDroidSession(adapter, threadId, "approval-required");
+        yield* adapter.sendTurn({
+          threadId,
+          input: `reject ${permissionOptionsMode} permission options`,
+          attachments: [],
+        });
+
+        const outcome = yield* Deferred.await(firstApprovalOutcome);
+        assert.equal(outcome.type, "turn.completed");
+        if (outcome.type === "turn.completed") {
+          assert.equal(outcome.payload.state, "failed");
+        }
+        const debugState = yield* readDebugState(threadId);
+        assert.equal(debugState.pendingApprovalCount, 0);
+
+        yield* Fiber.interrupt(runtimeEventsFiber);
+      }),
+    ).pipe(Effect.asVoid),
+  );
+
   it.effect("rejects a concurrent duplicate Droid permission response", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-response-race");
@@ -723,6 +771,49 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("bounds concurrent Droid permission handlers while responses are withheld", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-permission-handler-bound");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-permission-handler-bound-")),
+      );
+      const floodReadyFile = NodePath.join(coordinationDir, "flood-ready");
+      const { adapter, readDebugState } = yield* makeDroidScenario({
+        T3_DROID_MOCK_PERMISSION_FLOOD_COUNT: "24",
+        T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE: floodReadyFile,
+      });
+      const streamReady = yield* Deferred.make<void>();
+      const requestOpened = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.unwrap(
+        Deferred.succeed(streamReady, undefined).pipe(Effect.as(adapter.streamEvents)),
+      ).pipe(
+        Stream.runForEach((event) =>
+          event.type === "request.opened" && String(event.threadId) === String(threadId)
+            ? Deferred.succeed(requestOpened, undefined).pipe(Effect.ignore)
+            : Effect.void,
+        ),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(streamReady);
+
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      yield* adapter.sendTurn({
+        threadId,
+        input: "flood permission requests",
+        attachments: [],
+      });
+      yield* Effect.promise(() => waitForFile(floodReadyFile));
+      yield* Deferred.await(requestOpened);
+
+      const debugState = yield* readDebugState(threadId);
+      assert.isAtMost(debugState.pendingApprovalCount, 16);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
 
@@ -1270,7 +1361,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           turnIds: [nextTurn.turnId, TurnId.make("missing-turn")],
         }),
       );
-      assert.equal(tooDeep._tag, "ProviderAdapterRequestError");
+      assert.equal(tooDeep._tag, "ProviderAdapterValidationError");
+      if (tooDeep._tag === "ProviderAdapterValidationError") {
+        assert.equal(tooDeep.issue, "Rollback target does not match the current thread history.");
+      }
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);

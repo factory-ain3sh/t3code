@@ -7,6 +7,7 @@ import {
   NonNegativeInt,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
   type ProjectId,
   ThreadId,
   TurnId,
@@ -63,6 +64,7 @@ const CheckpointRevertIntent = Schema.Struct({
   threadId: ThreadId,
   provider: ProviderDriverKind,
   providerInstanceId: ProviderInstanceId,
+  sessionLease: ProviderSessionLease,
   cwd: Schema.String,
   turnCount: NonNegativeInt,
   turnIds: Schema.Array(TurnId),
@@ -194,24 +196,27 @@ const make = Effect.gen(function* () {
 
   const resolveSessionRuntimeForThread = Effect.fn("resolveSessionRuntimeForThread")(function* (
     threadId: ThreadId,
-  ): Effect.fn.Return<
-    Option.Option<{
-      readonly threadId: ThreadId;
-      readonly provider: ProviderDriverKind;
-      readonly providerInstanceId: ProviderInstanceId;
-      readonly cwd: string;
-    }>
-  > {
+  ) {
     const sessions = yield* providerService.listSessions();
     const session = sessions.find((entry) => entry.threadId === threadId);
-    return session?.cwd && session.providerInstanceId
-      ? Option.some({
-          threadId: session.threadId,
-          provider: session.provider,
-          providerInstanceId: session.providerInstanceId,
-          cwd: session.cwd,
-        })
-      : Option.none();
+    if (!session?.cwd || !session.providerInstanceId) {
+      return Option.none();
+    }
+    const binding = Option.getOrUndefined(yield* providerSessionDirectory.getBinding(threadId));
+    if (
+      binding?.providerInstanceId !== session.providerInstanceId ||
+      binding.sessionLease === null ||
+      binding.sessionLease === undefined
+    ) {
+      return Option.none();
+    }
+    return Option.some({
+      threadId: session.threadId,
+      provider: session.provider,
+      providerInstanceId: session.providerInstanceId,
+      sessionLease: binding.sessionLease,
+      cwd: session.cwd,
+    });
   });
 
   const resolveThreadDetail = Effect.fn("resolveThreadDetail")(function* (threadId: ThreadId) {
@@ -240,7 +245,7 @@ const make = Effect.gen(function* () {
     readonly thread: { readonly projectId: ProjectId; readonly worktreePath: string | null };
     readonly projects: ReadonlyArray<{ readonly id: ProjectId; readonly workspaceRoot: string }>;
     readonly preferSessionRuntime: boolean;
-  }): Effect.fn.Return<string | undefined> {
+  }) {
     const fromSession = yield* resolveSessionRuntimeForThread(input.threadId);
     const fromThread = resolveThreadWorkspaceCwd({
       thread: input.thread,
@@ -740,25 +745,60 @@ const make = Effect.gen(function* () {
   });
 
   const persistCheckpointRevertIntent = (intent: CheckpointRevertIntent) =>
-    providerSessionDirectory.upsert({
+    providerSessionDirectory.updateRuntimePayloadIfOwned({
       threadId: intent.threadId,
-      provider: intent.provider,
       providerInstanceId: intent.providerInstanceId,
+      sessionLease: intent.sessionLease,
       runtimePayload: { checkpointRevertIntent: intent },
     });
 
   const clearCheckpointRevertIntent = (intent: CheckpointRevertIntent, resumeCursor?: unknown) =>
-    providerSessionDirectory.upsert({
-      threadId: intent.threadId,
-      provider: intent.provider,
-      providerInstanceId: intent.providerInstanceId,
-      ...(resumeCursor !== undefined ? { resumeCursor } : {}),
-      runtimePayload: { checkpointRevertIntent: null },
-    });
+    providerSessionDirectory.getBinding(intent.threadId).pipe(
+      Effect.map(Option.getOrUndefined),
+      Effect.flatMap((binding) => {
+        if (
+          binding?.providerInstanceId !== intent.providerInstanceId ||
+          binding.sessionLease === null ||
+          binding.sessionLease === undefined
+        ) {
+          return Effect.succeed(false);
+        }
+        const providerInstanceId = binding.providerInstanceId;
+        const sessionLease = binding.sessionLease;
+        return providerSessionDirectory
+          .updateRuntimePayloadIfOwned({
+            threadId: intent.threadId,
+            providerInstanceId,
+            sessionLease,
+            runtimePayload: { checkpointRevertIntent: null },
+          })
+          .pipe(
+            Effect.flatMap((cleared) =>
+              resumeCursor !== undefined
+                ? providerSessionDirectory.updateResumeCursorIfOwned({
+                    threadId: intent.threadId,
+                    providerInstanceId,
+                    sessionLease,
+                    resumeCursor,
+                  })
+                : Effect.succeed(cleared),
+            ),
+          );
+      }),
+    );
 
-  const executeCheckpointRevert = Effect.fn("executeCheckpointRevert")(function* (
+  const executeCheckpointRevertUnlocked = Effect.fn("executeCheckpointRevertUnlocked")(function* (
     intent: CheckpointRevertIntent,
   ) {
+    const binding = Option.getOrUndefined(
+      yield* providerSessionDirectory.getBinding(intent.threadId),
+    );
+    if (
+      binding?.providerInstanceId !== intent.providerInstanceId ||
+      binding.sessionLease !== intent.sessionLease
+    ) {
+      return;
+    }
     const restored = yield* checkpointStore.restoreCheckpoint({
       cwd: intent.cwd,
       checkpointRef: intent.checkpointRef,
@@ -803,6 +843,15 @@ const make = Effect.gen(function* () {
     yield* clearCheckpointRevertIntent(intent, snapshot.resumeCursor);
   });
 
+  const executeCheckpointRevert = Effect.fn("executeCheckpointRevert")(function* (
+    intent: CheckpointRevertIntent,
+  ) {
+    yield* providerService.withSessionLifecycleLock(
+      intent.threadId,
+      executeCheckpointRevertUnlocked(intent),
+    );
+  });
+
   const handleRevertRequested = Effect.fn("handleRevertRequested")(function* (
     event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
   ) {
@@ -819,7 +868,11 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
+    let sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
+    if (Option.isNone(sessionRuntime)) {
+      yield* providerService.recoverSession(event.payload.threadId);
+      sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
+    }
     if (Option.isNone(sessionRuntime)) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
@@ -896,6 +949,7 @@ const make = Effect.gen(function* () {
       threadId: event.payload.threadId,
       provider: sessionRuntime.value.provider,
       providerInstanceId: sessionRuntime.value.providerInstanceId,
+      sessionLease: sessionRuntime.value.sessionLease,
       cwd: sessionRuntime.value.cwd,
       turnCount: event.payload.turnCount,
       turnIds: orderedCheckpoints
@@ -907,7 +961,10 @@ const make = Effect.gen(function* () {
       createdAt: now,
     };
 
-    yield* persistCheckpointRevertIntent(intent);
+    const persisted = yield* persistCheckpointRevertIntent(intent);
+    if (!persisted) {
+      return;
+    }
     yield* executeCheckpointRevert(intent);
   });
 
@@ -957,6 +1014,18 @@ const make = Effect.gen(function* () {
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
+    if (event.sessionLease !== undefined) {
+      const binding = Option.getOrUndefined(
+        yield* providerSessionDirectory.getBinding(event.threadId),
+      );
+      if (
+        binding?.sessionLease !== event.sessionLease ||
+        (event.providerInstanceId !== undefined &&
+          binding.providerInstanceId !== event.providerInstanceId)
+      ) {
+        return;
+      }
+    }
     if (event.type === "turn.started") {
       yield* ensurePreTurnBaselineFromTurnStart(event);
       return;

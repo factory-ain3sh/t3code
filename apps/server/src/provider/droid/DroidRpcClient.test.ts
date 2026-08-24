@@ -174,6 +174,56 @@ it.effect("rejects JSON-RPC envelopes without a supported type discriminator", (
   );
 });
 
+it.effect("rejects JSON-RPC envelopes with invalid id shapes", () => {
+  const logs: CapturedLog[] = [];
+  return withCapturedLogs(
+    logs,
+    Effect.gen(function* () {
+      const script = `
+        process.stdin.setEncoding("utf8");
+        process.stdin.once("data", (chunk) => {
+          const request = JSON.parse(chunk.split("\\n")[0]);
+          const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+          for (const id of [true, { nested: true }, ["array"]]) {
+            write({
+              jsonrpc: "2.0",
+              type: "response",
+              id,
+              result: { accepted: false }
+            });
+          }
+          write({
+            jsonrpc: "2.0",
+            type: "response",
+            id: request.id,
+            result: { accepted: true }
+          });
+        });
+        process.stdin.resume();
+      `;
+      const client = yield* makeDroidRpcClient({
+        command: process.execPath,
+        args: ["-e", script],
+      });
+
+      const result = yield* client.request("droid.list_models", {}, { timeoutMs: 500 });
+      assert.deepStrictEqual(result, { accepted: true });
+      assert.deepStrictEqual(
+        logs
+          .map((log) => log.message[0])
+          .filter((message) => String(message).includes("JSON-RPC id must")),
+        Array.from(
+          { length: 3 },
+          () =>
+            "Unable to parse Droid JSON-RPC line: JSON-RPC id must be a string, number, null, or absent",
+        ),
+      );
+
+      yield* within(client.shutdown, "client shutdown did not complete");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+  );
+});
+
 it.effect("correlates RPCs, decodes notifications, handles server requests, and detects exit", () =>
   Effect.gen(function* () {
     const client = yield* makeDroidRpcClient({
@@ -377,6 +427,415 @@ it.effect("preserves optional notification and server-request session envelopes"
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 
+it.effect("echoes numeric server-request ids without coercing them to strings", () =>
+  Effect.gen(function* () {
+    const script = `
+      const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+      write({
+        jsonrpc: "2.0",
+        type: "request",
+        id: 42,
+        method: "droid.ask_user",
+        params: {
+          toolCallId: "ask-numeric-id",
+          questions: [{
+            index: 0,
+            topic: "Scope",
+            question: "Which scope?",
+            options: ["workspace"]
+          }]
+        }
+      });
+      process.stdin.setEncoding("utf8");
+      process.stdin.once("data", (chunk) => {
+        const response = JSON.parse(chunk.split("\\n")[0]);
+        write({
+          jsonrpc: "2.0",
+          type: "notification",
+          method: "droid.session_notification",
+          params: {
+            notification: {
+              type: "assistant_text_delta",
+              messageId: "numeric-id",
+              textDelta: typeof response.id + ":" + response.id
+            }
+          }
+        });
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const request = yield* within(
+      Stream.runHead(client.serverRequests),
+      "numeric-id server request did not arrive",
+    );
+    assert.isTrue(Option.isSome(request));
+    if (Option.isSome(request)) {
+      assert.equal(request.value.id, 42);
+      yield* request.value.respond({
+        answers: [{ index: 0, question: "Which scope?", answer: "workspace" }],
+      });
+    }
+
+    const notification = yield* within(
+      Stream.runHead(client.notifications),
+      "numeric-id response was not observed",
+    );
+    assert.isTrue(Option.isSome(notification));
+    if (
+      Option.isSome(notification) &&
+      notification.value.notification.type === "assistant_text_delta"
+    ) {
+      assert.equal(notification.value.notification.textDelta, "number:42");
+    }
+
+    yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("does not correlate numeric responses with string request ids", () =>
+  Effect.gen(function* () {
+    const script = `
+      process.stdin.setEncoding("utf8");
+      process.stdin.once("data", (chunk) => {
+        const request = JSON.parse(chunk.split("\\n")[0]);
+        process.stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          type: "response",
+          id: Number(request.id),
+          result: { correlated: "numeric" }
+        }) + "\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0",
+            type: "response",
+            id: request.id,
+            result: { correlated: "string" }
+          }) + "\\n");
+        }, 10);
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const result = yield* client.request("droid.list_models", {}, { timeoutMs: 500 });
+    assert.deepStrictEqual(result, { correlated: "string" });
+
+    yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("allows an error fallback after a server response fails to encode", () =>
+  Effect.gen(function* () {
+    const script = `
+      const write = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+      write({
+        jsonrpc: "2.0",
+        type: "request",
+        id: "retry-response",
+        method: "droid.ask_user",
+        params: {
+          toolCallId: "ask-retry",
+          questions: [{
+            index: 0,
+            topic: "Scope",
+            question: "Which scope?",
+            options: ["workspace"]
+          }]
+        }
+      });
+      process.stdin.setEncoding("utf8");
+      process.stdin.once("data", (chunk) => {
+        const response = JSON.parse(chunk.split("\\n")[0]);
+        write({
+          jsonrpc: "2.0",
+          type: "notification",
+          method: "droid.session_notification",
+          params: {
+            notification: {
+              type: "assistant_text_delta",
+              messageId: "retry-response",
+              textDelta: response.error.code + ":" + response.error.message
+            }
+          }
+        });
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const request = yield* within(
+      Stream.runHead(client.serverRequests),
+      "retryable server request did not arrive",
+    );
+    assert.isTrue(Option.isSome(request));
+    if (Option.isSome(request)) {
+      const cyclic: { self?: unknown } = {};
+      cyclic.self = cyclic;
+      const failedResponse = yield* Effect.result(request.value.respond(cyclic));
+      assert.equal(failedResponse._tag, "Failure");
+      if (failedResponse._tag === "Failure") {
+        assert.equal(failedResponse.failure.kind, "encode");
+      }
+      yield* request.value.fail(-32603, "response encoding failed");
+    }
+
+    const notification = yield* within(
+      Stream.runHead(client.notifications),
+      "fallback server response was not observed",
+    );
+    assert.isTrue(Option.isSome(notification));
+    if (
+      Option.isSome(notification) &&
+      notification.value.notification.type === "assistant_text_delta"
+    ) {
+      assert.equal(notification.value.notification.textDelta, "-32603:response encoding failed");
+    }
+
+    yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("preserves terminal notifications when tool progress delivery is saturated", () =>
+  Effect.gen(function* () {
+    const script = `
+      process.stdin.setEncoding("utf8");
+      process.stdin.once("data", (chunk) => {
+        const request = JSON.parse(chunk.split("\\n")[0]);
+        const notifications = Array.from({ length: 128 }, (_, index) => ({
+          jsonrpc: "2.0",
+          type: "notification",
+          method: "droid.session_notification",
+          params: {
+            notification: {
+              type: "tool_progress_update",
+              toolUseId: "queued-" + index,
+              toolName: "Task",
+              update: {
+                type: "status",
+                status: "running",
+                text: String(index)
+              }
+            }
+          }
+        }));
+        notifications.push({
+          jsonrpc: "2.0",
+          type: "notification",
+          method: "droid.session_notification",
+          params: {
+            notification: {
+              type: "agent_turn_completed",
+              reason: "completed",
+              turnId: "turn-saturated",
+              tokenUsage: {
+                inputTokens: 1,
+                outputTokens: 2,
+                cacheCreationTokens: 0,
+                cacheReadTokens: 0,
+                thinkingTokens: 0
+              }
+            }
+          }
+        });
+        const response = {
+          jsonrpc: "2.0",
+          type: "response",
+          id: request.id,
+          result: { queueSaturated: true }
+        };
+        process.stdout.write(
+          [...notifications, response].map((message) => JSON.stringify(message)).join("\\n") + "\\n"
+        );
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const result = yield* client.request("droid.list_models", {}, { timeoutMs: 500 });
+    assert.deepStrictEqual(result, { queueSaturated: true });
+
+    const notifications = yield* within(
+      Stream.runCollect(client.notifications.pipe(Stream.take(64))),
+      "reserved terminal notification was not delivered",
+    );
+    assert.equal(notifications.length, 64);
+    assert.equal(notifications[63]?.notification.type, "agent_turn_completed");
+
+    yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("backpressures text deltas without terminating the transport", () =>
+  Effect.gen(function* () {
+    const script = `
+      process.stdin.setEncoding("utf8");
+      let input = "";
+      let requestCount = 0;
+      process.stdin.on("data", (chunk) => {
+        input += chunk;
+        const lines = input.split("\\n");
+        input = lines.pop();
+        for (const line of lines) {
+          if (!line) continue;
+          const request = JSON.parse(line);
+          requestCount += 1;
+          if (requestCount === 1) {
+            const notifications = Array.from({ length: 65 }, (_, index) => ({
+              jsonrpc: "2.0",
+              type: "notification",
+              method: "droid.session_notification",
+              params: {
+                notification: {
+                  type: "assistant_text_delta",
+                  messageId: "message-" + index,
+                  textDelta: String(index)
+                }
+              }
+            }));
+            const response = {
+              jsonrpc: "2.0",
+              type: "response",
+              id: request.id,
+              result: { queueSaturated: true }
+            };
+            process.stdout.write(
+              [...notifications, response].map((message) => JSON.stringify(message)).join("\\n") + "\\n"
+            );
+            continue;
+          }
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0",
+            type: "response",
+            id: request.id,
+            result: { transportAlive: true }
+          }) + "\\n");
+        }
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const saturated = yield* Effect.result(
+      client.request("droid.list_models", {}, { timeoutMs: 50 }),
+    );
+    assert.equal(saturated._tag, "Failure");
+    if (saturated._tag === "Failure") {
+      assert.equal(saturated.failure.kind, "timeout");
+    }
+
+    const notifications = yield* within(
+      Stream.runCollect(client.notifications.pipe(Stream.take(65))),
+      "backpressured text deltas were not delivered",
+    );
+    assert.equal(notifications.length, 65);
+    assert.isTrue(
+      notifications.every(
+        (notification) => notification.notification.type === "assistant_text_delta",
+      ),
+    );
+
+    const result = yield* client.request("droid.list_models", {}, { timeoutMs: 500 });
+    assert.deepStrictEqual(result, { transportAlive: true });
+
+    yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("backpressures server-request delivery without terminating the transport", () =>
+  Effect.gen(function* () {
+    const script = `
+      process.stdin.setEncoding("utf8");
+      let input = "";
+      let requestCount = 0;
+      process.stdin.on("data", (chunk) => {
+        input += chunk;
+        const lines = input.split("\\n");
+        input = lines.pop();
+        for (const line of lines) {
+          if (!line) continue;
+          const request = JSON.parse(line);
+          requestCount += 1;
+          if (requestCount === 1) {
+            const serverRequests = Array.from({ length: 17 }, (_, index) => ({
+              jsonrpc: "2.0",
+              type: "request",
+              id: "queued-request-" + index,
+              method: "droid.ask_user",
+              params: {
+                toolCallId: "ask-" + index,
+                questions: [{
+                  index: 0,
+                  topic: "Scope",
+                  question: "Which scope?",
+                  options: ["workspace"]
+                }]
+              }
+            }));
+            const response = {
+              jsonrpc: "2.0",
+              type: "response",
+              id: request.id,
+              result: { queueSaturated: true }
+            };
+            process.stdout.write(
+              [...serverRequests, response].map((message) => JSON.stringify(message)).join("\\n") + "\\n"
+            );
+            continue;
+          }
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0",
+            type: "response",
+            id: request.id,
+            result: { transportAlive: true }
+          }) + "\\n");
+        }
+      });
+      process.stdin.resume();
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    const saturated = yield* Effect.result(
+      client.request("droid.list_models", {}, { timeoutMs: 50 }),
+    );
+    assert.equal(saturated._tag, "Failure");
+    if (saturated._tag === "Failure") {
+      assert.equal(saturated.failure.kind, "timeout");
+    }
+
+    const serverRequests = yield* within(
+      Stream.runCollect(client.serverRequests.pipe(Stream.take(17))),
+      "backpressured server requests were not delivered",
+    );
+    assert.equal(serverRequests.length, 17);
+    assert.isTrue(serverRequests.every((request) => request.method === "droid.ask_user"));
+
+    const result = yield* client.request("droid.list_models", {}, { timeoutMs: 500 });
+    assert.deepStrictEqual(result, { transportAlive: true });
+
+    yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
 it.effect("fails registration after exit and ends every public stream", () =>
   Effect.gen(function* () {
     const client = yield* makeDroidRpcClient({
@@ -429,6 +888,34 @@ it.effect("terminates the transport when stdout closes before the process exits"
       assert.equal(requestResult.failure.kind, "process-exit");
       assert.deepStrictEqual(requestResult.failure.data, exit);
     }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("times out requests blocked by outbound backpressure", () =>
+  Effect.gen(function* () {
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1_000)"],
+    });
+    const largePayload = { text: "x".repeat(1024 * 1024) };
+
+    const results = yield* Effect.all(
+      Array.from({ length: 8 }, () =>
+        Effect.result(client.request("droid.blocked_write", largePayload, { timeoutMs: 20 })),
+      ),
+      { concurrency: "unbounded" },
+    ).pipe(Effect.timeoutOption("1 second"));
+
+    assert.isTrue(Option.isSome(results));
+    if (Option.isSome(results)) {
+      assert.isTrue(
+        results.value.every(
+          (result) => result._tag === "Failure" && result.failure.kind === "timeout",
+        ),
+      );
+    }
+
+    yield* within(client.shutdown, "client shutdown did not complete");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 

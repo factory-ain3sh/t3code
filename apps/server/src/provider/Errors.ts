@@ -2,10 +2,6 @@ import * as Schema from "effect/Schema";
 
 import type { CheckpointServiceError } from "../checkpointing/Errors.ts";
 
-function formatDefect(cause: unknown): string {
-  return cause instanceof Error && cause.message.trim().length > 0 ? cause.message : String(cause);
-}
-
 /**
  * ProviderAdapterValidationError - Invalid adapter API input.
  */
@@ -156,8 +152,7 @@ export class ProviderDriverError extends Schema.TaggedErrorClass<ProviderDriverE
   },
 ) {
   override get message(): string {
-    const causeDetail = this.cause === undefined ? "" : ` Cause: ${formatDefect(this.cause)}`;
-    return `Provider driver '${this.driver}' failed to create instance '${this.instanceId}': ${this.detail}${causeDetail}`;
+    return `Provider driver '${this.driver}' failed to create instance '${this.instanceId}': ${this.detail}`;
   }
 }
 

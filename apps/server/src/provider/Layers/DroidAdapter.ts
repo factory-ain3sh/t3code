@@ -9,6 +9,7 @@ import {
   type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
@@ -29,9 +30,7 @@ import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -40,7 +39,6 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
-  ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import {
@@ -55,23 +53,26 @@ import {
   type DroidToolUse,
 } from "../droid/DroidProtocol.ts";
 import {
-  makeDroidRpcClient,
+  DROID_SERVER_REQUEST_CONCURRENCY,
+  makeDroidExecRpcClient,
   type DroidRpcClient,
   type DroidServerRequest,
 } from "../droid/DroidRpcClient.ts";
 import { type DroidAdapterShape } from "../Services/DroidAdapter.ts";
+import {
+  makeRequireActiveProviderSession,
+  makeKeyedLock,
+  parseVersionedSessionResumeCursor,
+  type ProviderAdapterSession,
+  rollbackTargetMatchesTurnPrefix,
+} from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 
 const PROVIDER = ProviderDriverKind.make("droid");
 const DROID_RESUME_VERSION = 1 as const;
 const SESSION_INIT_TIMEOUT_MS = 75_000;
-
-const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
-
-function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
-  const result = encodeUnknownJsonStringExit(input);
-  return Exit.isSuccess(result) ? result.value : undefined;
-}
+const DROID_RUNTIME_EVENT_CAPACITY = 256;
 
 export interface DroidAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -84,13 +85,10 @@ export interface DroidAdapterLiveOptions {
       readonly threadLockCount: number;
       readonly threadLockReferenceCount: number;
       readonly interruptedTurnCount: number;
+      readonly pendingApprovalCount: number;
+      readonly pendingUserInputCount: number;
     }>,
   ) => void;
-}
-
-interface ThreadLockEntry {
-  readonly semaphore: Semaphore.Semaphore;
-  readonly references: number;
 }
 
 interface PendingApproval {
@@ -110,13 +108,12 @@ interface DroidSessionContext {
   readonly threadId: ThreadId;
   /** Mutable: rewind/compact mint a successor session id. */
   droidSessionId: string;
-  session: ProviderSession;
+  session: ProviderAdapterSession;
   readonly scope: Scope.Closeable;
   readonly rpc: DroidRpcClient;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
-  activeTurnId: TurnId | undefined;
   /** Turns already interrupted; late completions must not resurrect them. */
   readonly interruptedTurnIds: Set<TurnId>;
   /** Explicit rewind anchors already applied by this live process. */
@@ -346,13 +343,6 @@ export function droidTurnOutcomeForReason(reason: string | undefined): DroidTurn
   }
 }
 
-export function parseDroidResume(raw: unknown): { sessionId: string } | undefined {
-  if (!Predicate.isObject(raw)) return undefined;
-  if (raw.schemaVersion !== DROID_RESUME_VERSION) return undefined;
-  if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
-  return { sessionId: raw.sessionId.trim() };
-}
-
 function settlePendingApprovalsAsCancelled(
   pendingApprovals: ReadonlyMap<ApprovalRequestId, PendingApproval>,
 ): Effect.Effect<void> {
@@ -397,17 +387,23 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     // threads whose startSession is still in flight (not yet in `sessions`).
     let closing = false;
     const startingThreads = new Map<ThreadId, number>();
-    const threadLocksRef = yield* SynchronizedRef.make(new Map<ThreadId, ThreadLockEntry>());
+    const threadLocks = yield* makeKeyedLock<ThreadId>({
+      retain: (threadId) => sessions.has(threadId),
+    });
     options?.registerDebugStateReader?.((threadId) =>
-      SynchronizedRef.get(threadLocksRef).pipe(
-        Effect.map((locks) => ({
-          threadLockCount: locks.size,
-          threadLockReferenceCount: locks.get(threadId)?.references ?? 0,
+      threadLocks.inspect(threadId).pipe(
+        Effect.map((lockState) => ({
+          threadLockCount: lockState.keyCount,
+          threadLockReferenceCount: lockState.references,
           interruptedTurnCount: sessions.get(threadId)?.interruptedTurnIds.size ?? 0,
+          pendingApprovalCount: sessions.get(threadId)?.pendingApprovals.size ?? 0,
+          pendingUserInputCount: sessions.get(threadId)?.pendingUserInputs.size ?? 0,
         })),
       ),
     );
-    const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+    const runtimeEventPubSub = yield* PubSub.bounded<ProviderRuntimeEvent>(
+      DROID_RUNTIME_EVENT_CAPACITY,
+    );
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -427,42 +423,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
 
-    const acquireThreadSemaphore = (threadId: ThreadId) =>
-      SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
-        const existing = current.get(threadId);
-        if (existing !== undefined) {
-          const next = new Map(current);
-          next.set(threadId, { ...existing, references: existing.references + 1 });
-          return Effect.succeed([existing.semaphore, next] as const);
-        }
-        return Semaphore.make(1).pipe(
-          Effect.map((semaphore) => {
-            const next = new Map(current);
-            next.set(threadId, { semaphore, references: 1 });
-            return [semaphore, next] as const;
-          }),
-        );
-      });
-
-    const releaseThreadSemaphore = (threadId: ThreadId) =>
-      SynchronizedRef.update(threadLocksRef, (current) => {
-        const existing = current.get(threadId);
-        if (existing === undefined) return current;
-        const next = new Map(current);
-        if (existing.references === 1 && !sessions.has(threadId)) {
-          next.delete(threadId);
-        } else {
-          next.set(threadId, { ...existing, references: existing.references - 1 });
-        }
-        return next;
-      });
-
     const withThreadLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
-      Effect.acquireUseRelease(
-        acquireThreadSemaphore(threadId),
-        (semaphore) => semaphore.withPermit(effect),
-        () => releaseThreadSemaphore(threadId),
-      );
+      threadLocks.withLock(threadId, effect);
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
       Effect.gen(function* () {
@@ -493,17 +455,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         ),
       );
 
-    const requireSession = (
-      threadId: ThreadId,
-    ): Effect.Effect<DroidSessionContext, ProviderAdapterSessionNotFoundError> => {
-      const ctx = sessions.get(threadId);
-      if (!ctx || ctx.stopped) {
-        return Effect.fail(
-          new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }),
-        );
-      }
-      return Effect.succeed(ctx);
-    };
+    const requireSession = makeRequireActiveProviderSession(sessions, PROVIDER);
 
     const requestViaRpc = (
       ctx: DroidSessionContext,
@@ -651,7 +603,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   ...stamp,
                   provider: PROVIDER,
                   threadId: ctx.threadId,
-                  turnId: ctx.activeTurnId ?? ctx.session.activeTurnId,
+                  turnId: ctx.session.activeTurnId,
                   payload: {
                     taskId: RuntimeTaskId.make(sessionId),
                     status: "stopped",
@@ -678,7 +630,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           ctx.interruptedTurnIds.delete(turnId);
           return;
         }
-        if (ctx.activeTurnId !== turnId && ctx.session.activeTurnId !== turnId) {
+        if (ctx.session.activeTurnId !== turnId) {
           // Late cancelled terminal for an already-settled turn retires its mark.
           if (outcome.state === "cancelled") ctx.interruptedTurnIds.delete(turnId);
           return;
@@ -689,13 +641,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         ctx.persistedPendingTurnMessageIds.clear();
         ctx.specSuccessorSessionId = undefined;
         ctx.specHandoffApproved = false;
-        ctx.activeTurnId = undefined;
+        const updatedAt = yield* nowIso;
         const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-        ctx.session = { ...readySession, status: "ready", updatedAt: yield* nowIso };
+        ctx.session = { ...readySession, status: "ready", updatedAt };
         yield* offerRuntimeEvent({
           type: "turn.completed",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
+          sessionLease: ctx.session.sessionLease,
           threadId: ctx.threadId,
           turnId,
           payload:
@@ -726,7 +679,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         Effect.gen(function* () {
           const live = sessions.get(ctx.threadId);
           if (!live || live.stopped || live.droidSessionId !== ctx.droidSessionId) return;
-          const turnId = live.activeTurnId ?? live.session.activeTurnId;
+          const turnId = live.session.activeTurnId;
           yield* emitTokenUsage(
             live,
             notification.cumulativeTokenUsage ?? notification.tokenUsage,
@@ -792,7 +745,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
+            turnId: ctx.session.activeTurnId,
             payload: {
               taskId: RuntimeTaskId.make(notification.childSessionId),
               description,
@@ -827,7 +780,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
+            turnId: ctx.session.activeTurnId,
             payload: { message: notification.message, class: "provider_error" },
           });
           return;
@@ -838,7 +791,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
+            turnId: ctx.session.activeTurnId,
             payload: {
               message: `Droid is retrying the model request (attempt ${notification.attempt}).`,
             },
@@ -862,7 +815,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
 
         // Everything below streams inside a turn; drop stragglers with no
         // active turn or an interrupted one (Grok precedent).
-        const turnId = ctx.activeTurnId;
+        const turnId = ctx.session.activeTurnId;
         if (turnId === undefined || ctx.interruptedTurnIds.has(turnId)) return;
 
         switch (notification.type) {
@@ -998,7 +951,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: ctx.threadId,
-            turnId: ctx.activeTurnId,
+            turnId: ctx.session.activeTurnId,
             payload: {
               taskId: RuntimeTaskId.make(sessionId),
               status:
@@ -1026,13 +979,17 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       Effect.gen(function* () {
         const params = request.params;
         yield* logNative(ctx.threadId, "droid.request_permission", request.rawParams);
+        const supportedDecisions = droidSupportedApprovalDecisions(params.options);
+        if (supportedDecisions.length === 0) {
+          yield* request.fail(-32602, "Droid permission request has no supported decisions");
+          return;
+        }
         const primaryToolUse = params.toolUses[0];
         if (primaryToolUse) rememberToolUse(ctx, primaryToolUse.toolUse);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
-        const turnId = ctx.activeTurnId;
-        const supportedDecisions = droidSupportedApprovalDecisions(params.options);
+        const turnId = ctx.session.activeTurnId;
         ctx.pendingApprovals.set(requestId, { decision, supportedDecisions });
         const requestType = droidCanonicalRequestType(primaryToolUse?.details.type);
         yield* offerRuntimeEvent({
@@ -1103,7 +1060,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const resolution = yield* Deferred.make<PendingUserInputResolution>();
-        const turnId = ctx.activeTurnId;
+        const turnId = ctx.session.activeTurnId;
         ctx.pendingUserInputs.set(requestId, { resolution });
         yield* offerRuntimeEvent({
           type: "user-input.requested",
@@ -1159,9 +1116,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         }
         return yield* handleAskUserRequest(ctx, request);
       });
-      // Each HITL request parks on a Deferred until a client answers, so it
-      // must not block the request stream; failures answer the RPC so the
-      // CLI never hangs on t3.
+      // Each HITL request parks on a Deferred until a client answers. The
+      // request stream runs these handlers with bounded concurrency so parked
+      // approvals and user-input prompts cannot grow without bound.
       return handler.pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("Droid server request handling failed.", {
@@ -1173,7 +1130,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ),
           ),
         ),
-        Effect.forkIn(ctx.scope),
       );
     };
 
@@ -1182,7 +1138,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         if (ctx.stopped) return;
         ctx.stopped = true;
         yield* completeAllOpenChildTasks(ctx);
-        const activeTurnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
+        const activeTurnId = ctx.session.activeTurnId;
         if (activeTurnId !== undefined) {
           yield* settleTurn(ctx, activeTurnId, {
             state: "cancelled",
@@ -1266,10 +1222,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
           );
 
-          const resumeSessionId = parseDroidResume(input.resumeCursor)?.sessionId;
-          const rpc = yield* makeDroidRpcClient({
-            command: droidSettings.binaryPath,
-            args: ["exec", "--input-format", "stream-jsonrpc", "--output-format", "stream-jsonrpc"],
+          const resumeSessionId = parseVersionedSessionResumeCursor(
+            input.resumeCursor,
+            DROID_RESUME_VERSION,
+          );
+          const rpc = yield* makeDroidExecRpcClient({
+            binaryPath: droidSettings.binaryPath,
             cwd,
             ...(options?.environment ? { env: options.environment } : {}),
           }).pipe(
@@ -1379,9 +1337,10 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           }
 
           const now = yield* nowIso;
-          const session: ProviderSession = {
+          const session: ProviderAdapterSession = {
             provider: PROVIDER,
             providerInstanceId: boundInstanceId,
+            sessionLease: ProviderSessionLease.make(yield* randomUUIDv4),
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
@@ -1408,7 +1367,6 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             // this process are safe rewind anchors; resumed rollback fails
             // loudly rather than guessing at a user-message boundary.
             turns: [],
-            activeTurnId: undefined,
             interruptedTurnIds: new Set(),
             appliedRollbackAnchors: new Set(),
             pendingTurnMessageIds: new Set(),
@@ -1446,7 +1404,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                     );
                   }
                   const isSpecSuccessor =
-                    ctx.activeTurnId !== undefined &&
+                    ctx.session.activeTurnId !== undefined &&
                     ctx.currentInteractionMode === "spec" &&
                     ctx.specHandoffApproved &&
                     (ctx.specSuccessorSessionId === undefined ||
@@ -1473,11 +1431,17 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             Effect.forkIn(ctx.scope),
           );
 
-          // handleServerRequest forks each HITL exchange and answers the RPC
-          // on failure, so draining the request stream itself cannot fail.
+          // HITL exchanges answer their RPC on failure. Concurrency matches
+          // the transport request queue's budget, bounding both queued and
+          // active work while still allowing independent prompts to resolve.
           yield* Stream.runDrain(
-            Stream.mapEffect(rpc.serverRequests, (request) =>
-              Effect.asVoid(handleServerRequest(ctx, request)),
+            Stream.mapEffect(
+              rpc.serverRequests,
+              (request) => Effect.asVoid(handleServerRequest(ctx, request)),
+              {
+                concurrency: DROID_SERVER_REQUEST_CONCURRENCY,
+                unordered: true,
+              },
             ),
           ).pipe(Effect.forkIn(ctx.scope));
 
@@ -1495,7 +1459,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   if (live !== ctx || live.stopped) return;
                   live.stopped = true;
                   yield* completeAllOpenChildTasks(live);
-                  const activeTurnId = live.activeTurnId ?? live.session.activeTurnId;
+                  const activeTurnId = live.session.activeTurnId;
                   if (activeTurnId !== undefined) {
                     yield* settleTurn(live, activeTurnId, {
                       state: "failed",
@@ -1651,21 +1615,22 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           );
 
           const messageId = yield* randomUUIDv4;
-          const steeringTurnId = ctx.pendingTurnMessageIds.size > 0 ? ctx.activeTurnId : undefined;
+          const steeringTurnId =
+            ctx.pendingTurnMessageIds.size > 0 ? ctx.session.activeTurnId : undefined;
           const turnId = steeringTurnId ?? TurnId.make(messageId);
           ctx.pendingTurnMessageIds.add(messageId);
-          ctx.activeTurnId = turnId;
           const displayModel =
             requestedInteractionMode === "spec" ? ctx.currentSpecModeModelId : ctx.currentModelId;
           const displayEffort =
             requestedInteractionMode === "spec"
               ? ctx.currentSpecModeReasoningEffort
               : ctx.currentReasoningEffort;
+          const updatedAt = yield* nowIso;
           ctx.session = {
             ...ctx.session,
             status: "running",
             activeTurnId: turnId,
-            updatedAt: yield* nowIso,
+            updatedAt,
             ...(displayModel ? { model: displayModel } : {}),
           };
 
@@ -1678,6 +1643,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               type: "turn.started",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
+              sessionLease: ctx.session.sessionLease,
               threadId: input.threadId,
               turnId,
               payload: {
@@ -1727,7 +1693,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           if (!ctx || ctx.stopped) {
             return { _tag: "Proceed" as const, interruptedTurnId: turnId };
           }
-          const activeTurnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
+          const activeTurnId = ctx.session.activeTurnId;
           if (turnId !== undefined && activeTurnId !== undefined && activeTurnId !== turnId) {
             return { _tag: "Ignore" as const };
           }
@@ -1743,7 +1709,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(threadId);
-            const activeTurnId = ctx.activeTurnId ?? ctx.session.activeTurnId;
+            const activeTurnId = ctx.session.activeTurnId;
             const interruptedTurnId = observed.interruptedTurnId ?? activeTurnId;
             if (
               interruptedTurnId !== undefined &&
@@ -1842,16 +1808,22 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         threadId,
         Effect.gen(function* () {
           const ctx = yield* requireSession(threadId);
-          if (ctx.activeTurnId !== undefined) {
+          if (ctx.session.activeTurnId !== undefined) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "rollbackThread",
               issue: "Cannot roll back while a turn is running.",
             });
           }
+          if (!rollbackTargetMatchesTurnPrefix(ctx.turns, target)) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "rollbackThread",
+              issue: "Rollback target does not match the current thread history.",
+            });
+          }
           if (
             ctx.turns.length === target.turnIds.length &&
-            ctx.turns.every((turn, index) => turn.id === target.turnIds[index]) &&
             (target.anchorTurnId === undefined ||
               ctx.appliedRollbackAnchors.has(target.anchorTurnId))
           ) {

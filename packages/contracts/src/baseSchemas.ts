@@ -48,7 +48,7 @@ export const ForwardCompatibleArray = <Element extends Schema.Top>(element: Elem
 /**
  * Construct a branded identifier. Enforces non-empty trimmed strings
  */
-const makeEntityId = <Brand extends string>(brand: Brand) => {
+export const makeEntityId = <Brand extends string>(brand: Brand) => {
   return TrimmedNonEmptyString.pipe(Schema.brand(brand));
 };
 

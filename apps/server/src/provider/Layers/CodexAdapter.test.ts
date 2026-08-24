@@ -222,6 +222,8 @@ function makeScopedRuntimeFactory(options?: { readonly failConstruction?: boolea
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
+  updateResumeCursorIfOwned: () => Effect.succeed(false),
+  updateRuntimePayloadIfOwned: () => Effect.succeed(false),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
   getBinding: () => Effect.succeed(Option.none()),
@@ -402,6 +404,120 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         effort: "high",
         serviceTier: "priority",
       });
+    }),
+  );
+
+  it.effect("rejects an absolute rollback target from a different Codex history", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("thread-rollback-mismatch");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      runtime.readThreadImpl.mockResolvedValue({
+        threadId: "provider-thread-1",
+        turns: [
+          { id: asTurnId("turn-1"), items: [] },
+          { id: asTurnId("turn-2"), items: [] },
+        ],
+      });
+      runtime.rollbackThreadImpl.mockClear();
+
+      const result = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [asTurnId("foreign-turn")],
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        NodeAssert.equal(result.failure._tag, "ProviderAdapterValidationError");
+        if (result.failure._tag === "ProviderAdapterValidationError") {
+          NodeAssert.equal(
+            result.failure.issue,
+            "Rollback target does not match the current thread history.",
+          );
+        }
+      }
+      NodeAssert.equal(runtime.rollbackThreadImpl.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("serializes Codex rollback against concurrent turn mutation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("thread-rollback-revalidate");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      const firstTurn = { id: asTurnId("turn-1"), items: [] };
+      const makeGate = () => {
+        let open!: () => void;
+        const wait = new Promise<void>((resolve) => {
+          open = resolve;
+        });
+        return { open, wait };
+      };
+      const readStarted = makeGate();
+      const releaseRead = makeGate();
+      const sendStarted = makeGate();
+      let sendEnteredRuntime = false;
+      runtime.readThreadImpl.mockImplementation(async () => {
+        readStarted.open();
+        await releaseRead.wait;
+        return {
+          threadId: "provider-thread-1",
+          turns: [firstTurn, { id: asTurnId("turn-2"), items: [] }],
+        };
+      });
+      runtime.rollbackThreadImpl.mockResolvedValue({
+        threadId: "provider-thread-1",
+        turns: [firstTurn],
+      });
+      runtime.sendTurnImpl.mockImplementation(() => {
+        sendEnteredRuntime = true;
+        sendStarted.open();
+        return Promise.resolve({
+          threadId,
+          turnId: asTurnId("turn-concurrent"),
+        });
+      });
+
+      const rollbackFiber = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [firstTurn.id],
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => readStarted.wait);
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "concurrent mutation",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      NodeAssert.equal(sendEnteredRuntime, false);
+
+      releaseRead.open();
+      const result = yield* Fiber.join(rollbackFiber);
+      yield* Effect.promise(() => sendStarted.wait);
+      yield* Fiber.join(sendFiber);
+
+      NodeAssert.deepStrictEqual(
+        result.turns.map((turn) => turn.id),
+        [firstTurn.id],
+      );
+      NodeAssert.equal(runtime.readThreadImpl.mock.calls.length, 1);
+      NodeAssert.deepStrictEqual(runtime.rollbackThreadImpl.mock.calls, [[1]]);
     }),
   );
 

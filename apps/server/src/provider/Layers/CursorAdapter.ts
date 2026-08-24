@@ -12,10 +12,10 @@ import {
   type ProviderApprovalDecision,
   type ProviderInteractionMode,
   type ProviderRuntimeEvent,
-  type ProviderSession,
   type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
   RuntimeRequestId,
   type RuntimeMode,
   type ThreadId,
@@ -31,7 +31,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
-import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -46,7 +45,6 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
-  ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import {
@@ -65,6 +63,11 @@ import {
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import {
+  parseVersionedSessionResumeCursor,
+  type ProviderAdapterSession,
+  rollbackTargetMatchesTurnPrefix,
+} from "../Services/ProviderAdapter.ts";
+import {
   type AcpSessionMode,
   type AcpSessionModeState,
   parsePermissionRequest,
@@ -80,20 +83,16 @@ import {
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
+import { makeRequireActiveProviderSession } from "../Services/ProviderAdapter.ts";
+import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
-const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("cursor");
 const CURSOR_RESUME_VERSION = 1 as const;
 const ACP_PLAN_MODE_ALIASES = ["plan", "architect"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["code", "agent", "default", "chat", "implement"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];
-
-function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
-  const result = encodeUnknownJsonStringExit(input);
-  return Exit.isSuccess(result) ? result.value : undefined;
-}
 
 export interface CursorAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -130,7 +129,7 @@ interface PendingUserInput {
 
 interface CursorSessionContext {
   readonly threadId: ThreadId;
-  session: ProviderSession;
+  session: ProviderAdapterSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
@@ -170,17 +169,6 @@ function settlePendingUserInputsAsEmptyAnswers(
       discard: true,
     },
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseCursorResume(raw: unknown): { sessionId: string } | undefined {
-  if (!isRecord(raw)) return undefined;
-  if (raw.schemaVersion !== CURSOR_RESUME_VERSION) return undefined;
-  if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
-  return { sessionId: raw.sessionId.trim() };
 }
 
 function normalizeModeSearchText(mode: AcpSessionMode): string {
@@ -434,17 +422,7 @@ export function makeCursorAdapter(
         );
       });
 
-    const requireSession = (
-      threadId: ThreadId,
-    ): Effect.Effect<CursorSessionContext, ProviderAdapterSessionNotFoundError> => {
-      const ctx = sessions.get(threadId);
-      if (!ctx || ctx.stopped) {
-        return Effect.fail(
-          new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }),
-        );
-      }
-      return Effect.succeed(ctx);
-    };
+    const requireSession = makeRequireActiveProviderSession(sessions, PROVIDER);
 
     const stopSessionInternal = (ctx: CursorSessionContext) =>
       Effect.gen(function* () {
@@ -502,7 +480,10 @@ export function makeCursorAdapter(
           );
           let ctx!: CursorSessionContext;
 
-          const resumeSessionId = parseCursorResume(input.resumeCursor)?.sessionId;
+          const resumeSessionId = parseVersionedSessionResumeCursor(
+            input.resumeCursor,
+            CURSOR_RESUME_VERSION,
+          );
           const acpNativeLoggers = makeAcpNativeLoggers({
             nativeEventLogger,
             provider: PROVIDER,
@@ -747,9 +728,10 @@ export function makeCursorAdapter(
           });
 
           const now = yield* nowIso;
-          const session: ProviderSession = {
+          const session: ProviderAdapterSession = {
             provider: PROVIDER,
             providerInstanceId: boundInstanceId,
+            sessionLease: ProviderSessionLease.make(yield* randomUUIDv4),
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
@@ -956,6 +938,7 @@ export function makeCursorAdapter(
               type: "turn.started",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
+              sessionLease: ctx.session.sessionLease,
               threadId: input.threadId,
               turnId,
               payload: { model: resolvedModel },
@@ -1037,6 +1020,7 @@ export function makeCursorAdapter(
               type: "turn.completed",
               ...(yield* makeEventStamp()),
               provider: PROVIDER,
+              sessionLease: ctx.session.sessionLease,
               threadId: input.threadId,
               turnId,
               payload: {
@@ -1126,11 +1110,11 @@ export function makeCursorAdapter(
     const rollbackThread: CursorAdapterShape["rollbackThread"] = (threadId, target) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
-        if (ctx.turns.length < target.turnIds.length) {
+        if (!rollbackTargetMatchesTurnPrefix(ctx.turns, target)) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "rollbackThread",
-            issue: `Cannot roll back to ${target.turnIds.length} turns from ${ctx.turns.length}.`,
+            issue: "Rollback target does not match the current thread history.",
           });
         }
         ctx.turns.splice(target.turnIds.length);

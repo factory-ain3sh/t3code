@@ -1,6 +1,7 @@
 import type {
   ProviderInstanceId,
   ProviderDriverKind,
+  ProviderSessionLease,
   ProviderSessionRuntimeStatus,
   RuntimeMode,
   ThreadId,
@@ -23,6 +24,8 @@ export interface ProviderRuntimeBinding {
    * exposing bindings; runtime callers must not infer this from `provider`.
    */
   readonly providerInstanceId?: ProviderInstanceId;
+  /** Incarnation token for the specific live adapter session owning the binding. */
+  readonly sessionLease?: ProviderSessionLease | null;
   readonly adapterKey?: string;
   readonly status?: ProviderSessionRuntimeStatus;
   readonly resumeCursor?: unknown | null;
@@ -52,6 +55,28 @@ export interface ProviderSessionDirectoryShape {
   readonly getBinding: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<ProviderRuntimeBinding>, ProviderSessionDirectoryReadError>;
+
+  /**
+   * Persist a cursor only when both the configured provider instance and its
+   * current live session incarnation still own the thread.
+   */
+  readonly updateResumeCursorIfOwned: (input: {
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly sessionLease: ProviderSessionLease;
+    readonly resumeCursor: unknown;
+  }) => Effect.Effect<boolean, ProviderSessionDirectoryWriteError>;
+
+  /**
+   * Merge runtime payload only while the configured provider instance and its
+   * current live session incarnation still own the thread.
+   */
+  readonly updateRuntimePayloadIfOwned: (input: {
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly sessionLease: ProviderSessionLease;
+    readonly runtimePayload: unknown | null;
+  }) => Effect.Effect<boolean, ProviderSessionDirectoryWriteError>;
 
   readonly listThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,

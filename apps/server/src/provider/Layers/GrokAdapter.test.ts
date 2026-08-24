@@ -123,6 +123,31 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("rejects rollback targets from a different Grok history", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-rollback-mismatch");
+      const adapter = yield* makeTestAdapter(yield* Effect.promise(() => makeMockGrokWrapper()));
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [TurnId.make("foreign-turn")],
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        assert.equal(error.issue, "Rollback target does not match the current thread history.");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-mock-thread");

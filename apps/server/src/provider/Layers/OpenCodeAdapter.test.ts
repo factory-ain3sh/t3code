@@ -20,6 +20,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
@@ -66,6 +67,7 @@ const runtimeMock = {
     promptCalls: [] as Array<unknown>,
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
+    messagesCalls: 0,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
     sessionGetIds: [] as string[],
@@ -86,6 +88,7 @@ const runtimeMock = {
     this.state.promptCalls.length = 0;
     this.state.promptAsyncError = null;
     this.state.closeError = null;
+    this.state.messagesCalls = 0;
     this.state.messages = [];
     this.state.subscribedEvents = [];
     this.state.sessionGetIds.length = 0;
@@ -183,7 +186,10 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             throw runtimeMock.state.promptAsyncError;
           }
         },
-        messages: async () => ({ data: runtimeMock.state.messages }),
+        messages: async () => {
+          runtimeMock.state.messagesCalls += 1;
+          return { data: runtimeMock.state.messages };
+        },
         revert: async ({ sessionID, messageID }: { sessionID: string; messageID?: string }) => {
           runtimeMock.state.revertCalls.push({
             sessionID,
@@ -233,6 +239,8 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
+  updateResumeCursorIfOwned: () => Effect.succeed(false),
+  updateRuntimePayloadIfOwned: () => Effect.succeed(false),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
   getBinding: () => Effect.succeed(Option.none()),
@@ -970,6 +978,70 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         { sessionID: "http://127.0.0.1:9999/session" },
       ]);
       NodeAssert.deepEqual(snapshot.turns, []);
+    }),
+  );
+
+  it.effect("returns the existing snapshot without rereading a no-op rollback", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-rollback-noop");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      runtimeMock.state.messages = [
+        {
+          info: { id: "assistant-1", role: "assistant" },
+          parts: [{ type: "text", text: "Done" }],
+        },
+      ];
+
+      const snapshot = yield* adapter.rollbackThread(threadId, {
+        turnIds: [TurnId.make("assistant-1")],
+      });
+
+      NodeAssert.equal(runtimeMock.state.messagesCalls, 1);
+      NodeAssert.deepEqual(runtimeMock.state.revertCalls, []);
+      NodeAssert.deepEqual(snapshot.turns, [
+        {
+          id: TurnId.make("assistant-1"),
+          items: [
+            { id: "assistant-1", role: "assistant" },
+            { type: "text", text: "Done" },
+          ],
+        },
+      ]);
+    }),
+  );
+
+  it.effect("rejects rollback targets from a different OpenCode history", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-rollback-mismatch");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      runtimeMock.state.messages = [
+        {
+          info: { id: "assistant-1", role: "assistant" },
+          parts: [],
+        },
+      ];
+
+      const error = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [TurnId.make("foreign-turn")],
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        NodeAssert.equal(error.issue, "Rollback target does not match the current thread history.");
+      }
+      NodeAssert.deepEqual(runtimeMock.state.revertCalls, []);
     }),
   );
 

@@ -30,14 +30,23 @@ const timedOutRequestRetentionLimit = 256;
 const diagnosticTextLimit = 2000;
 const outgoingQueueCapacity = 2;
 const notificationQueueCapacity = 64;
-const serverRequestQueueCapacity = 16;
+const lossyNotificationQueueLimit = notificationQueueCapacity - 1;
+export const DROID_SERVER_REQUEST_CONCURRENCY = 16;
+const serverRequestQueueCapacity = DROID_SERVER_REQUEST_CONCURRENCY;
 const maxOutgoingMessageBytes = 128 * 1024 * 1024;
 const maxIncomingLineBytes = 2 * 1024 * 1024;
 const stdoutExitObservationGrace = Duration.millis(100);
+const lossyNotificationTypes: ReadonlySet<string> = new Set(["tool_progress_update"]);
 
 export interface DroidRpcSpawnInput {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
+  readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+export interface DroidExecRpcInput {
+  readonly binaryPath: string;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
 }
@@ -110,7 +119,7 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
 }
 
 interface DroidServerRequestBase {
-  readonly id: string;
+  readonly id: string | number;
   readonly sessionId: string | undefined;
   readonly respond: (result: unknown) => Effect.Effect<void, DroidRpcError>;
   readonly fail: (code: number, message: string) => Effect.Effect<void, DroidRpcError>;
@@ -176,6 +185,17 @@ function parseJsonRpcLine(line: string): ParseJsonRpcLineResult {
         error: "JSON-RPC line must include a valid type discriminator",
       };
     }
+    if (
+      "id" in parsed &&
+      parsed.id !== null &&
+      typeof parsed.id !== "string" &&
+      typeof parsed.id !== "number"
+    ) {
+      return {
+        _tag: "Invalid",
+        error: "JSON-RPC id must be a string, number, null, or absent",
+      };
+    }
     return {
       _tag: "Message",
       message: {
@@ -196,6 +216,7 @@ interface PendingRequest {
   readonly _tag: "Pending";
   readonly method: string;
   readonly deferred: Deferred.Deferred<unknown, DroidRpcError>;
+  readonly sent: boolean;
 }
 
 interface TimedOutRequest {
@@ -353,6 +374,7 @@ export const makeDroidRpcClient = (
     });
     const nextRequestId = yield* Ref.make(0);
     const exitDeferred = yield* Deferred.make<DroidProcessExit>();
+    const droppedLossyNotificationCount = yield* Ref.make(0);
 
     const publishDiagnostic = (
       message: string,
@@ -433,7 +455,7 @@ export const makeDroidRpcClient = (
       );
 
     const sendResponse = (
-      id: string,
+      id: string | number,
       result:
         | { readonly _tag: "Success"; readonly value: unknown }
         | { readonly _tag: "Failure"; readonly code: number; readonly message: string },
@@ -450,11 +472,11 @@ export const makeDroidRpcClient = (
 
     const resolveResponse = (message: ParsedJsonRpcMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
-        if (message.id === undefined || message.id === null) {
-          yield* publishDiagnostic("Ignoring Droid JSON-RPC response without an id");
+        if (typeof message.id !== "string") {
+          yield* publishDiagnostic("Ignoring Droid JSON-RPC response without a string id");
           return;
         }
-        const requestId = String(message.id);
+        const requestId = message.id;
         const requestState = yield* SynchronizedRef.modify(lifecycle, (state) => {
           if (state._tag === "Exited") {
             return [undefined, state] as const;
@@ -490,26 +512,29 @@ export const makeDroidRpcClient = (
         yield* Deferred.succeed(requestState.deferred, message.result);
       });
 
-    const makeServerRequestBase = (id: string, method: string, sessionId: string | undefined) =>
+    const makeServerRequestBase = (
+      id: string | number,
+      method: string,
+      sessionId: string | undefined,
+    ) =>
       Effect.gen(function* () {
-        const answered = yield* Ref.make(false);
+        const answered = yield* SynchronizedRef.make(false);
+        const requestId = String(id);
         const answerOnce = (
           result:
             | { readonly _tag: "Success"; readonly value: unknown }
             | { readonly _tag: "Failure"; readonly code: number; readonly message: string },
         ) =>
-          Ref.getAndSet(answered, true).pipe(
-            Effect.flatMap((alreadyAnswered) =>
-              alreadyAnswered
-                ? Effect.fail(
-                    new DroidRpcError({
-                      kind: "duplicate-server-response",
-                      method,
-                      requestId: id,
-                    }),
-                  )
-                : sendResponse(id, result),
-            ),
+          SynchronizedRef.modifyEffect(answered, (alreadyAnswered) =>
+            alreadyAnswered
+              ? Effect.fail(
+                  new DroidRpcError({
+                    kind: "duplicate-server-response",
+                    method,
+                    requestId,
+                  }),
+                )
+              : sendResponse(id, result).pipe(Effect.as([undefined, true] as const)),
           );
         return {
           id,
@@ -531,13 +556,15 @@ export const makeDroidRpcClient = (
     const publishServerRequest = (request: DroidServerRequest) =>
       Queue.offer(serverRequestPubSub, request).pipe(Effect.asVoid);
 
-    const handleServerRequest = (message: ParsedJsonRpcMessage): Effect.Effect<void> =>
+    const handleServerRequest = (
+      message: ParsedJsonRpcMessage,
+    ): Effect.Effect<void, DroidRpcError> =>
       Effect.gen(function* () {
         if (message.id === undefined || message.id === null || typeof message.method !== "string") {
           yield* publishDiagnostic("Ignoring malformed server-initiated Droid request");
           return;
         }
-        const id = String(message.id);
+        const id = message.id;
         const sessionId =
           Predicate.isObject(message.params) && typeof message.params.sessionId === "string"
             ? message.params.sessionId
@@ -595,7 +622,9 @@ export const makeDroidRpcClient = (
         }).pipe(Effect.ignore);
       });
 
-    const handleNotification = (message: ParsedJsonRpcMessage): Effect.Effect<void> =>
+    const handleNotification = (
+      message: ParsedJsonRpcMessage,
+    ): Effect.Effect<void, DroidRpcError> =>
       Effect.gen(function* () {
         if (message.method !== "droid.session_notification") {
           return;
@@ -613,13 +642,29 @@ export const makeDroidRpcClient = (
         }
         const sessionId =
           typeof message.params.sessionId === "string" ? message.params.sessionId : undefined;
+        const notification = decoded.success;
+        if (
+          lossyNotificationTypes.has(notification.type) &&
+          Queue.sizeUnsafe(notificationPubSub) >= lossyNotificationQueueLimit
+        ) {
+          const droppedCount = yield* Ref.updateAndGet(
+            droppedLossyNotificationCount,
+            (count) => count + 1,
+          );
+          if (droppedCount === 1 || droppedCount % notificationQueueCapacity === 0) {
+            yield* publishDiagnostic(
+              `Dropped ${droppedCount} lossy Droid session notifications because the delivery queue is saturated`,
+            );
+          }
+          return;
+        }
         yield* Queue.offer(notificationPubSub, {
           sessionId,
-          notification: decoded.success,
+          notification,
         });
       });
 
-    const handleMessage = (message: ParsedJsonRpcMessage): Effect.Effect<void> => {
+    const handleMessage = (message: ParsedJsonRpcMessage): Effect.Effect<void, DroidRpcError> => {
       switch (message.type) {
         case "request":
           return handleServerRequest(message);
@@ -787,7 +832,7 @@ export const makeDroidRpcClient = (
         yield* SynchronizedRef.modifyEffect(lifecycle, (state) => {
           if (state._tag === "Running") {
             const next = new Map(state.pending);
-            next.set(requestId, { _tag: "Pending", method, deferred });
+            next.set(requestId, { _tag: "Pending", method, deferred, sent: false });
             return Effect.succeed([undefined, { ...state, pending: next }] as const);
           }
           const exit =
@@ -801,10 +846,34 @@ export const makeDroidRpcClient = (
           return Effect.fail(processExitError(exit, method));
         });
         const timeoutMs = options === undefined ? defaultRequestTimeoutMs : options.timeoutMs;
+        const exchange = writeEnvelope({
+          jsonrpc: "2.0",
+          type: "request",
+          factoryApiVersion: "1.0.0",
+          id: requestId,
+          method,
+          params,
+        }).pipe(
+          Effect.tap(() =>
+            SynchronizedRef.update(lifecycle, (state) => {
+              if (state._tag === "Exited") {
+                return state;
+              }
+              const entry = state.pending.get(requestId);
+              if (entry === undefined || entry._tag !== "Pending" || entry.deferred !== deferred) {
+                return state;
+              }
+              const next = new Map(state.pending);
+              next.set(requestId, { ...entry, sent: true });
+              return { ...state, pending: next };
+            }),
+          ),
+          Effect.andThen(Deferred.await(deferred)),
+        );
         const result =
           timeoutMs === undefined
-            ? Deferred.await(deferred)
-            : Deferred.await(deferred).pipe(
+            ? exchange
+            : exchange.pipe(
                 Effect.timeoutOption(Duration.millis(timeoutMs)),
                 Effect.flatMap((result) => {
                   if (Option.isSome(result)) {
@@ -822,13 +891,18 @@ export const makeDroidRpcClient = (
                     ) {
                       return [false, state] as const;
                     }
-                    return [
-                      true,
-                      {
-                        ...state,
-                        pending: markRequestTimedOut(state.pending, requestId, method),
-                      },
-                    ] as const;
+                    if (entry.sent) {
+                      return [
+                        true,
+                        {
+                          ...state,
+                          pending: markRequestTimedOut(state.pending, requestId, method),
+                        },
+                      ] as const;
+                    }
+                    const next = new Map(state.pending);
+                    next.delete(requestId);
+                    return [true, { ...state, pending: next }] as const;
                   }).pipe(
                     Effect.flatMap((markedTimedOut) =>
                       markedTimedOut
@@ -845,15 +919,7 @@ export const makeDroidRpcClient = (
                   );
                 }),
               );
-        return yield* writeEnvelope({
-          jsonrpc: "2.0",
-          type: "request",
-          factoryApiVersion: "1.0.0",
-          id: requestId,
-          method,
-          params,
-        }).pipe(
-          Effect.andThen(result),
+        return yield* result.pipe(
           Effect.ensuring(
             SynchronizedRef.update(lifecycle, (state) => {
               if (state._tag === "Exited") {
@@ -911,4 +977,12 @@ export const makeDroidRpcClient = (
       exits,
       shutdown,
     } satisfies DroidRpcClient;
+  });
+
+export const makeDroidExecRpcClient = (input: DroidExecRpcInput) =>
+  makeDroidRpcClient({
+    command: input.binaryPath,
+    args: ["exec", "--input-format", "stream-jsonrpc", "--output-format", "stream-jsonrpc"],
+    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+    ...(input.env === undefined ? {} : { env: input.env }),
   });

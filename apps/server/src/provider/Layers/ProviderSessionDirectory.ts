@@ -72,6 +72,7 @@ function toRuntimeBinding(
           // persistence so hot routing code never has to infer an instance
           // from a driver kind.
           providerInstanceId: runtime.providerInstanceId ?? defaultInstanceIdForDriver(provider),
+          sessionLease: runtime.sessionLease,
           adapterKey: runtime.adapterKey,
           runtimeMode: runtime.runtimeMode,
           status: runtime.status,
@@ -125,11 +126,27 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         issue: "providerInstanceId is required for provider session runtime bindings.",
       });
     }
+    const ownerChanged =
+      providerChanged ||
+      (existingRuntime !== undefined &&
+        existingRuntime.providerInstanceId !== null &&
+        existingRuntime.providerInstanceId !== providerInstanceId);
+    const sessionIncarnationChanged =
+      binding.sessionLease !== undefined &&
+      binding.sessionLease !== null &&
+      existingRuntime !== undefined &&
+      existingRuntime.sessionLease !== binding.sessionLease;
     yield* repository
       .upsert({
         threadId: resolvedThreadId,
         providerName: binding.provider,
         providerInstanceId,
+        sessionLease:
+          binding.sessionLease !== undefined
+            ? binding.sessionLease
+            : ownerChanged
+              ? null
+              : (existingRuntime?.sessionLease ?? null),
         adapterKey:
           binding.adapterKey ??
           (providerChanged ? binding.provider : (existingRuntime?.adapterKey ?? binding.provider)),
@@ -139,9 +156,13 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         resumeCursor:
           binding.resumeCursor !== undefined
             ? binding.resumeCursor
-            : (existingRuntime?.resumeCursor ?? null),
+            : ownerChanged
+              ? null
+              : (existingRuntime?.resumeCursor ?? null),
         runtimePayload: mergeRuntimePayload(
-          existingRuntime?.runtimePayload ?? null,
+          ownerChanged || sessionIncarnationChanged
+            ? null
+            : (existingRuntime?.runtimePayload ?? null),
           binding.runtimePayload,
         ),
       })
@@ -163,6 +184,39 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         }),
       ),
     );
+
+  const updateResumeCursorIfOwned: ProviderSessionDirectoryShape["updateResumeCursorIfOwned"] = (
+    input,
+  ) =>
+    DateTime.now.pipe(
+      Effect.flatMap((now) =>
+        repository.updateResumeCursorIfOwned({
+          ...input,
+          lastSeenAt: DateTime.formatIso(now),
+        }),
+      ),
+      Effect.mapError(
+        toPersistenceError(
+          "ProviderSessionDirectory.updateResumeCursorIfOwned:updateResumeCursorIfOwned",
+        ),
+      ),
+    );
+
+  const updateRuntimePayloadIfOwned: ProviderSessionDirectoryShape["updateRuntimePayloadIfOwned"] =
+    (input) =>
+      DateTime.now.pipe(
+        Effect.flatMap((now) =>
+          repository.updateRuntimePayloadIfOwned({
+            ...input,
+            lastSeenAt: DateTime.formatIso(now),
+          }),
+        ),
+        Effect.mapError(
+          toPersistenceError(
+            "ProviderSessionDirectory.updateRuntimePayloadIfOwned:updateRuntimePayloadIfOwned",
+          ),
+        ),
+      );
 
   const listThreadIds: ProviderSessionDirectoryShape["listThreadIds"] = () =>
     repository.list().pipe(
@@ -186,6 +240,8 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
     upsert,
     getProvider,
     getBinding,
+    updateResumeCursorIfOwned,
+    updateRuntimePayloadIfOwned,
     listThreadIds,
     listBindings,
   } satisfies ProviderSessionDirectoryShape;

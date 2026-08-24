@@ -90,6 +90,22 @@ export interface ProviderServiceShape {
   readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;
 
   /**
+   * Recover the persisted provider session bound to a thread.
+   */
+  readonly recoverSession: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ProviderSession, ProviderServiceError>;
+
+  /**
+   * Serialize a session lifecycle operation with start/stop replacement for
+   * the same thread.
+   */
+  readonly withSessionLifecycleLock: <A, E, R>(
+    threadId: ThreadId,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
+
+  /**
    * Read capabilities for the adapter bound to a configured provider instance.
    */
   readonly getCapabilities: (

@@ -35,7 +35,7 @@
  */
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { makeEntityId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const PROVIDER_SLUG_MAX_CHARS = 64;
 /**
@@ -81,6 +81,16 @@ export const isProviderDriverKind = (value: unknown): value is ProviderDriverKin
  */
 export const ProviderInstanceId = slugSchema.pipe(Schema.brand("ProviderInstanceId"));
 export type ProviderInstanceId = typeof ProviderInstanceId.Type;
+
+/**
+ * Opaque identifier for one live provider-session incarnation.
+ *
+ * A configured provider instance can be rebuilt without changing its routing
+ * id, so persistence writes must also prove that the event came from the
+ * specific live session that currently owns the thread.
+ */
+export const ProviderSessionLease = makeEntityId("ProviderSessionLease");
+export type ProviderSessionLease = typeof ProviderSessionLease.Type;
 
 /**
  * Lightweight reference identifying which driver implements an instance.

@@ -4,7 +4,7 @@ import {
   ProviderApprovalDecision,
   ProviderRuntimeEvent,
   RuntimeSessionId,
-  ProviderSession,
+  ProviderSessionLease,
   ProviderTurnStartResult,
   ThreadId,
   TurnId,
@@ -20,6 +20,7 @@ import {
   type ProviderAdapterError,
 } from "../src/provider/Errors.ts";
 import type {
+  ProviderAdapterSession,
   ProviderAdapterShape,
   ProviderThreadSnapshot,
   ProviderThreadTurnSnapshot,
@@ -50,7 +51,7 @@ export type FixtureProviderRuntimeEvent = {
 export type LegacyProviderRuntimeEvent = FixtureProviderRuntimeEvent;
 
 interface SessionState {
-  readonly session: ProviderSession;
+  readonly session: ProviderAdapterSession;
   snapshot: ProviderThreadSnapshot;
   turnCount: number;
   readonly queuedResponses: Array<TestTurnResponse>;
@@ -240,7 +241,13 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       }>
     >();
 
-    const emit = (event: ProviderRuntimeEvent) => Queue.offer(runtimeEvents, event);
+    const emit = (event: ProviderRuntimeEvent) => {
+      const sessionLease = sessions.get(event.threadId)?.session.sessionLease;
+      return Queue.offer(
+        runtimeEvents,
+        sessionLease === undefined ? event : { ...event, sessionLease },
+      );
+    };
     const nextEventId = (threadId: ThreadId) => {
       eventCount += 1;
       return EventId.make(`test-provider:${provider}:${threadId}:${eventCount}`);
@@ -260,7 +267,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
         const threadId = input.threadId;
         const createdAt = nowIso();
 
-        const session: ProviderSession = {
+        const session: ProviderAdapterSession = {
           provider,
           ...(input.providerInstanceId !== undefined
             ? { providerInstanceId: input.providerInstanceId }
@@ -268,6 +275,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
           status: "ready",
           runtimeMode: input.runtimeMode,
           threadId,
+          sessionLease: ProviderSessionLease.make(`lease-${sessionCount}`),
           cwd: input.cwd,
           resumeCursor: input.resumeCursor ?? { threadId: String(threadId), seed: sessionCount },
           createdAt,

@@ -29,7 +29,7 @@ import {
   type DroidModelInfo,
   type DroidSkillInfo,
 } from "../droid/DroidProtocol.ts";
-import { makeDroidRpcClient } from "../droid/DroidRpcClient.ts";
+import { makeDroidExecRpcClient } from "../droid/DroidRpcClient.ts";
 import {
   buildSelectOptionDescriptor,
   buildServerProvider,
@@ -233,9 +233,8 @@ const discoverDroidInventory = (
   cwd: string = process.cwd(),
 ) =>
   Effect.gen(function* () {
-    const rpc = yield* makeDroidRpcClient({
-      command: droidSettings.binaryPath,
-      args: ["exec", "--input-format", "stream-jsonrpc", "--output-format", "stream-jsonrpc"],
+    const rpc = yield* makeDroidExecRpcClient({
+      binaryPath: droidSettings.binaryPath,
       cwd,
       env: environment,
     });

@@ -4,10 +4,10 @@ import {
   EventId,
   type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
-  type ProviderSession,
   type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
   RuntimeRequestId,
   type ThreadId,
   TurnId,
@@ -23,7 +23,6 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
-import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -38,7 +37,6 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
-  ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import {
@@ -56,6 +54,11 @@ import {
   makeAcpRequestResolvedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
+import {
+  parseVersionedSessionResumeCursor,
+  type ProviderAdapterSession,
+  rollbackTargetMatchesTurnPrefix,
+} from "../Services/ProviderAdapter.ts";
 import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
@@ -72,17 +75,12 @@ import {
   XAiAskUserQuestionRequest,
 } from "../acp/XAiAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
+import { makeRequireActiveProviderSession } from "../Services/ProviderAdapter.ts";
+import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
-
-const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("grok");
 const GROK_RESUME_VERSION = 1 as const;
-
-function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
-  const result = encodeUnknownJsonStringExit(input);
-  return Exit.isSuccess(result) ? result.value : undefined;
-}
 
 export interface GrokAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -107,7 +105,7 @@ interface PendingUserInput {
 interface GrokSessionContext {
   readonly threadId: ThreadId;
   readonly acpSessionId: string;
-  session: ProviderSession;
+  session: ProviderAdapterSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
@@ -162,10 +160,6 @@ function appendPromptResultToTurn(
     : [...ctx.turns, { id: turnId, items: [{ prompt: promptParts, result }] }];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 const resolveNotificationTurnId = (ctx: GrokSessionContext): TurnId | undefined => ctx.activeTurnId;
 
 const resolveCallbackTurnId = (ctx: GrokSessionContext): TurnId | undefined => ctx.activeTurnId;
@@ -177,13 +171,6 @@ const resolveSessionCallbackTurnId = (
   const ctx = sessions.get(threadId);
   return ctx ? resolveCallbackTurnId(ctx) : undefined;
 };
-
-function parseGrokResume(raw: unknown): { sessionId: string } | undefined {
-  if (!isRecord(raw)) return undefined;
-  if (raw.schemaVersion !== GROK_RESUME_VERSION) return undefined;
-  if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
-  return { sessionId: raw.sessionId.trim() };
-}
 
 function completedStopReasonFromPromptResponse(
   response: EffectAcpSchema.PromptResponse | undefined,
@@ -317,6 +304,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 type: "turn.completed",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,
+                sessionLease: liveCtx.session.sessionLease,
                 threadId,
                 turnId,
                 payload: {
@@ -329,6 +317,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 type: "turn.completed",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,
+                sessionLease: liveCtx.session.sessionLease,
                 threadId,
                 turnId,
                 payload: {
@@ -393,6 +382,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             type: "turn.completed",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
+            sessionLease: liveCtx.session.sessionLease,
             threadId,
             turnId: settleTurnId,
             payload: {
@@ -405,6 +395,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             type: "turn.completed",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
+            sessionLease: liveCtx.session.sessionLease,
             threadId,
             turnId: settleTurnId,
             payload: {
@@ -478,17 +469,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         );
       });
 
-    const requireSession = (
-      threadId: ThreadId,
-    ): Effect.Effect<GrokSessionContext, ProviderAdapterSessionNotFoundError> => {
-      const ctx = sessions.get(threadId);
-      if (!ctx || ctx.stopped) {
-        return Effect.fail(
-          new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }),
-        );
-      }
-      return Effect.succeed(ctx);
-    };
+    const requireSession = makeRequireActiveProviderSession(sessions, PROVIDER);
 
     const stopSessionInternal = (ctx: GrokSessionContext) =>
       Effect.gen(function* () {
@@ -545,7 +526,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
           );
 
-          const resumeSessionId = parseGrokResume(input.resumeCursor)?.sessionId;
+          const resumeSessionId = parseVersionedSessionResumeCursor(
+            input.resumeCursor,
+            GROK_RESUME_VERSION,
+          );
           const acpNativeLoggers = makeAcpNativeLoggers({
             nativeEventLogger,
             provider: PROVIDER,
@@ -734,9 +718,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           });
 
           const now = yield* nowIso;
-          const session: ProviderSession = {
+          const session: ProviderAdapterSession = {
             provider: PROVIDER,
             providerInstanceId: boundInstanceId,
+            sessionLease: ProviderSessionLease.make(yield* randomUUIDv4),
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
@@ -1025,6 +1010,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   type: "turn.started",
                   ...(yield* makeEventStamp()),
                   provider: PROVIDER,
+                  sessionLease: ctx.session.sessionLease,
                   threadId: input.threadId,
                   turnId,
                   payload: displayModel ? { model: displayModel } : {},
@@ -1176,6 +1162,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   type: "turn.completed",
                   ...(yield* makeEventStamp()),
                   provider: PROVIDER,
+                  sessionLease: ctx.session.sessionLease,
                   threadId: input.threadId,
                   turnId: prepared.turnId,
                   payload: {
@@ -1400,6 +1387,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
     const rollbackThread: GrokAdapterShape["rollbackThread"] = (threadId, target) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        if (!rollbackTargetMatchesTurnPrefix(ctx.turns, target)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "rollbackThread",
+            issue: "Rollback target does not match the current thread history.",
+          });
+        }
         if (ctx.turns.length === target.turnIds.length) {
           return { threadId, turns: ctx.turns };
         }

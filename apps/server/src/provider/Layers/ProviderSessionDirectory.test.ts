@@ -4,7 +4,12 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderSessionLease,
+  ThreadId,
+} from "@t3tools/contracts";
 import { it, assert } from "@effect/vitest";
 import { assertSome } from "@effect/vitest/utils";
 import * as Effect from "effect/Effect";
@@ -122,6 +127,193 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       }
     }));
 
+  it("updates resume cursors only for the owning provider session incarnation", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("thread-owned-cursor");
+      const owner = ProviderInstanceId.make("droid-owner");
+      const currentLease = ProviderSessionLease.make("lease-current");
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: currentLease,
+        threadId,
+        resumeCursor: { sessionId: "original" },
+      });
+
+      assert.equal(
+        yield* directory.updateResumeCursorIfOwned({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("droid-stale"),
+          sessionLease: currentLease,
+          resumeCursor: { sessionId: "stale" },
+        }),
+        false,
+      );
+      assert.equal(
+        yield* directory.updateResumeCursorIfOwned({
+          threadId,
+          providerInstanceId: owner,
+          sessionLease: ProviderSessionLease.make("lease-stale"),
+          resumeCursor: { sessionId: "stale" },
+        }),
+        false,
+      );
+      assert.equal(
+        yield* directory.updateResumeCursorIfOwned({
+          threadId,
+          providerInstanceId: owner,
+          sessionLease: currentLease,
+          resumeCursor: { sessionId: "current" },
+        }),
+        true,
+      );
+
+      const binding = yield* directory.getBinding(threadId);
+      assertSome(binding, {
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: currentLease,
+        resumeCursor: { sessionId: "current" },
+      });
+    }));
+
+  it("updates runtime payload only for the owning provider session incarnation", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("thread-owned-payload");
+      const owner = ProviderInstanceId.make("droid-owner");
+      const currentLease = ProviderSessionLease.make("lease-current");
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: currentLease,
+        threadId,
+        runtimePayload: { cwd: "/tmp/project", checkpointRevertIntent: null },
+      });
+
+      assert.equal(
+        yield* directory.updateRuntimePayloadIfOwned({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("droid-stale"),
+          sessionLease: currentLease,
+          runtimePayload: { checkpointRevertIntent: { turnCount: 1 } },
+        }),
+        false,
+      );
+      assert.equal(
+        yield* directory.updateRuntimePayloadIfOwned({
+          threadId,
+          providerInstanceId: owner,
+          sessionLease: ProviderSessionLease.make("lease-stale"),
+          runtimePayload: { checkpointRevertIntent: { turnCount: 1 } },
+        }),
+        false,
+      );
+      assert.equal(
+        yield* directory.updateRuntimePayloadIfOwned({
+          threadId,
+          providerInstanceId: owner,
+          sessionLease: currentLease,
+          runtimePayload: { checkpointRevertIntent: { turnCount: 2 } },
+        }),
+        true,
+      );
+
+      const binding = yield* directory.getBinding(threadId);
+      assertSome(binding, {
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: currentLease,
+        runtimePayload: {
+          cwd: "/tmp/project",
+          checkpointRevertIntent: { turnCount: 2 },
+        },
+      });
+    }));
+
+  it("atomically merges concurrent runtime payload patches for the owning session", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("thread-concurrent-payload");
+      const owner = ProviderInstanceId.make("droid-owner");
+      const sessionLease = ProviderSessionLease.make("lease-current");
+      const patches = Array.from(
+        { length: 32 },
+        (_, index) => [`patch${String(index)}`, index] as const,
+      );
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease,
+        threadId,
+        runtimePayload: { cwd: "/tmp/project" },
+      });
+
+      const results = yield* Effect.all(
+        patches.map(([key, value]) =>
+          directory.updateRuntimePayloadIfOwned({
+            threadId,
+            providerInstanceId: owner,
+            sessionLease,
+            runtimePayload: { [key]: value },
+          }),
+        ),
+        { concurrency: "unbounded" },
+      );
+      assert.isTrue(results.every(Boolean));
+
+      const binding = yield* directory.getBinding(threadId);
+      assert.isTrue(Option.isSome(binding));
+      if (Option.isSome(binding)) {
+        assert.deepEqual(binding.value.runtimePayload, {
+          cwd: "/tmp/project",
+          ...Object.fromEntries(patches),
+        });
+      }
+    }));
+
+  it("does not inherit runtime payload across live session incarnations", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("thread-incarnation-payload");
+      const owner = ProviderInstanceId.make("droid-owner");
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: ProviderSessionLease.make("lease-a"),
+        threadId,
+        resumeCursor: { sessionId: "session-a" },
+        runtimePayload: {
+          cwd: "/tmp/project",
+          checkpointRevertIntent: { turnCount: 1 },
+        },
+      });
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        threadId,
+        runtimePayload: { cwd: "/tmp/project" },
+      });
+
+      const binding = yield* directory.getBinding(threadId);
+      assertSome(binding, {
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        resumeCursor: { sessionId: "session-a" },
+        runtimePayload: { cwd: "/tmp/project" },
+      });
+    }));
+
   it("lists persisted bindings with metadata in oldest-first order", () =>
     Effect.gen(function* () {
       const directory = yield* ProviderSessionDirectory;
@@ -134,6 +326,7 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
         threadId: newerThreadId,
         providerName: "codex",
         providerInstanceId: null,
+        sessionLease: null,
         adapterKey: "codex",
         runtimeMode: "full-access",
         status: "running",
@@ -150,6 +343,7 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
         threadId: olderThreadId,
         providerName: "claudeAgent",
         providerInstanceId: null,
+        sessionLease: null,
         adapterKey: "claudeAgent",
         runtimeMode: "approval-required",
         status: "starting",
@@ -206,6 +400,7 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
         threadId,
         providerName: "claudeAgent",
         providerInstanceId: null,
+        sessionLease: null,
         adapterKey: "claudeAgent",
         runtimeMode: "full-access",
         status: "running",

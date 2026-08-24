@@ -189,6 +189,7 @@ const buildEntry = <R>(input: {
         instanceId: rawInstanceId,
         driver: entry.driver,
         detail: createResult.failure.detail,
+        cause: createResult.failure.cause,
       });
       yield* Scope.close(childScope, Exit.void).pipe(Effect.ignore);
       return {

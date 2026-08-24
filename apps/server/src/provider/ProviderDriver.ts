@@ -25,6 +25,7 @@ import type {
   ProviderDriverKind,
   ProviderInstanceEnvironment,
   ProviderInstanceId,
+  ServerProvider,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Schema from "effect/Schema";
@@ -32,6 +33,7 @@ import type * as Scope from "effect/Scope";
 
 import type * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import type { ProviderAdapterError, ProviderDriverError } from "./Errors.ts";
+import type { ServerProviderDraft } from "./providerSnapshot.ts";
 import type { ProviderAdapterShape } from "./Services/ProviderAdapter.ts";
 import type { ServerProviderShape } from "./Services/ServerProvider.ts";
 
@@ -87,6 +89,25 @@ export function defaultProviderContinuationIdentity(input: {
     continuationKey: `${input.driverKind}:instance:${input.instanceId}`,
   };
 }
+
+/**
+ * Stamp configured instance identity onto a driver-kind snapshot.
+ */
+export const withProviderInstanceIdentity =
+  (input: {
+    readonly instanceId: ProviderInstanceId;
+    readonly continuationIdentity: ProviderContinuationIdentity;
+    readonly displayName: string | undefined;
+    readonly accentColor: string | undefined;
+  }) =>
+  (snapshot: ServerProviderDraft): ServerProvider => ({
+    ...snapshot,
+    instanceId: input.instanceId,
+    driver: input.continuationIdentity.driverKind,
+    ...(input.displayName ? { displayName: input.displayName } : {}),
+    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
+    continuation: { groupKey: input.continuationIdentity.continuationKey },
+  });
 
 /**
  * Inputs the registry passes to a driver's `create` function.

@@ -4,9 +4,11 @@ import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
+import * as NodeTimersPromises from "node:timers/promises";
 
 const emitToolCall = process.env.T3_DROID_MOCK_EMIT_TOOL_CALL === "1";
 const requestPermission = process.env.T3_DROID_MOCK_REQUEST_PERMISSION === "1";
+const permissionOptionsMode = process.env.T3_DROID_MOCK_PERMISSION_OPTIONS;
 const askUser = process.env.T3_DROID_MOCK_ASK_USER === "1";
 const hangTurn = process.env.T3_DROID_MOCK_HANG_TURN === "1";
 const failInit = process.env.T3_DROID_MOCK_FAIL_INIT === "1";
@@ -17,6 +19,8 @@ const exitMidTurn = process.env.T3_DROID_MOCK_EXIT_MID_TURN === "1";
 const emitUnknownNotification = process.env.T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION === "1";
 const omitUsageNotification = process.env.T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION === "1";
 const startRaceDir = process.env.T3_DROID_MOCK_START_RACE_DIR;
+const permissionFloodCount = Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "0");
+const permissionFloodReadyFile = process.env.T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE;
 
 if (startRaceDir) {
   NodeFS.writeFileSync(NodePath.join(startRaceDir, `pid-${process.pid}`), String(process.pid));
@@ -462,6 +466,15 @@ async function runTurn(params: {
   }
 
   if (requestPermission) {
+    const permissionOptions =
+      permissionOptionsMode === "empty"
+        ? []
+        : permissionOptionsMode === "unknown"
+          ? [{ label: "Unexpected", value: "unexpected" }]
+          : [
+              { label: "Allow once", value: "proceed_once" },
+              { label: "Deny", value: "cancel" },
+            ];
     const result = (await requestClient("droid.request_permission", {
       toolUses: [
         {
@@ -481,10 +494,7 @@ async function runTurn(params: {
           },
         },
       ],
-      options: [
-        { label: "Allow once", value: "proceed_once" },
-        { label: "Deny", value: "cancel" },
-      ],
+      options: permissionOptions,
     })) as { selectedOption?: unknown };
     notify({
       type: "permission_resolved",
@@ -496,6 +506,43 @@ async function runTurn(params: {
       emitTurnCompleted("permission_rejected", turnId);
       return;
     }
+  }
+
+  if (permissionFloodCount > 0) {
+    const requests: Array<Promise<unknown>> = [];
+    for (let index = 0; index < permissionFloodCount; index += 1) {
+      requests.push(
+        requestClient("droid.request_permission", {
+          toolUses: [
+            {
+              toolUse: {
+                type: "tool_use",
+                id: `permission-flood-tool-${turnId}-${index}`,
+                input: { command: `echo ${index}` },
+                name: "Execute",
+              },
+              confirmationType: "exec",
+              details: {
+                type: "exec",
+                fullCommand: `echo ${index}`,
+                command: "echo",
+                impactLevel: "low",
+                riskLevelReason: "The mock command only prints text.",
+              },
+            },
+          ],
+          options: [
+            { label: "Allow once", value: "proceed_once" },
+            { label: "Deny", value: "cancel" },
+          ],
+        }),
+      );
+      await NodeTimersPromises.setTimeout(5);
+    }
+    if (permissionFloodReadyFile) {
+      NodeFS.writeFileSync(permissionFloodReadyFile, "");
+    }
+    await Promise.all(requests);
   }
 
   if (askUser) {

@@ -36,7 +36,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
   type ProviderSendTurnInput,
-  type ProviderSession,
+  ProviderSessionLease,
   type ThreadTokenUsageSnapshot,
   type ProviderUserInputAnswers,
   type RuntimeContentStreamKind,
@@ -95,8 +95,12 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import {
+  type ProviderAdapterSession,
+  rollbackTargetMatchesTurnPrefix,
+} from "../Services/ProviderAdapter.ts";
+import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
-const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
@@ -106,11 +110,6 @@ type ClaudeToolResultStreamKind = Extract<
   "command_output" | "file_change_output"
 >;
 type ClaudeSdkEffort = NonNullable<ClaudeQueryOptions["effort"]>;
-
-function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
-  const result = encodeUnknownJsonStringExit(input);
-  return Exit.isSuccess(result) ? result.value : undefined;
-}
 
 type PromptQueueItem =
   | {
@@ -243,7 +242,7 @@ interface ClaudeTaskAgentState {
 }
 
 interface ClaudeSessionContext {
-  session: ProviderSession;
+  session: ProviderAdapterSession;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
   readonly query: ClaudeQueryRuntime;
   streamFiber: Fiber.Fiber<void, Error> | undefined;
@@ -2361,6 +2360,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       type: "turn.completed",
       eventId: stamp.eventId,
       provider: PROVIDER,
+      sessionLease: context.session.sessionLease,
       createdAt: stamp.createdAt,
       threadId: context.session.threadId,
       turnId: turnState.turnId,
@@ -2913,6 +2913,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         type: "turn.started",
         eventId: turnStartedStamp.eventId,
         provider: PROVIDER,
+        sessionLease: context.session.sessionLease,
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
@@ -4240,10 +4241,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           }),
       });
 
-      const session: ProviderSession = {
+      const session: ProviderAdapterSession = {
         threadId,
         provider: PROVIDER,
         providerInstanceId: boundInstanceId,
+        sessionLease: ProviderSessionLease.make(yield* randomUUIDv4),
         status: "ready",
         runtimeMode: input.runtimeMode,
         ...(input.cwd ? { cwd: input.cwd } : {}),
@@ -4444,6 +4446,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         type: "turn.started",
         eventId: turnStartedStamp.eventId,
         provider: PROVIDER,
+        sessionLease: context.session.sessionLease,
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
@@ -4497,6 +4500,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           provider: PROVIDER,
           operation: "rollbackThread",
           issue: `Cannot roll back to ${target.turnIds.length} turns from ${context.turns.length}.`,
+        });
+      }
+      if (!rollbackTargetMatchesTurnPrefix(context.turns, target)) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "Rollback target does not match the current thread history.",
         });
       }
       context.turns.splice(target.turnIds.length);

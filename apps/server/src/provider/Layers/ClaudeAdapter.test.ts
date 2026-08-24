@@ -20,6 +20,7 @@ import {
   type RuntimeMode,
   ThreadId,
   ProviderInstanceId,
+  TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
@@ -3866,7 +3867,7 @@ describe("ClaudeAdapterLive", () => {
   });
 
   it.effect(
-    "supports rollbackThread by trimming in-memory turns and preserving earlier turns",
+    "supports rollbackThread by rejecting mismatched absolute histories before trimming in-memory turns and preserving every retained turn",
     () => {
       const harness = makeHarness();
       return Effect.gen(function* () {
@@ -3932,6 +3933,23 @@ describe("ClaudeAdapterLive", () => {
 
         const threadBeforeRollback = yield* adapter.readThread(session.threadId);
         assert.equal(threadBeforeRollback.turns.length, 2);
+
+        const mismatchedRollback = yield* adapter
+          .rollbackThread(session.threadId, {
+            turnIds: [TurnId.make("foreign-turn")],
+          })
+          .pipe(Effect.result);
+        assert.equal(mismatchedRollback._tag, "Failure");
+        if (mismatchedRollback._tag === "Failure") {
+          assert.instanceOf(mismatchedRollback.failure, ProviderAdapterValidationError);
+          assert.equal(
+            mismatchedRollback.failure.issue,
+            "Rollback target does not match the current thread history.",
+          );
+        }
+
+        const threadAfterRejectedRollback = yield* adapter.readThread(session.threadId);
+        assert.equal(threadAfterRejectedRollback.turns.length, 2);
 
         const rolledBack = yield* adapter.rollbackThread(session.threadId, {
           turnIds: [firstTurn.turnId],
