@@ -807,7 +807,10 @@ const make = Effect.gen(function* () {
 
   // Terminal state for an intent whose owning session is gone: a stopped
   // binding has a null lease, so the ownership-conditional clear can never
-  // match it and the intent would otherwise stay armed forever.
+  // match it and the intent would otherwise stay armed forever. The clear is
+  // identity-guarded rather than lease-guarded: it nulls the slot only while
+  // the slot still holds THIS intent, so a stale intent's terminal clear can
+  // never erase a newer intent a replacement session has already persisted.
   const clearUnexecutableRevertIntent = (
     intent: CheckpointRevertIntent,
     detail: string,
@@ -816,7 +819,11 @@ const make = Effect.gen(function* () {
       const binding = Option.getOrUndefined(
         yield* providerSessionDirectory.getBinding(intent.threadId),
       );
-      if (binding !== undefined) {
+      const storedIntent =
+        binding !== undefined
+          ? Option.getOrUndefined(checkpointRevertIntentFromRuntimePayload(binding.runtimePayload))
+          : undefined;
+      if (binding !== undefined && storedIntent?.commandId === intent.commandId) {
         yield* providerSessionDirectory.upsert({
           threadId: intent.threadId,
           provider: binding.provider,
