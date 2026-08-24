@@ -1198,6 +1198,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       schema: ProviderRollbackConversationInput,
       payload: rawInput,
     });
+    if (input.turnIds.length === 0 && input.anchorTurnId === undefined) {
+      return yield* toValidationError(
+        "ProviderService.rollbackConversation",
+        "Rollback target must include at least one turn ID or an anchor turn ID.",
+      );
+    }
     let metricProvider = "unknown";
     return yield* Effect.gen(function* () {
       const routed = yield* resolveRoutableSession({

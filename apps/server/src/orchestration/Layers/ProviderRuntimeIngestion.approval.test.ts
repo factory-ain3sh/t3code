@@ -10,7 +10,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { runtimeEventToActivities } from "./ProviderRuntimeIngestion.ts";
 
 describe("runtimeEventToActivities approval details", () => {
-  it("preserves complete multiline command details", () => {
+  it("preserves approval details and supported decisions", () => {
     const detail = `bun run release -- ${"long-argument ".repeat(20)}\nsecond line`;
     const event = {
       type: "request.opened",
@@ -29,6 +29,11 @@ describe("runtimeEventToActivities approval details", () => {
     const [activity] = runtimeEventToActivities(event);
 
     expect(activity?.kind).toBe("approval.requested");
+    expect((activity?.payload as Record<string, unknown> | undefined)?.supportedDecisions).toEqual([
+      "accept",
+      "decline",
+      "cancel",
+    ]);
     expect((activity?.payload as Record<string, unknown> | undefined)?.detail).toBe(detail);
   });
 });

@@ -96,7 +96,10 @@ describe("AcpCoreRuntimeEvents", () => {
         }),
       ).toMatchObject({
         type: "request.opened",
-        payload: { requestType: "dynamic_tool_call" },
+        payload: {
+          requestType: "dynamic_tool_call",
+          supportedDecisions: ["accept", "cancel"],
+        },
       });
 
       expect(

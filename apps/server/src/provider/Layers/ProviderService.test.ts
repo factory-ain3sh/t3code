@@ -46,7 +46,11 @@ import {
   ProviderValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterSession, ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterSession,
+  ProviderAdapterShape,
+  ProviderThreadRollbackTarget,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -199,7 +203,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const rollbackThread = vi.fn(
     (
       threadId: ThreadId,
-      target: { readonly turnIds: ReadonlyArray<TurnId> },
+      target: ProviderThreadRollbackTarget,
     ): Effect.Effect<
       {
         threadId: ThreadId;
@@ -926,6 +930,7 @@ it.effect(
         yield* provider.rollbackConversation({
           threadId: startedSession.threadId,
           turnIds: [],
+          anchorTurnId: asTurnId("turn-1"),
         });
       }).pipe(Effect.provide(secondProviderLayer));
 
@@ -947,7 +952,10 @@ it.effect(
       assert.equal(secondCodex.rollbackThread.mock.calls.length, 1);
       const rollbackCall = secondCodex.rollbackThread.mock.calls[0];
       assert.equal(typeof rollbackCall?.[0], "string");
-      assert.deepEqual(rollbackCall?.[1], { turnIds: [] });
+      assert.deepEqual(rollbackCall?.[1], {
+        turnIds: [],
+        anchorTurnId: asTurnId("turn-1"),
+      });
 
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
@@ -1193,6 +1201,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       yield* provider.rollbackConversation({
         threadId: initial.threadId,
         turnIds: [],
+        anchorTurnId: asTurnId("turn-1"),
       });
 
       assert.equal(routing.codex.startSession.mock.calls.length, 1);
@@ -1212,7 +1221,10 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }
       assert.equal(routing.codex.rollbackThread.mock.calls.length, 1);
       const rollbackCall = routing.codex.rollbackThread.mock.calls[0];
-      assert.deepEqual(rollbackCall?.[1], { turnIds: [] });
+      assert.deepEqual(rollbackCall?.[1], {
+        turnIds: [],
+        anchorTurnId: asTurnId("turn-1"),
+      });
     }),
   );
 
@@ -1234,7 +1246,11 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }
 
       yield* advanceTestClock(50);
-      yield* provider.rollbackConversation({ threadId, turnIds: [] });
+      yield* provider.rollbackConversation({
+        threadId,
+        turnIds: [],
+        anchorTurnId: asTurnId("turn-1"),
+      });
 
       const afterRollback = yield* runtimeRepository.getByThreadId({ threadId });
       assert.equal(Option.isSome(afterRollback), true);
@@ -2324,7 +2340,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       });
       yield* provider.rollbackConversation({
         threadId: session.threadId,
-        turnIds: [],
+        turnIds: [asTurnId("turn-1")],
       });
       yield* provider.stopSession({ threadId: session.threadId });
 
@@ -2482,6 +2498,42 @@ validation.layer("ProviderServiceLive validation", (it) => {
       }
       assert.equal(failure.failure.operation, "ProviderService.startSession");
       assert.equal(failure.failure.issue.includes("invalid-provider"), true);
+    }),
+  );
+
+  it.effect("rejects empty rollback targets before session recovery", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-empty-rollback-target");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* validation.codex.stopSession(threadId);
+      validation.codex.startSession.mockClear();
+      validation.codex.rollbackThread.mockClear();
+
+      const result = yield* Effect.result(
+        provider.rollbackConversation({
+          threadId,
+          turnIds: [],
+        }),
+      );
+
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.instanceOf(result.failure, ProviderValidationError);
+        assert.equal(result.failure.operation, "ProviderService.rollbackConversation");
+        assert.equal(
+          result.failure.issue,
+          "Rollback target must include at least one turn ID or an anchor turn ID.",
+        );
+      }
+      assert.equal(validation.codex.startSession.mock.calls.length, 0);
+      assert.equal(validation.codex.rollbackThread.mock.calls.length, 0);
     }),
   );
 
