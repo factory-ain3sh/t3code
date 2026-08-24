@@ -2,6 +2,7 @@ import * as NodeAssert from "node:assert/strict";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -9,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -739,6 +741,37 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("does not start OpenCode resources when lease generation fails", () =>
+    Effect.gen(function* () {
+      const crypto = yield* Crypto.Crypto;
+      const uuidError = PlatformError.systemError({
+        _tag: "Unknown",
+        module: "Crypto",
+        method: "randomUUIDv4",
+        description: "UUID generation unavailable",
+      });
+      const adapter = yield* makeOpenCodeAdapter(openCodeAdapterTestSettings).pipe(
+        Effect.provideService(Crypto.Crypto, {
+          ...crypto,
+          randomUUIDv4: Effect.fail(uuidError),
+        }),
+      );
+
+      const result = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId: asThreadId("thread-start-lease-failure"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateUrls, []);
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, []);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, []);
+    }),
+  );
+
   it.effect("completes streamEvents when the adapter scope closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make("sequential");
@@ -1106,6 +1139,41 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const error = yield* adapter
         .rollbackThread(threadId, {
           turnIds: [TurnId.make("foreign-turn")],
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        NodeAssert.equal(error.issue, "Rollback target does not match the current thread history.");
+      }
+      NodeAssert.deepEqual(runtimeMock.state.revertCalls, []);
+    }),
+  );
+
+  it.effect("rejects a stale OpenCode rollback anchor", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-rollback-stale-anchor");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      runtimeMock.state.messages = [
+        {
+          info: { id: "assistant-1", role: "assistant" },
+          parts: [],
+        },
+        {
+          info: { id: "assistant-2", role: "assistant" },
+          parts: [],
+        },
+      ];
+
+      const error = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [TurnId.make("assistant-1")],
+          anchorTurnId: TurnId.make("stale-assistant"),
         })
         .pipe(Effect.flip);
 

@@ -22,6 +22,7 @@ const omitUsageNotification = process.env.T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION 
 const startRaceDir = process.env.T3_DROID_MOCK_START_RACE_DIR;
 const permissionFloodCount = Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "0");
 const permissionFloodReadyFile = process.env.T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE;
+const interruptOrderDir = process.env.T3_DROID_MOCK_INTERRUPT_ORDER_DIR;
 
 if (startRaceDir) {
   NodeFS.writeFileSync(NodePath.join(startRaceDir, `pid-${process.pid}`), String(process.pid));
@@ -53,6 +54,7 @@ let activeTurn:
       completed: boolean;
     }
   | undefined;
+let interruptRequestBlocked = false;
 
 const pendingServerRequests = new Map<
   string,
@@ -745,6 +747,12 @@ async function handleRequest(message: {
         await NodeFSP.writeFile(NodePath.join(startRaceDir, "thread-lock-held"), "");
         await waitForFile(NodePath.join(startRaceDir, "release-thread-lock"));
       }
+      if (interruptOrderDir && interruptRequestBlocked) {
+        await NodeFSP.writeFile(
+          NodePath.join(interruptOrderDir, "turn-started-before-interrupt"),
+          "",
+        );
+      }
       respond(message.id, {});
       if (
         params.text === "mock release shared tool" &&
@@ -810,6 +818,12 @@ async function handleRequest(message: {
       return;
     }
     case "droid.interrupt_session":
+      if (interruptOrderDir) {
+        interruptRequestBlocked = true;
+        await NodeFSP.writeFile(NodePath.join(interruptOrderDir, "interrupt-received"), "");
+        await waitForFile(NodePath.join(interruptOrderDir, "release-interrupt"));
+        interruptRequestBlocked = false;
+      }
       if (activeTurn) {
         emitTurnCompleted(
           process.env.T3_DROID_MOCK_INTERRUPT_RACE === "1" ? "completed" : "cancelled",

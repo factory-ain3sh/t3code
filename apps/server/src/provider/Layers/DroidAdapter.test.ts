@@ -11,8 +11,10 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
   ApprovalRequestId,
@@ -122,6 +124,9 @@ const startDroidSession = (
 const eventsForThread = (events: ReadonlyArray<ProviderRuntimeEvent>, threadId: ThreadId) =>
   events.filter((event) => String(event.threadId) === String(threadId));
 
+const advanceTestClock = (ms: number) =>
+  TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
+
 async function waitForFile(filePath: string) {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -217,8 +222,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(session.provider, "droid");
       assert.equal(session.model, "mock-deep");
       assert.deepStrictEqual(session.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-1",
+        turnIds: [],
       });
 
       const sentTurn = yield* adapter.sendTurn({
@@ -1261,6 +1267,79 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("does not let a late Droid interrupt cancel a replacement turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-interrupt-replacement-order");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-interrupt-order-")),
+      );
+      const interruptReceived = NodePath.join(coordinationDir, "interrupt-received");
+      const releaseInterrupt = NodePath.join(coordinationDir, "release-interrupt");
+      const overlapReceipt = NodePath.join(coordinationDir, "turn-started-before-interrupt");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_INTERRUPT_ORDER_DIR: coordinationDir,
+      });
+      const firstTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const secondTurnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed" && String(event.threadId) === String(threadId)
+          ? Deferred.succeed(firstTurnCompleted, event).pipe(
+              Effect.flatMap((wasFirst) =>
+                wasFirst ? Effect.void : Deferred.succeed(secondTurnCompleted, event),
+              ),
+              Effect.asVoid,
+            )
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const interruptedTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "mock hang this turn",
+        attachments: [],
+      });
+      yield* adapter.interruptTurn(threadId, interruptedTurn.turnId);
+      const interruptedTerminal = yield* Deferred.await(firstTurnCompleted);
+      yield* Effect.promise(() => waitForFile(interruptReceived));
+
+      const replacementFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "replacement after interrupt",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      const replacementBeforeInterruptFiber = yield* Fiber.join(replacementFiber).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(1_000);
+      const replacementBeforeInterrupt = yield* Fiber.join(replacementBeforeInterruptFiber);
+
+      yield* Effect.promise(() => NodeFSP.writeFile(releaseInterrupt, ""));
+      const replacementTurn = yield* Fiber.join(replacementFiber);
+      const replacementTerminal = yield* Deferred.await(secondTurnCompleted);
+      const overlap = yield* Effect.promise(() =>
+        NodeFSP.access(overlapReceipt).then(
+          () => true,
+          () => false,
+        ),
+      );
+
+      assert.equal(interruptedTerminal.payload.state, "cancelled");
+      assert.equal(Option.isNone(replacementBeforeInterrupt), true);
+      assert.equal(overlap, false);
+      assert.equal(String(replacementTerminal.turnId), String(replacementTurn.turnId));
+      assert.equal(replacementTerminal.payload.state, "completed");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
+  );
+
   it.effect("loads a known Droid resume cursor into a ready session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-known");
@@ -1278,14 +1357,15 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         provider: ProviderDriverKind.make("droid"),
         cwd: process.cwd(),
         runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+        resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
       });
       const started = yield* Deferred.await(sessionStarted);
 
       assert.equal(session.status, "ready");
       assert.deepStrictEqual(session.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-known",
+        turnIds: [],
       });
       assert.equal(started.payload.resume, true);
 
@@ -1318,7 +1398,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         provider: ProviderDriverKind.make("droid"),
         cwd: process.cwd(),
         runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+        resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
       });
       const sentTurn = yield* adapter.sendTurn({
         threadId,
@@ -1355,7 +1435,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           provider: ProviderDriverKind.make("droid"),
           cwd: process.cwd(),
           runtimeMode: "full-access",
-          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-missing" },
+          resumeCursor: { schemaVersion: 2, sessionId: "mock-session-missing", turnIds: [] },
         }),
       );
 
@@ -1378,7 +1458,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           provider: ProviderDriverKind.make("droid"),
           cwd: process.cwd(),
           runtimeMode: "approval-required",
-          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+          resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
         }),
       );
 
@@ -1493,8 +1573,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         attachments: [],
       });
       assert.deepStrictEqual(nextTurn.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
+        turnIds: [nextTurn.turnId],
       });
       yield* Deferred.await(secondTurnCompleted);
 
@@ -1705,8 +1786,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "spec_handoff");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-spec-successor",
+        turnIds: [sentTurn.turnId],
       });
 
       yield* Fiber.interrupt(runtimeEventsFiber);
@@ -1757,8 +1839,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.include(assistantText, "hello from droid mock");
       assert.equal(terminal.payload.state, "completed");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-1",
+        turnIds: [sentTurn.turnId],
       });
 
       yield* Fiber.interrupt(runtimeEventsFiber);
@@ -2121,39 +2204,32 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
-  it.effect("uses an explicit rollback anchor after resuming a Droid session", () =>
+  it.effect("restores durable Droid history before rollback after resume", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-rollback");
       const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_LOAD_STEERING_MESSAGES: "1" });
+      const persistedTurnIds = [
+        TurnId.make("persisted-turn-1"),
+        TurnId.make("persisted-turn-2"),
+        TurnId.make("persisted-turn-3"),
+      ];
+      const persistedAnchor = TurnId.make("persisted-anchor");
 
       yield* adapter.startSession({
         threadId,
         provider: ProviderDriverKind.make("droid"),
         cwd: process.cwd(),
         runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+        resumeCursor: {
+          schemaVersion: 2,
+          sessionId: "mock-session-known",
+          turnIds: [...persistedTurnIds, persistedAnchor],
+        },
       });
-      const persistedTurnIds = [
-        TurnId.make("persisted-turn-1"),
-        TurnId.make("persisted-turn-2"),
-        TurnId.make("persisted-turn-3"),
-      ];
-      const missingAnchor = yield* Effect.flip(
-        adapter.rollbackThread(threadId, {
-          turnIds: persistedTurnIds,
-        }),
-      );
-      assert.equal(missingAnchor._tag, "ProviderAdapterValidationError");
-      if (missingAnchor._tag === "ProviderAdapterValidationError") {
-        assert.equal(
-          missingAnchor.issue,
-          "Rollback target does not match the current thread history.",
-        );
-      }
 
       const snapshot = yield* adapter.rollbackThread(threadId, {
         turnIds: persistedTurnIds,
-        anchorTurnId: TurnId.make("persisted-anchor"),
+        anchorTurnId: persistedAnchor,
       });
 
       assert.deepEqual(
@@ -2161,10 +2237,43 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
+        turnIds: persistedTurnIds,
       });
 
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a resumed Droid rollback prefix that differs from persisted history", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-resumed-rollback-mismatch");
+      const { adapter } = yield* makeDroidScenario();
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("droid"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: {
+          schemaVersion: 2,
+          sessionId: "mock-session-known",
+          turnIds: [TurnId.make("persisted-turn-1"), TurnId.make("persisted-anchor")],
+        },
+      });
+
+      const error = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [TurnId.make("bogus-turn")],
+          anchorTurnId: TurnId.make("persisted-anchor"),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        assert.equal(error.issue, "Rollback target does not match the current thread history.");
+      }
       yield* adapter.stopSession(threadId);
     }),
   );
@@ -2173,6 +2282,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-turn-rollback");
       const { adapter } = yield* makeDroidScenario();
+      const persistedTurnIds = [
+        TurnId.make("persisted-turn-1"),
+        TurnId.make("persisted-turn-2"),
+        TurnId.make("persisted-turn-3"),
+      ];
       const turnCompleted =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
       const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
@@ -2186,7 +2300,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         provider: ProviderDriverKind.make("droid"),
         cwd: process.cwd(),
         runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known" },
+        resumeCursor: {
+          schemaVersion: 2,
+          sessionId: "mock-session-known",
+          turnIds: persistedTurnIds,
+        },
       });
       const resumedTurn = yield* adapter.sendTurn({
         threadId,
@@ -2195,11 +2313,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       yield* Deferred.await(turnCompleted);
 
-      const persistedTurnIds = [
-        TurnId.make("persisted-turn-1"),
-        TurnId.make("persisted-turn-2"),
-        TurnId.make("persisted-turn-3"),
-      ];
       const snapshot = yield* adapter.rollbackThread(threadId, {
         turnIds: persistedTurnIds,
         anchorTurnId: resumedTurn.turnId,
@@ -2210,8 +2323,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
+        turnIds: persistedTurnIds,
       });
 
       const repeated = yield* adapter.rollbackThread(threadId, {
@@ -2222,8 +2336,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(repeated.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
+        turnIds: persistedTurnIds,
       });
 
       yield* Fiber.interrupt(runtimeEventsFiber);

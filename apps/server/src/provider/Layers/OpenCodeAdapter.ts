@@ -42,7 +42,7 @@ import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
 import {
   parseVersionedSessionResumeCursor,
   type ProviderAdapterSession,
-  rollbackTargetMatchesTurnPrefix,
+  rollbackTargetMatchesKnownHistory,
 } from "../Services/ProviderAdapter.ts";
 import {
   buildOpenCodePermissionRules,
@@ -1233,6 +1233,7 @@ export function makeOpenCodeAdapter(
           sessions.delete(input.threadId);
         }
 
+        const sessionLease = ProviderSessionLease.make(yield* randomUUIDv4);
         const started = yield* Effect.gen(function* () {
           const sessionScope = yield* Scope.make();
           const startedExit = yield* Effect.exit(
@@ -1389,7 +1390,7 @@ export function makeOpenCodeAdapter(
         const session: ProviderAdapterSession = {
           provider: PROVIDER,
           providerInstanceId: boundInstanceId,
-          sessionLease: ProviderSessionLease.make(yield* randomUUIDv4),
+          sessionLease,
           status: "ready",
           runtimeMode: input.runtimeMode,
           cwd: directory,
@@ -1703,7 +1704,7 @@ export function makeOpenCodeAdapter(
           (entry) => entry.info.role === "assistant",
         );
         if (
-          !rollbackTargetMatchesTurnPrefix(
+          !rollbackTargetMatchesKnownHistory(
             assistantMessages.map((entry) => ({ id: TurnId.make(entry.info.id) })),
             target,
           )

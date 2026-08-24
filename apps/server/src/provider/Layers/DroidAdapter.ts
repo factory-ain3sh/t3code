@@ -26,6 +26,7 @@ import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
@@ -62,7 +63,6 @@ import { type DroidAdapterShape } from "../Services/DroidAdapter.ts";
 import {
   makeRequireActiveProviderSession,
   makeKeyedLock,
-  parseVersionedSessionResumeCursor,
   type ProviderAdapterSession,
   type ProviderThreadRollbackTarget,
   rollbackTargetMatchesKnownHistory,
@@ -72,9 +72,34 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 
 const PROVIDER = ProviderDriverKind.make("droid");
-const DROID_RESUME_VERSION = 1 as const;
+const DROID_RESUME_VERSION = 2 as const;
 const SESSION_INIT_TIMEOUT_MS = 75_000;
 const DROID_RUNTIME_EVENT_CAPACITY = 256;
+const DroidResumeCursor = Schema.Struct({
+  schemaVersion: Schema.Literal(DROID_RESUME_VERSION),
+  sessionId: Schema.String,
+  turnIds: Schema.Array(TurnId),
+});
+type DroidResumeCursor = typeof DroidResumeCursor.Type;
+const decodeDroidResumeCursor = Schema.decodeUnknownOption(DroidResumeCursor);
+
+function parseDroidResumeCursor(raw: unknown): DroidResumeCursor | undefined {
+  const decoded = decodeDroidResumeCursor(raw);
+  if (Option.isNone(decoded)) return undefined;
+  const sessionId = decoded.value.sessionId.trim();
+  return sessionId.length > 0 ? { ...decoded.value, sessionId } : undefined;
+}
+
+function makeDroidResumeCursor(
+  sessionId: string,
+  turnIds: ReadonlyArray<TurnId>,
+): DroidResumeCursor {
+  return {
+    schemaVersion: DROID_RESUME_VERSION,
+    sessionId,
+    turnIds,
+  };
+}
 
 export interface DroidAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -119,11 +144,10 @@ interface DroidSessionContext {
   session: ProviderAdapterSession;
   readonly scope: Scope.Closeable;
   readonly rpc: DroidRpcClient;
+  pendingInterrupt: Deferred.Deferred<void> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
-  /** True until a rewind replaces the process-known suffix with the absolute t3 prefix. */
-  hasUnknownTurnPrefix: boolean;
   /** Turns already interrupted; late completions must not resurrect them. */
   readonly interruptedTurnIds: Set<TurnId>;
   /**
@@ -352,16 +376,23 @@ export function droidTurnOutcomeForReason(reason: string | undefined): DroidTurn
 }
 
 function rollbackTargetMatchesDroidHistory(
-  ctx: Pick<DroidSessionContext, "hasUnknownTurnPrefix" | "turns">,
+  ctx: Pick<DroidSessionContext, "turns">,
   target: ProviderThreadRollbackTarget,
 ): boolean {
-  if (ctx.hasUnknownTurnPrefix) {
-    return target.anchorTurnId !== undefined;
-  }
   if (ctx.turns.length === target.turnIds.length) {
     return rollbackTargetMatchesTurnPrefix(ctx.turns, target);
   }
   return rollbackTargetMatchesKnownHistory(ctx.turns, target);
+}
+
+function refreshDroidResumeCursor(ctx: DroidSessionContext): void {
+  ctx.session = {
+    ...ctx.session,
+    resumeCursor: makeDroidResumeCursor(
+      ctx.droidSessionId,
+      ctx.turns.map((turn) => turn.id),
+    ),
+  };
 }
 
 function settlePendingApprovalsAsCancelled(
@@ -711,13 +742,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           if (notification.reason === "spec_handoff" && live.specSuccessorSessionId !== undefined) {
             live.droidSessionId = live.specSuccessorSessionId;
             live.specSuccessorSessionId = undefined;
-            live.session = {
-              ...live.session,
-              resumeCursor: {
-                schemaVersion: DROID_RESUME_VERSION,
-                sessionId: live.droidSessionId,
-              },
-            };
+            refreshDroidResumeCursor(live);
           }
           if (notification.turnId !== undefined) {
             live.pendingTurnMessageIds.delete(notification.turnId);
@@ -1295,10 +1320,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
           );
 
-          const resumeSessionId = parseVersionedSessionResumeCursor(
-            input.resumeCursor,
-            DROID_RESUME_VERSION,
-          );
+          const resumeCursor = parseDroidResumeCursor(input.resumeCursor);
+          const resumeSessionId = resumeCursor?.sessionId;
           const rpc = yield* makeDroidExecRpcClient({
             binaryPath: droidSettings.binaryPath,
             cwd,
@@ -1419,10 +1442,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             cwd,
             ...(requestedModelId ? { model: requestedModelId } : {}),
             threadId: input.threadId,
-            resumeCursor: {
-              schemaVersion: DROID_RESUME_VERSION,
-              sessionId: droidSessionId,
-            },
+            resumeCursor: makeDroidResumeCursor(droidSessionId, resumeCursor?.turnIds ?? []),
             createdAt: now,
             updatedAt: now,
           };
@@ -1433,14 +1453,10 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             session,
             scope: sessionScope,
             rpc,
+            pendingInterrupt: undefined,
             pendingApprovals: new Map(),
             pendingUserInputs: new Map(),
-            // Durable Droid user messages do not identify which ones were
-            // steers coalesced into an earlier t3 turn. Keep only the turns
-            // opened by this process as a known suffix; an explicit rollback
-            // anchor can join that suffix to t3's persisted absolute prefix.
-            turns: [],
-            hasUnknownTurnPrefix: initialized.kind === "loaded",
+            turns: (resumeCursor?.turnIds ?? []).map((id) => ({ id, items: [] })),
             interruptedTurnIds: new Set(),
             pendingTurnMessageIds: new Set(),
             persistedPendingTurnMessageIds: new Set(),
@@ -1598,11 +1614,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         }).pipe(Effect.scoped),
       );
 
-    const sendTurn: DroidAdapterShape["sendTurn"] = (input) =>
+    const sendTurnAttempt = (input: Parameters<DroidAdapterShape["sendTurn"]>[0]) =>
       withThreadLock(
         input.threadId,
         Effect.gen(function* () {
           const ctx = yield* requireSession(input.threadId);
+          if (ctx.pendingInterrupt !== undefined) {
+            return { _tag: "PendingInterrupt" as const, barrier: ctx.pendingInterrupt };
+          }
           const text = input.input?.trim();
           const attachments = input.attachments ?? [];
           if (!text && attachments.length === 0) {
@@ -1712,6 +1731,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             // Track the turn here, not from create_message notifications, so
             // rewind anchoring stays 1:1 with t3's turn count.
             ctx.turns.push({ id: turnId, items: [] });
+            refreshDroidResumeCursor(ctx);
             yield* offerRuntimeEvent({
               type: "turn.started",
               ...(yield* makeEventStamp()),
@@ -1739,6 +1759,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   // A rejected opening message never became a droid turn, so
                   // it must not count toward rewind anchoring either.
                   ctx.turns = ctx.turns.filter((turn) => turn.id !== turnId);
+                  refreshDroidResumeCursor(ctx);
                   yield* settleTurn(ctx, turnId, {
                     state: "failed",
                     errorMessage: "Droid rejected the user message.",
@@ -1749,12 +1770,26 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           );
 
           return {
-            threadId: input.threadId,
-            turnId,
-            resumeCursor: ctx.session.resumeCursor,
+            _tag: "Sent" as const,
+            turn: {
+              threadId: input.threadId,
+              turnId,
+              resumeCursor: ctx.session.resumeCursor,
+            },
           };
         }),
       );
+
+    const sendTurn: DroidAdapterShape["sendTurn"] = (input) =>
+      Effect.gen(function* () {
+        while (true) {
+          const result = yield* sendTurnAttempt(input);
+          if (result._tag === "Sent") {
+            return result.turn;
+          }
+          yield* Deferred.await(result.barrier);
+        }
+      });
 
     const interruptTurn: DroidAdapterShape["interruptTurn"] = (threadId, turnId) =>
       Effect.gen(function* () {
@@ -1778,7 +1813,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         });
         if (observed._tag === "Ignore") return;
 
-        const ctx = yield* withThreadLock(
+        yield* withThreadLock(
           threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(threadId);
@@ -1789,6 +1824,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               activeTurnId !== undefined &&
               activeTurnId !== interruptedTurnId
             ) {
+              return;
+            }
+            if (ctx.pendingInterrupt !== undefined) {
+              if (interruptedTurnId !== undefined) {
+                ctx.interruptedTurnIds.delete(interruptedTurnId);
+              }
               return;
             }
             yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
@@ -1802,16 +1843,20 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               });
               ctx.interruptedTurnIds.delete(interruptedTurnId);
             }
-            return ctx;
+            const barrier = yield* Deferred.make<void>();
+            ctx.pendingInterrupt = barrier;
+            yield* requestViaRpc(ctx, "droid.interrupt_session", {}).pipe(
+              Effect.ignore,
+              Effect.ensuring(
+                Effect.sync(() => {
+                  if (ctx.pendingInterrupt === barrier) {
+                    ctx.pendingInterrupt = undefined;
+                  }
+                }).pipe(Effect.andThen(Deferred.succeed(barrier, undefined)), Effect.asVoid),
+              ),
+              Effect.forkIn(ctx.scope),
+            );
           }),
-        );
-        if (ctx === undefined) return;
-        // The local turn is terminal before the provider interrupt begins.
-        // Run the best-effort RPC in the session scope so its timeout cannot
-        // hold the thread lock or block a replacement turn.
-        yield* requestViaRpc(ctx, "droid.interrupt_session", {}).pipe(
-          Effect.ignore,
-          Effect.forkIn(ctx.scope),
         );
       });
 
@@ -1895,7 +1940,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               issue: "Rollback target does not match the current thread history.",
             });
           }
-          if (ctx.turns.length === target.turnIds.length && !ctx.hasUnknownTurnPrefix) {
+          if (ctx.turns.length === target.turnIds.length) {
             return {
               threadId,
               turns: ctx.turns,
@@ -1941,15 +1986,11 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           });
           ctx.droidSessionId = rewound.newSessionId;
           ctx.turns = target.turnIds.map((id) => ({ id, items: [] }));
-          ctx.hasUnknownTurnPrefix = false;
           ctx.session = {
             ...ctx.session,
-            resumeCursor: {
-              schemaVersion: DROID_RESUME_VERSION,
-              sessionId: rewound.newSessionId,
-            },
             updatedAt: yield* nowIso,
           };
+          refreshDroidResumeCursor(ctx);
           return {
             threadId,
             turns: ctx.turns,
