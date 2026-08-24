@@ -16,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { beforeEach } from "vite-plus/test";
 
 import {
+  ApprovalRequestId,
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -76,6 +77,10 @@ const runtimeMock = {
     sessionDirectoryById: new Map<string, string>(),
     sessionUpdateCalls: [] as Array<{ sessionID: string; permission: unknown }>,
     forkCalls: [] as Array<{ sessionID: string; directory?: string }>,
+    permissionReplyCalls: [] as Array<{
+      requestID: string;
+      reply: "once" | "always" | "reject";
+    }>,
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -97,6 +102,7 @@ const runtimeMock = {
     this.state.sessionDirectoryById.clear();
     this.state.sessionUpdateCalls.length = 0;
     this.state.forkCalls.length = 0;
+    this.state.permissionReplyCalls.length = 0;
   },
 };
 
@@ -217,6 +223,11 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             }
           })(),
         }),
+      },
+      permission: {
+        reply: async (input: { requestID: string; reply: "once" | "always" | "reject" }) => {
+          runtimeMock.state.permissionReplyCalls.push(input);
+        },
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -633,6 +644,67 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         events.map((event) => event.type),
         ["session.started", "thread.started", "session.exited"],
       );
+    }),
+  );
+
+  it.effect("exposes only distinct OpenCode permission decisions", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-permission-decisions");
+      const providerSessionId = "http://127.0.0.1:9999/session";
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "permission.asked",
+          properties: {
+            id: "permission-1",
+            sessionID: providerSessionId,
+            permission: "bash",
+            patterns: ["echo mock"],
+            metadata: {},
+          },
+        },
+      ];
+      const requestOpenedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<typeof event, { type: "request.opened" }> =>
+            event.threadId === threadId && event.type === "request.opened",
+        ),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow),
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+
+      const opened = yield* Fiber.join(requestOpenedFiber).pipe(Effect.timeout("1 second"));
+      NodeAssert.deepEqual(opened.payload.supportedDecisions, [
+        "accept",
+        "acceptForSession",
+        "decline",
+      ]);
+
+      const cancelResult = yield* adapter
+        .respondToRequest(threadId, ApprovalRequestId.make(String(opened.requestId)), "cancel")
+        .pipe(Effect.result);
+      NodeAssert.equal(cancelResult._tag, "Failure");
+      if (cancelResult._tag === "Failure") {
+        NodeAssert.equal(cancelResult.failure._tag, "ProviderAdapterValidationError");
+      }
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, []);
+
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(opened.requestId)),
+        "decline",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: "permission-1", reply: "reject" },
+      ]);
+      yield* adapter.stopSession(threadId);
     }),
   );
 

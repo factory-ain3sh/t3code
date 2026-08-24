@@ -81,7 +81,7 @@ before implementation, then presents the plan approval as an approval request in
 Approve it to begin implementation. Rejecting it cancels the turn; send another message in plan mode
 to refine the plan. On approval, Droid hands the work to an implementation session in the same
 thread; the turn keeps streaming and the thread resumes onto the implementation conversation
-afterwards.
+afterward.
 
 ## Context And Subagents
 
@@ -90,7 +90,7 @@ compaction rather than lifetime usage. When Droid delegates work to a subagent, 
 in the conversation with its own completion state.
 
 If you send another message while Droid is working, T3 Code treats it as steering for the active
-turn. Droid may fold it into the current run or process it immediately afterwards.
+turn. Droid may fold it into the current run or process it immediately afterward.
 
 ## Session Resume
 

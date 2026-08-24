@@ -97,7 +97,7 @@ import {
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import {
   type ProviderAdapterSession,
-  rollbackTargetMatchesTurnPrefix,
+  rollbackTargetMatchesKnownHistory,
 } from "../Services/ProviderAdapter.ts";
 import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -4502,7 +4502,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           issue: `Cannot roll back to ${target.turnIds.length} turns from ${context.turns.length}.`,
         });
       }
-      if (!rollbackTargetMatchesTurnPrefix(context.turns, target)) {
+      if (!rollbackTargetMatchesKnownHistory(context.turns, target)) {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
           operation: "rollbackThread",

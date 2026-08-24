@@ -9,6 +9,7 @@ import * as NodeTimersPromises from "node:timers/promises";
 const emitToolCall = process.env.T3_DROID_MOCK_EMIT_TOOL_CALL === "1";
 const requestPermission = process.env.T3_DROID_MOCK_REQUEST_PERMISSION === "1";
 const permissionOptionsMode = process.env.T3_DROID_MOCK_PERMISSION_OPTIONS;
+const permissionResponseFile = process.env.T3_DROID_MOCK_PERMISSION_RESPONSE_FILE;
 const askUser = process.env.T3_DROID_MOCK_ASK_USER === "1";
 const hangTurn = process.env.T3_DROID_MOCK_HANG_TURN === "1";
 const failInit = process.env.T3_DROID_MOCK_FAIL_INIT === "1";
@@ -106,6 +107,12 @@ function respond(id: string | number | null, result: unknown): void {
 
 function fail(id: string | number | null, code: number, message: string): void {
   write({ type: "response", id, error: { code, message } });
+}
+
+async function writeJsonReceipt(filePath: string, value: unknown): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await NodeFSP.writeFile(tempPath, JSON.stringify(value), "utf8");
+  await NodeFSP.rename(tempPath, filePath);
 }
 
 function notifyForSession(sessionId: string, notification: Record<string, unknown>): void {
@@ -471,31 +478,49 @@ async function runTurn(params: {
         ? []
         : permissionOptionsMode === "unknown"
           ? [{ label: "Unexpected", value: "unexpected" }]
-          : [
-              { label: "Allow once", value: "proceed_once" },
-              { label: "Deny", value: "cancel" },
-            ];
-    const result = (await requestClient("droid.request_permission", {
-      toolUses: [
-        {
-          toolUse: {
-            type: "tool_use",
-            id: `permission-tool-${turnId}`,
-            input: { command: "echo mock" },
-            name: "Execute",
+          : permissionOptionsMode === "accept-only"
+            ? [{ label: "Allow once", value: "proceed_once" }]
+            : [
+                { label: "Allow once", value: "proceed_once" },
+                { label: "Deny", value: "cancel" },
+              ];
+    let result: { selectedOption?: unknown };
+    try {
+      result = (await requestClient("droid.request_permission", {
+        toolUses: [
+          {
+            toolUse: {
+              type: "tool_use",
+              id: `permission-tool-${turnId}`,
+              input: { command: "echo mock" },
+              name: "Execute",
+            },
+            confirmationType: "exec",
+            details: {
+              type: "exec",
+              fullCommand: "echo mock",
+              command: "echo",
+              impactLevel: "low",
+              riskLevelReason: "The mock command only prints text.",
+            },
           },
-          confirmationType: "exec",
-          details: {
-            type: "exec",
-            fullCommand: "echo mock",
-            command: "echo",
-            impactLevel: "low",
-            riskLevelReason: "The mock command only prints text.",
-          },
-        },
-      ],
-      options: permissionOptions,
-    })) as { selectedOption?: unknown };
+        ],
+        options: permissionOptions,
+      })) as { selectedOption?: unknown };
+      if (permissionResponseFile) {
+        await writeJsonReceipt(permissionResponseFile, {
+          selectedOption: result.selectedOption,
+        });
+      }
+    } catch (error) {
+      if (permissionResponseFile) {
+        await writeJsonReceipt(permissionResponseFile, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      throw error;
+    }
     notify({
       type: "permission_resolved",
       requestId: `permission-${turnId}`,

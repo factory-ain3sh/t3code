@@ -239,6 +239,17 @@ it.live("runs multi-turn tool/approval flow", () =>
       });
       assert.equal((session.threadId ?? "").length > 0, true);
 
+      const unprovableAnchor = yield* fixture.harness.adapter
+        .rollbackThread(session.threadId, {
+          turnIds: [],
+          anchorTurnId: TurnId.make("unreconstructed-turn"),
+        })
+        .pipe(Effect.result);
+      assert.equal(unprovableAnchor._tag, "Failure");
+      if (unprovableAnchor._tag === "Failure") {
+        assert.equal(unprovableAnchor.failure._tag, "ProviderAdapterValidationError");
+      }
+
       const firstTurnEvents = yield* runTurn({
         provider,
         harness: fixture.harness,
@@ -302,6 +313,10 @@ it.live("rolls back provider conversation state only", () =>
             writeFileString(join(cwd, "README.md"), "v2\n").pipe(Effect.asVoid, Effect.ignore),
         },
       });
+      const firstTurnStartedId = firstTurnEvents.find(
+        (event) => event.type === "turn.started",
+      )?.turnId;
+      assert.isDefined(firstTurnStartedId, "expected a turn.started event for the first turn");
 
       yield* runTurn({
         provider,
@@ -317,11 +332,7 @@ it.live("rolls back provider conversation state only", () =>
 
       yield* provider.rollbackConversation({
         threadId: session.threadId,
-        turnIds: [
-          TurnId.make(
-            String(firstTurnEvents.find((event) => event.type === "turn.started")?.turnId),
-          ),
-        ],
+        turnIds: [TurnId.make(String(firstTurnStartedId))],
       });
 
       const rollbackCalls = fixture.harness.getRollbackCalls(session.threadId);

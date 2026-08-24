@@ -1441,6 +1441,77 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("does not persist a delayed send over a replacement session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-send-replacement-overlap");
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const sendEntered = yield* Deferred.make<void>();
+      const allowSend = yield* Deferred.make<void>();
+      routing.codex.sendTurn.mockImplementationOnce((input) =>
+        Deferred.succeed(sendEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowSend)),
+          Effect.andThen(
+            Effect.succeed({
+              threadId: input.threadId,
+              turnId: asTurnId("turn-delayed-send"),
+              resumeCursor: { opaque: "delayed-send-cursor" },
+            }),
+          ),
+        ),
+      );
+
+      const delayedSend = yield* provider
+        .sendTurn({
+          threadId,
+          input: "delayed send",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(sendEntered);
+
+      const replacementStart = yield* provider
+        .startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      const replacementBeforeSendFiber = yield* Fiber.join(replacementStart).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(1_000);
+      const replacementBeforeSend = yield* Fiber.join(replacementBeforeSendFiber);
+
+      yield* Deferred.succeed(allowSend, undefined);
+      yield* Fiber.join(delayedSend);
+      if (Option.isNone(replacementBeforeSend)) {
+        yield* Fiber.join(replacementStart);
+      }
+
+      assert.equal(Option.isNone(replacementBeforeSend), true);
+      const binding = yield* directory.getBinding(threadId);
+      assert.equal(Option.isSome(binding), true);
+      if (Option.isSome(binding)) {
+        assert.equal(binding.value.provider, CLAUDE_AGENT_DRIVER);
+        assert.equal(binding.value.providerInstanceId, claudeAgentInstanceId);
+        assert.notEqual(binding.value.sessionLease, null);
+        assert.equal(binding.value.status, "running");
+        assert.notDeepEqual(binding.value.resumeCursor, { opaque: "delayed-send-cursor" });
+      }
+    }),
+  );
+
   it.effect("serializes overlapping replacement session starts per thread", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

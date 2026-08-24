@@ -197,6 +197,35 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
     }),
   );
 
+  it.effect("rejects an unprovable anchored empty rollback", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-anchored-empty-rollback");
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [],
+          anchorTurnId: TurnId.make("unreconstructed-turn"),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        assert.equal(error.issue, "Rollback target does not match the current thread history.");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

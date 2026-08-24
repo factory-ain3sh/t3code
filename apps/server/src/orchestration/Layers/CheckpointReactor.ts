@@ -965,6 +965,12 @@ const make = Effect.gen(function* () {
 
     const persisted = yield* persistCheckpointRevertIntent(intent);
     if (!persisted) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: "The provider session was replaced before the revert could start.",
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
       return;
     }
     yield* executeCheckpointRevert(intent);

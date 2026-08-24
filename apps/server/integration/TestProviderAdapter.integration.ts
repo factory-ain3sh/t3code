@@ -25,6 +25,7 @@ import type {
   ProviderThreadSnapshot,
   ProviderThreadTurnSnapshot,
 } from "../src/provider/Services/ProviderAdapter.ts";
+import { rollbackTargetMatchesKnownHistory } from "../src/provider/Services/ProviderAdapter.ts";
 
 export interface TestTurnResponse {
   readonly events: ReadonlyArray<FixtureProviderRuntimeEvent>;
@@ -461,12 +462,15 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       if (!state) {
         return missingSessionEffect(provider, threadId);
       }
-      if (target.turnIds.length > state.snapshot.turns.length) {
+      if (
+        target.turnIds.length > state.snapshot.turns.length ||
+        !rollbackTargetMatchesKnownHistory(state.snapshot.turns, target)
+      ) {
         return Effect.fail(
           new ProviderAdapterValidationError({
             provider,
             operation: "rollbackThread",
-            issue: "Rollback target exceeds the current turn count.",
+            issue: "Rollback target does not match the current thread history.",
           }),
         );
       }

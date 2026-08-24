@@ -360,6 +360,7 @@ describe("CheckpointReactor", () => {
     readonly persistedSessionBinding?: boolean;
     readonly replaceBindingDuringRollback?: boolean;
     readonly failResumeCursorUpdate?: boolean;
+    readonly rejectRevertIntentPersistence?: boolean;
   }) {
     const cwd = createGitRepository();
     tempDirs.push(cwd);
@@ -417,24 +418,41 @@ describe("CheckpointReactor", () => {
     const providerSessionDirectoryBaseLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
     );
-    const providerSessionDirectoryLayer = options?.failResumeCursorUpdate
-      ? Layer.effect(
-          ProviderSessionDirectory,
-          Effect.gen(function* () {
-            const directory = yield* Effect.service(ProviderSessionDirectory);
-            return ProviderSessionDirectory.of({
-              ...directory,
-              updateResumeCursorIfOwned: () =>
-                Effect.fail(
-                  new ProviderSessionDirectoryPersistenceError({
-                    operation: "updateResumeCursorIfOwned",
-                    detail: "Injected cursor persistence failure",
-                  }),
-                ),
-            });
-          }),
-        ).pipe(Layer.provide(providerSessionDirectoryBaseLayer))
-      : providerSessionDirectoryBaseLayer;
+    const providerSessionDirectoryLayer =
+      options?.failResumeCursorUpdate || options?.rejectRevertIntentPersistence
+        ? Layer.effect(
+            ProviderSessionDirectory,
+            Effect.gen(function* () {
+              const directory = yield* Effect.service(ProviderSessionDirectory);
+              return ProviderSessionDirectory.of({
+                ...directory,
+                ...(options?.failResumeCursorUpdate
+                  ? {
+                      updateResumeCursorIfOwned: () =>
+                        Effect.fail(
+                          new ProviderSessionDirectoryPersistenceError({
+                            operation: "updateResumeCursorIfOwned",
+                            detail: "Injected cursor persistence failure",
+                          }),
+                        ),
+                    }
+                  : {}),
+                ...(options?.rejectRevertIntentPersistence
+                  ? {
+                      updateRuntimePayloadIfOwned: (input) => {
+                        const runtimePayload = input.runtimePayload;
+                        return runtimePayload !== null &&
+                          typeof runtimePayload === "object" &&
+                          "checkpointRevertIntent" in runtimePayload
+                          ? Effect.succeed(false)
+                          : directory.updateRuntimePayloadIfOwned(input);
+                      },
+                    }
+                  : {}),
+              });
+            }),
+          ).pipe(Layer.provide(providerSessionDirectoryBaseLayer))
+        : providerSessionDirectoryBaseLayer;
 
     const checkpointReactorLayer = CheckpointReactorLive.pipe(
       Layer.provideMerge(orchestrationLayer),
@@ -1637,6 +1655,27 @@ describe("CheckpointReactor", () => {
     expect(thread.activities.some((activity) => activity.kind === "checkpoint.revert.failed")).toBe(
       true,
     );
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+  });
+
+  it("appends an error activity when revert intent loses session ownership", async () => {
+    const harness = await createHarness({ rejectRevertIntentPersistence: true });
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.checkpoint.revert",
+      commandId: CommandId.make("cmd-revert-lost-ownership"),
+      threadId: ThreadId.make("thread-1"),
+      turnCount: 0,
+      createdAt,
+    });
+    await harness.drain();
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+    ).toBe(true);
     expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
   });
 

@@ -62,6 +62,22 @@ export function rollbackTargetMatchesTurnPrefix(
   return target.turnIds.every((turnId, index) => turns[index]?.id === turnId);
 }
 
+export function rollbackTargetMatchesKnownHistory(
+  turns: ReadonlyArray<Pick<ProviderThreadTurnSnapshot, "id">>,
+  target: ProviderThreadRollbackTarget,
+): boolean {
+  if (!rollbackTargetMatchesTurnPrefix(turns, target)) {
+    return false;
+  }
+  if (target.anchorTurnId === undefined) {
+    return true;
+  }
+  if (turns.length === target.turnIds.length) {
+    return turns.length > 0;
+  }
+  return turns[target.turnIds.length]?.id === target.anchorTurnId;
+}
+
 export function parseVersionedSessionResumeCursor(
   raw: unknown,
   schemaVersion: number,

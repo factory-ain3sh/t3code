@@ -454,7 +454,7 @@ export type CursorSettings = typeof CursorSettings.Type;
 
 export const GrokSettings = makeProviderSettingsSchema(
   {
-    // Off by default (like Cursor and OpenCode): the binding is not yet
+    // Off by default (like OpenCode and Droid): the binding is not yet
     // stable enough to probe on every install. Users opt in from Settings.
     enabled: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(false)),
@@ -480,7 +480,7 @@ export type GrokSettings = typeof GrokSettings.Type;
 
 export const OpenCodeSettings = makeProviderSettingsSchema(
   {
-    // Off by default (like Cursor and Grok): the binding is not yet stable
+    // Off by default (like Grok and Droid): the binding is not yet stable
     // enough to probe on every install. Users opt in from Settings.
     enabled: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(false)),
@@ -532,7 +532,7 @@ export type OpenCodeSettings = typeof OpenCodeSettings.Type;
 
 export const DroidSettings = makeProviderSettingsSchema(
   {
-    // Off by default (like Cursor, Grok, and OpenCode): the binding is not
+    // Off by default (like Grok and OpenCode): the binding is not
     // yet stable enough to probe on every install. Users opt in from
     // Settings.
     enabled: Schema.Boolean.pipe(

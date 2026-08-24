@@ -65,7 +65,7 @@ import {
 import {
   parseVersionedSessionResumeCursor,
   type ProviderAdapterSession,
-  rollbackTargetMatchesTurnPrefix,
+  rollbackTargetMatchesKnownHistory,
 } from "../Services/ProviderAdapter.ts";
 import {
   type AcpSessionMode,
@@ -1110,7 +1110,7 @@ export function makeCursorAdapter(
     const rollbackThread: CursorAdapterShape["rollbackThread"] = (threadId, target) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
-        if (!rollbackTargetMatchesTurnPrefix(ctx.turns, target)) {
+        if (!rollbackTargetMatchesKnownHistory(ctx.turns, target)) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "rollbackThread",

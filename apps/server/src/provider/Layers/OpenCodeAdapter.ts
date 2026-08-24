@@ -4,7 +4,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionLease,
-  PROVIDER_APPROVAL_DECISIONS,
+  type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
   RuntimeItemId,
   RuntimeRequestId,
@@ -60,6 +60,11 @@ import {
 import * as Option from "effect/Option";
 
 const PROVIDER = ProviderDriverKind.make("opencode");
+const OPENCODE_APPROVAL_DECISIONS: ReadonlyArray<ProviderApprovalDecision> = [
+  "accept",
+  "acceptForSession",
+  "decline",
+];
 
 /**
  * Version tag stamped into the OpenCode resume cursor. Bump if the cursor
@@ -975,7 +980,7 @@ export function makeOpenCodeAdapter(
             type: "request.opened",
             payload: {
               requestType: mapPermissionToRequestType(event.properties.permission),
-              supportedDecisions: PROVIDER_APPROVAL_DECISIONS,
+              supportedDecisions: OPENCODE_APPROVAL_DECISIONS,
               detail:
                 event.properties.patterns.length > 0
                   ? event.properties.patterns.join("\n")
@@ -1601,6 +1606,13 @@ export function makeOpenCodeAdapter(
           provider: PROVIDER,
           method: "permission.reply",
           detail: `Unknown pending permission request: ${requestId}`,
+        });
+      }
+      if (!OPENCODE_APPROVAL_DECISIONS.includes(decision)) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "respondToRequest",
+          issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
         });
       }
 

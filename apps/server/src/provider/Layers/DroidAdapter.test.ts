@@ -33,6 +33,14 @@ import {
 } from "./DroidAdapter.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
+const decodeDroidPermissionResponse = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      error: Schema.optional(Schema.Unknown),
+      selectedOption: Schema.optional(Schema.Unknown),
+    }),
+  ),
+);
 
 it("derives Droid approval capabilities without escalating one-shot approval", () => {
   const options = [
@@ -40,11 +48,11 @@ it("derives Droid approval capabilities without escalating one-shot approval", (
     { label: "Cancel", outcome: "cancel" },
   ] as const;
 
-  assert.deepEqual(droidSupportedApprovalDecisions(options), [
-    "acceptForSession",
-    "decline",
-    "cancel",
-  ]);
+  assert.deepEqual(droidSupportedApprovalDecisions(options), ["acceptForSession", "decline"]);
+  assert.deepEqual(
+    droidSupportedApprovalDecisions([{ label: "Allow once", outcome: "proceed_once" }]),
+    ["accept"],
+  );
   assert.isUndefined(selectDroidPermissionOutcome(options, "accept"));
   assert.equal(selectDroidPermissionOutcome(options, "acceptForSession"), "proceed_always");
 });
@@ -65,7 +73,10 @@ type DroidDebugStateReader = Parameters<
 >[0];
 type DroidStartSessionInput = Parameters<DroidTestAdapter["startSession"]>[0];
 
-const makeDroidScenario = (mockEnv?: Record<string, string>) =>
+const makeDroidScenario = (
+  mockEnv?: Record<string, string>,
+  adapterOptions?: Omit<DroidAdapterOptions, "registerDebugStateReader">,
+) =>
   Effect.gen(function* () {
     const dir = yield* Effect.promise(() =>
       NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-jsonrpc-mock-")),
@@ -84,6 +95,7 @@ ${mockAgentExec}
     let debugStateReader: DroidDebugStateReader = () =>
       Effect.die("Droid debug state reader was not registered");
     const adapter = yield* makeDroidAdapter(decodeDroidSettings({ binaryPath: wrapperPath }), {
+      ...adapterOptions,
       registerDebugStateReader: (read) => {
         debugStateReader = read;
       },
@@ -620,7 +632,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const opened = yield* Deferred.await(requestOpened);
       assert.equal(String(opened.turnId), String(sentTurn.turnId));
       assert.equal(opened.payload.requestType, "exec_command_approval");
-      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline", "cancel"]);
+      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline"]);
       assert.equal(opened.payload.detail, "echo mock");
       assert.deepInclude(opened.payload.args, {
         toolUses: [
@@ -709,6 +721,134 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         yield* Fiber.interrupt(runtimeEventsFiber);
       }),
     ).pipe(Effect.asVoid),
+  );
+
+  it.effect("interrupts an accept-only Droid permission without sending cancel", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-permission-accept-only-interrupt");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-permission-accept-only-")),
+      );
+      const permissionResponseFile = NodePath.join(coordinationDir, "permission-response.json");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_REQUEST_PERMISSION: "1",
+        T3_DROID_MOCK_PERMISSION_OPTIONS: "accept-only",
+        T3_DROID_MOCK_PERMISSION_RESPONSE_FILE: permissionResponseFile,
+      });
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const requestResolved =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.resolved" }>>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (String(event.threadId) !== String(threadId)) return Effect.void;
+        if (event.type === "request.opened") {
+          return Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
+        }
+        if (event.type === "request.resolved") {
+          return Deferred.succeed(requestResolved, event).pipe(Effect.ignore);
+        }
+        if (event.type === "turn.completed") {
+          return Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "interrupt the accept-only permission",
+        attachments: [],
+      });
+
+      const opened = yield* Deferred.await(requestOpened);
+      assert.deepEqual(opened.payload.supportedDecisions, ["accept"]);
+      yield* adapter.interruptTurn(threadId, sentTurn.turnId);
+      const terminal = yield* Deferred.await(turnCompleted);
+      const resolved = yield* Deferred.await(requestResolved);
+      yield* Effect.promise(() => waitForFile(permissionResponseFile));
+      const permissionResponse = decodeDroidPermissionResponse(
+        yield* Effect.promise(() => NodeFSP.readFile(permissionResponseFile, "utf8")),
+      );
+
+      assert.equal(terminal.payload.state, "cancelled");
+      assert.isUndefined(resolved.payload.decision);
+      assert.isString(permissionResponse.error);
+      assert.notEqual(permissionResponse.selectedOption, "cancel");
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
+  );
+
+  it.effect("does not open a Droid permission that registers after interruption", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-permission-registration-interrupt");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-permission-registration-")),
+      );
+      const permissionResponseFile = NodePath.join(coordinationDir, "permission-response.json");
+      const requestRegistrationEntered = yield* Deferred.make<void>();
+      const allowRequestRegistration = yield* Deferred.make<void>();
+      const nativeEventLogger = {
+        filePath: NodePath.join(coordinationDir, "native.ndjson"),
+        write: () =>
+          Deferred.succeed(requestRegistrationEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(allowRequestRegistration)),
+          ),
+        close: () => Effect.void,
+      } satisfies NonNullable<DroidAdapterOptions["nativeEventLogger"]>;
+      const { adapter, readDebugState } = yield* makeDroidScenario(
+        {
+          T3_DROID_MOCK_REQUEST_PERMISSION: "1",
+          T3_DROID_MOCK_PERMISSION_RESPONSE_FILE: permissionResponseFile,
+        },
+        { nativeEventLogger },
+      );
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed" && String(event.threadId) === String(threadId)
+              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      const sentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "interrupt before permission registration",
+        attachments: [],
+      });
+      yield* Deferred.await(requestRegistrationEntered);
+      yield* adapter.interruptTurn(threadId, sentTurn.turnId);
+      yield* Deferred.succeed(allowRequestRegistration, undefined);
+      yield* Deferred.await(turnCompleted);
+      yield* Effect.promise(() => waitForFile(permissionResponseFile));
+      const permissionResponse = decodeDroidPermissionResponse(
+        yield* Effect.promise(() => NodeFSP.readFile(permissionResponseFile, "utf8")),
+      );
+      const debugState = yield* readDebugState(threadId);
+
+      assert.equal(debugState.pendingApprovalCount, 0);
+      assert.lengthOf(
+        eventsForThread(runtimeEvents, threadId).filter((event) => event.type === "request.opened"),
+        0,
+      );
+      assert.isString(permissionResponse.error);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
   );
 
   it.effect("rejects a concurrent duplicate Droid permission response", () =>
@@ -1339,6 +1479,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         anchorTurnId: firstTurn.turnId,
       });
       assert.deepEqual(snapshot.turns, []);
+      const replayed = yield* adapter.rollbackThread(threadId, {
+        turnIds: [],
+        anchorTurnId: firstTurn.turnId,
+      });
+      assert.deepEqual(replayed.turns, []);
 
       // The live process re-anchored on the fork: the resume cursor points at
       // the rewound session and the session still takes turns.
@@ -1352,6 +1497,17 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         sessionId: "mock-session-rewound",
       });
       yield* Deferred.await(secondTurnCompleted);
+
+      const staleAnchor = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [],
+          anchorTurnId: firstTurn.turnId,
+        })
+        .pipe(Effect.result);
+      assert.equal(staleAnchor._tag, "Failure");
+      if (staleAnchor._tag === "Failure") {
+        assert.equal(staleAnchor.failure._tag, "ProviderAdapterValidationError");
+      }
 
       // Rolling back past the turns tracked in this process is refused
       // rather than mis-anchored (rollback of the post-rewind turn is fine,
@@ -1526,7 +1682,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       const opened = yield* Deferred.await(requestOpened);
       assert.equal(opened.payload.requestType, "plan_approval");
-      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline", "cancel"]);
+      assert.deepEqual(opened.payload.supportedDecisions, ["accept", "decline"]);
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),

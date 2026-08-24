@@ -54,14 +54,14 @@ yay -S t3code-nightly-bin
 T3 Code drives provider CLIs; it does not ship them. Install the CLI for each provider you want
 to use, then authenticate it.
 
-| Provider   | CLI                                                   | Install                                       | Default binary | Log in with                             |
-| ---------- | ----------------------------------------------------- | --------------------------------------------- | -------------- | --------------------------------------- |
-| Codex      | [Codex CLI](https://developers.openai.com/codex/cli)  | See provider instructions                     | `codex`        | `codex login`                           |
-| Claude     | [Claude Code](https://claude.com/product/claude-code) | See provider instructions                     | `claude`       | `claude auth login`                     |
-| Cursor     | [Cursor CLI](https://cursor.com/cli)                  | See provider instructions                     | `cursor-agent` | `agent login`                           |
-| Droid      | [Factory Droid](https://www.factory.ai/)              | `curl -fsSL https://app.factory.ai/cli \| sh` | `droid`        | Run `droid` and sign in in your browser |
-| Grok Build | [Grok Build CLI](https://x.ai/cli)                    | See provider instructions                     | `grok`         | `grok login`                            |
-| OpenCode   | [OpenCode](https://opencode.ai)                       | See provider instructions                     | `opencode`     | `opencode auth login`                   |
+| Provider   | CLI                                                   | Install                                       | Default binary | Log in with                                  |
+| ---------- | ----------------------------------------------------- | --------------------------------------------- | -------------- | -------------------------------------------- |
+| Codex      | [Codex CLI](https://developers.openai.com/codex/cli)  | See provider instructions                     | `codex`        | `codex login`                                |
+| Claude     | [Claude Code](https://claude.com/product/claude-code) | See provider instructions                     | `claude`       | `claude auth login`                          |
+| Cursor     | [Cursor CLI](https://cursor.com/cli)                  | See provider instructions                     | `cursor-agent` | `agent login`                                |
+| Droid      | [Factory Droid](https://www.factory.ai/)              | `curl -fsSL https://app.factory.ai/cli \| sh` | `droid`        | Run `droid` and sign in through your browser |
+| Grok Build | [Grok Build CLI](https://x.ai/cli)                    | See provider instructions                     | `grok`         | `grok login`                                 |
+| OpenCode   | [OpenCode](https://opencode.ai)                       | See provider instructions                     | `opencode`     | `opencode auth login`                        |
 
 On Windows, install Droid with `irm https://app.factory.ai/cli/windows | iex`.
 
