@@ -37,6 +37,12 @@ const notificationQueueCapacity = 64;
 const lossyNotificationQueueLimit = notificationQueueCapacity - 1;
 export const DROID_SERVER_REQUEST_CONCURRENCY = 16;
 const serverRequestQueueCapacity = DROID_SERVER_REQUEST_CONCURRENCY;
+// Hard cap on lossless backlogs. A consumer this far behind is not slow, it
+// is gone (the adapter drains these queues on forked fibers), and unbounded
+// retention would trade the old reader-suspension deadlock for silent memory
+// growth. Failing the transport turns that into a diagnosed session failure
+// that recovers through resume.
+export const DROID_LOSSLESS_BACKLOG_HARD_LIMIT = 8192;
 const maxOutgoingMessageBytes = 128 * 1024 * 1024;
 // A single inbound frame past this cap terminates the transport rather than
 // dropping the frame: a peer that emits multi-megabyte single frames is
@@ -88,6 +94,7 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
     "duplicate-server-response",
     "message-too-large",
     "frame-too-large",
+    "backlog-overflow",
   ]),
   method: Schema.optionalKey(Schema.String),
   requestId: Schema.optionalKey(Schema.String),
@@ -122,6 +129,8 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
         return `Droid JSON-RPC message is ${this.actualBytes} bytes; limit is ${this.limitBytes}`;
       case "frame-too-large":
         return `Droid JSON-RPC line exceeded the ${this.limitBytes} byte limit`;
+      case "backlog-overflow":
+        return "Droid lossless backlog exceeded its hard limit because the consumer stopped draining";
     }
   }
 }
@@ -565,7 +574,14 @@ export const makeDroidRpcClient = (
 
     const publishServerRequest = (request: DroidServerRequest) =>
       Effect.gen(function* () {
-        if (Queue.sizeUnsafe(serverRequestPubSub) === serverRequestQueueCapacity) {
+        const backlog = Queue.sizeUnsafe(serverRequestPubSub);
+        if (backlog >= DROID_LOSSLESS_BACKLOG_HARD_LIMIT) {
+          return yield* new DroidRpcError({
+            kind: "backlog-overflow",
+            data: { queue: "server-requests", backlog, limit: DROID_LOSSLESS_BACKLOG_HARD_LIMIT },
+          });
+        }
+        if (backlog === serverRequestQueueCapacity) {
           yield* publishDiagnostic(
             `Droid server-request backlog exceeded ${serverRequestQueueCapacity}; the consumer is falling behind`,
           );
@@ -675,13 +691,19 @@ export const makeDroidRpcClient = (
           }
           return;
         }
-        if (
-          !lossyNotificationTypes.has(notification.type) &&
-          Queue.sizeUnsafe(notificationPubSub) === notificationQueueCapacity
-        ) {
-          yield* publishDiagnostic(
-            `Lossless Droid session notification backlog exceeded ${notificationQueueCapacity}; the consumer is falling behind`,
-          );
+        if (!lossyNotificationTypes.has(notification.type)) {
+          const backlog = Queue.sizeUnsafe(notificationPubSub);
+          if (backlog >= DROID_LOSSLESS_BACKLOG_HARD_LIMIT) {
+            return yield* new DroidRpcError({
+              kind: "backlog-overflow",
+              data: { queue: "notifications", backlog, limit: DROID_LOSSLESS_BACKLOG_HARD_LIMIT },
+            });
+          }
+          if (backlog === notificationQueueCapacity) {
+            yield* publishDiagnostic(
+              `Lossless Droid session notification backlog exceeded ${notificationQueueCapacity}; the consumer is falling behind`,
+            );
+          }
         }
         yield* Queue.offer(notificationPubSub, {
           sessionId,

@@ -1279,6 +1279,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getInstanceInfo: ProviderServiceMethod<"getInstanceInfo"> = (instanceId) =>
     registry.getInstanceInfo(instanceId);
 
+  // Contract: the caller holds this thread's session lifecycle lock (the
+  // CheckpointReactor wraps revert execution in withSessionLifecycleLock).
+  // The per-thread lock is not reentrant, so acquiring it here would deadlock
+  // the reactor; lifecycleLockHeld below asserts the caller's obligation.
   const rollbackConversation: ProviderServiceMethod<"rollbackConversation"> = Effect.fn(
     "rollbackConversation",
   )(function* (rawInput) {

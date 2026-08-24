@@ -263,24 +263,25 @@ export function droidCanonicalRequestType(
  * (the CLI versions it independently): one-shot `proceed_*` variants bind to
  * accept, `proceed_always*` variants to acceptForSession, and an outcome this
  * server does not recognize is never selectable — misbinding it could grant
- * more than the user chose.
+ * more than the user chose. The outcome is an opaque token the reply must
+ * carry back byte-for-byte, so trimming only classifies; the original string
+ * is returned.
  */
 export function selectDroidPermissionOutcome(
   options: ReadonlyArray<DroidPermissionOption>,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
-  const outcomes = options
-    .map((option) => option.outcome.trim())
-    .filter((outcome): outcome is string => Boolean(outcome));
+  const outcomes = options.map((option) => option.outcome).filter((outcome) => outcome.trim());
   switch (decision) {
     case "accept":
-      return outcomes.find(
-        (outcome) => outcome.startsWith("proceed_") && !outcome.startsWith("proceed_always"),
-      );
+      return outcomes.find((outcome) => {
+        const trimmed = outcome.trim();
+        return trimmed.startsWith("proceed_") && !trimmed.startsWith("proceed_always");
+      });
     case "acceptForSession":
-      return outcomes.find((outcome) => outcome.startsWith("proceed_always"));
+      return outcomes.find((outcome) => outcome.trim().startsWith("proceed_always"));
     case "decline":
-      return outcomes.includes("cancel") ? "cancel" : undefined;
+      return outcomes.find((outcome) => outcome.trim() === "cancel");
     default:
       return undefined;
   }
@@ -307,7 +308,7 @@ export function droidApprovalOptions(
     if (outcome === undefined) {
       continue;
     }
-    const label = options.find((option) => option.outcome.trim() === outcome)?.label.trim();
+    const label = options.find((option) => option.outcome === outcome)?.label.trim();
     approvalOptions.push({ decision, label: label || DROID_DECISION_FALLBACK_LABELS[decision] });
   }
   return approvalOptions;
@@ -1131,7 +1132,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         // turn's handoff.
         const approvedSpecHandoff =
           primaryToolUse?.details.type === "exit_spec_mode" &&
-          selectedOutcome !== "cancel" &&
+          selectedOutcome.trim() !== "cancel" &&
           (yield* withThreadLock(
             ctx.threadId,
             Effect.sync(() => {

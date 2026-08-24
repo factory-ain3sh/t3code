@@ -755,8 +755,10 @@ const make = Effect.gen(function* () {
   // Keyed on the binding's CURRENT lease, not the intent's: session recovery
   // re-mints the lease mid-rollback, and a clear that required intent-lease
   // equality would strand exactly the intents that most need a terminal state.
-  // The rewound cursor is best-effort; the intent clears regardless, because a
-  // retained intent replays the destructive restore at the next startup.
+  // A provided rewound cursor must persist before the intent clears: the
+  // intent is the recovery state that reconciles the rewound provider with the
+  // stored cursor, so a failed cursor write propagates and the caller retains
+  // the intent for the startup replay instead of clearing over a stale cursor.
   const clearCheckpointRevertIntent = (intent: CheckpointRevertIntent, resumeCursor?: unknown) =>
     providerSessionDirectory.getBinding(intent.threadId).pipe(
       Effect.map(Option.getOrUndefined),
@@ -780,16 +782,13 @@ const make = Effect.gen(function* () {
                 resumeCursor,
               });
         return persistResumeCursor.pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("Failed to persist the rewound provider resume cursor.", {
-              threadId: intent.threadId,
-              cause: error,
-            }).pipe(Effect.as(false)),
-          ),
           Effect.tap((persisted) =>
             persisted
               ? Effect.void
-              : Effect.logWarning(
+              : // A CAS miss means ownership moved mid-clear; the intent clear
+                // below misses the same CAS and the ownership fence owns the
+                // terminal state at the next replay.
+                Effect.logWarning(
                   "Clearing checkpoint revert intent without a rewound resume cursor.",
                   { threadId: intent.threadId, turnCount: intent.turnCount },
                 ),
@@ -884,23 +883,79 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    // Roll back the provider conversation before touching the working tree: a
-    // rollback that fails deterministically must not leave files reverted,
-    // and any failure below clears the intent instead of leaving it armed for
-    // an eternal startup replay of the destructive restore.
-    yield* Effect.gen(function* () {
-      const snapshot = yield* providerService.rollbackConversation({
+    // Prove the checkpoint exists before the provider conversation is rolled
+    // back, so a deterministically missing ref never leaves the provider
+    // rewound behind an unrestored tree. turnCount 0 falls back to HEAD and
+    // needs no ref.
+    if (intent.turnCount !== 0) {
+      const hasRef = yield* checkpointStore.hasCheckpointRef({
+        cwd: intent.cwd,
+        checkpointRef: intent.checkpointRef,
+      });
+      if (!hasRef) {
+        yield* clearUnexecutableRevertIntent(
+          intent,
+          `Filesystem checkpoint is unavailable for turn ${intent.turnCount}.`,
+        );
+        return;
+      }
+    }
+
+    // Roll back the provider conversation before touching the working tree. A
+    // failure here is pre-destructive: nothing has moved, so the intent clears
+    // terminally instead of arming an eternal startup replay.
+    const rollback = yield* providerService
+      .rollbackConversation({
         threadId: intent.threadId,
         turnIds: intent.turnIds,
         ...(intent.anchorTurnId !== undefined ? { anchorTurnId: intent.anchorTurnId } : {}),
-      });
+      })
+      .pipe(
+        Effect.map(Option.some),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.failCause(cause);
+          }
+          return Effect.gen(function* () {
+            yield* clearCheckpointRevertIntent(intent).pipe(
+              Effect.catch(() => Effect.succeed(false)),
+            );
+            yield* appendRevertFailureActivity({
+              threadId: intent.threadId,
+              turnCount: intent.turnCount,
+              detail: Cause.pretty(cause).slice(0, 2000),
+              createdAt: intent.createdAt,
+            }).pipe(Effect.catch(() => Effect.void));
+            yield* Effect.logWarning("Checkpoint revert failed; the intent was cleared.", {
+              threadId: intent.threadId,
+              turnCount: intent.turnCount,
+              cause: Cause.pretty(cause),
+            });
+            return Option.none();
+          });
+        }),
+      );
+    if (Option.isNone(rollback)) {
+      return;
+    }
+    const snapshot = rollback.value;
 
+    // The provider conversation is rewound past this point. A failure below
+    // must NOT clear the intent: it is the durable recovery state that lets
+    // the startup replay reconcile the rewound provider, the tree, and the
+    // read model. The replay converges because rolling back an already-applied
+    // equal-length target is a no-op, the restore is idempotent, and
+    // thread.revert.complete reuses the intent's commandId.
+    yield* Effect.gen(function* () {
       const restored = yield* checkpointStore.restoreCheckpoint({
         cwd: intent.cwd,
         checkpointRef: intent.checkpointRef,
         fallbackToHead: intent.turnCount === 0,
       });
       if (!restored) {
+        // Ref deleted between the pre-check and the restore. The provider is
+        // rewound, so persist the rewound cursor with the clear and surface
+        // the failure rather than retrying against a ref that will stay gone.
         yield* clearCheckpointRevertIntent(intent, snapshot.resumeCursor).pipe(
           Effect.catch(() => Effect.succeed(false)),
         );
@@ -939,20 +994,21 @@ const make = Effect.gen(function* () {
           return Effect.failCause(cause);
         }
         return Effect.gen(function* () {
-          yield* clearCheckpointRevertIntent(intent).pipe(
-            Effect.catch(() => Effect.succeed(false)),
-          );
           yield* appendRevertFailureActivity({
             threadId: intent.threadId,
             turnCount: intent.turnCount,
-            detail: Cause.pretty(cause).slice(0, 2000),
+            detail:
+              "The revert applied but its bookkeeping did not finish; it completes on the next server start.",
             createdAt: intent.createdAt,
           }).pipe(Effect.catch(() => Effect.void));
-          yield* Effect.logWarning("Checkpoint revert failed; the intent was cleared.", {
-            threadId: intent.threadId,
-            turnCount: intent.turnCount,
-            cause: Cause.pretty(cause),
-          });
+          yield* Effect.logWarning(
+            "Checkpoint revert bookkeeping failed after the rollback; the intent is retained for startup recovery.",
+            {
+              threadId: intent.threadId,
+              turnCount: intent.turnCount,
+              cause: Cause.pretty(cause),
+            },
+          );
         });
       }),
     );

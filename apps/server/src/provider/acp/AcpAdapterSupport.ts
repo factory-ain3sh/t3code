@@ -67,7 +67,10 @@ export function selectAcpPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
-  return acpOptionForDecision(request, decision)?.optionId.trim() || undefined;
+  // The option id is an opaque agent token: trimming only validates
+  // non-emptiness, and the reply carries the id back byte-for-byte.
+  const optionId = acpOptionForDecision(request, decision)?.optionId;
+  return optionId?.trim() ? optionId : undefined;
 }
 
 const ACP_DECISION_FALLBACK_LABELS = {

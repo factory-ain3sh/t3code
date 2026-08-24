@@ -43,7 +43,6 @@ const nativePackageToolUpdate = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "@example/native-package-tool",
   homebrewFormula: "native-package-tool",
   nativeUpdate: {
-    executable: "native-package-tool",
     args: ["update"],
     lockKey: "native-package-tool-native",
     isCommandPath: isNativeTestCommandPath("/.local/bin/native-package-tool"),
@@ -54,7 +53,6 @@ const scopedPackageToolUpdate = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "@example/scoped-package-tool",
   homebrewFormula: "example/tap/scoped-package-tool",
   nativeUpdate: {
-    executable: "scoped-package-tool",
     args: ["upgrade"],
     lockKey: "scoped-package-tool-native",
     isCommandPath: isNativeTestCommandPath("/.scoped-package-tool/bin/scoped-package-tool"),
@@ -358,9 +356,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           provider: driver("nativePackageTool"),
           packageName: "@example/native-package-tool",
           update: {
-            command: "native-package-tool update",
+            command: `${nativePackageToolPath} update`,
 
-            executable: "native-package-tool",
+            executable: nativePackageToolPath,
 
             args: ["update"],
 
@@ -395,9 +393,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           provider: driver("scopedPackageTool"),
           packageName: "@example/scoped-package-tool",
           update: {
-            command: "scoped-package-tool upgrade",
+            command: `${scopedPackageToolPath} upgrade`,
 
-            executable: "scoped-package-tool",
+            executable: scopedPackageToolPath,
 
             args: ["upgrade"],
 
@@ -555,7 +553,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       npmPackageName: "@anthropic-ai/claude-code",
       homebrewFormula: "claude-code",
       nativeUpdate: {
-        executable: "claude",
         args: ["update"],
         lockKey: "claude-native",
         isCommandPath: isNativeTestCommandPath("/.local/bin/claude"),
@@ -622,9 +619,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         provider: driver("droid"),
         packageName: "@factory/cli",
         update: {
-          command: "droid update",
+          command: `${droidPath} update`,
 
-          executable: "droid",
+          executable: droidPath,
 
           args: ["update"],
 
@@ -647,9 +644,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       provider: driver("droid"),
       packageName: "@factory/cli",
       update: {
-        command: "droid update",
+        command: "C:\\Users\\dev\\bin\\droid.exe update",
 
-        executable: "droid",
+        executable: "C:\\Users\\dev\\bin\\droid.exe",
 
         args: ["update"],
 

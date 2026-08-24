@@ -60,7 +60,6 @@ export const DroidProviderMaintenanceResolver = makePackageManagedProviderMainte
   npmPackageName: "@factory/cli",
   homebrewFormula: null,
   nativeUpdate: {
-    executable: "droid",
     args: ["update"],
     lockKey: "droid-native",
     isCommandPath: isDroidNativeCommandPath,

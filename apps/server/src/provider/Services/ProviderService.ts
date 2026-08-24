@@ -118,6 +118,11 @@ export interface ProviderServiceShape {
 
   /**
    * Roll back provider conversation state to one absolute target.
+   *
+   * The caller must already hold this thread's session lifecycle lock (via
+   * `withSessionLifecycleLock`): rollback routes with `lifecycleLockHeld` and
+   * must not race start, send, stop, or recovery. The per-thread lock is not
+   * reentrant, so this method cannot acquire it itself.
    */
   readonly rollbackConversation: (input: {
     readonly threadId: ThreadId;

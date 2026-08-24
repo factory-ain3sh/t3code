@@ -68,7 +68,6 @@ export interface PackageManagedProviderMaintenanceDefinition {
   readonly npmPackageName: string;
   readonly homebrewFormula: string | null;
   readonly nativeUpdate: {
-    readonly executable: string;
     readonly args: ReadonlyArray<string>;
     readonly lockKey: string;
     readonly isCommandPath: (commandPath: string) => boolean;
@@ -207,22 +206,6 @@ function makeHomebrewProviderMaintenanceCapabilities(
   });
 }
 
-function makeNativeProviderMaintenanceCapabilities(
-  definition: PackageManagedProviderMaintenanceDefinition,
-): ProviderMaintenanceCapabilities | null {
-  if (!definition.nativeUpdate) {
-    return null;
-  }
-
-  return makeProviderMaintenanceCapabilities({
-    provider: definition.provider,
-    packageName: definition.npmPackageName,
-    updateExecutable: definition.nativeUpdate.executable,
-    updateArgs: definition.nativeUpdate.args,
-    updateLockKey: definition.nativeUpdate.lockKey,
-  });
-}
-
 export function hasPathSeparator(value: string): boolean {
   return value.includes("/") || value.includes("\\");
 }
@@ -292,14 +275,22 @@ export function resolvePackageManagedProviderMaintenance(
     ];
 
     const nativeUpdate = definition.nativeUpdate;
-    if (
-      nativeUpdate &&
-      commandPaths.some((commandPath) => nativeUpdate.isCommandPath(commandPath))
-    ) {
-      return (
-        makeNativeProviderMaintenanceCapabilities(definition) ??
-        makeNpmGlobalProviderMaintenanceCapabilities(definition)
+    if (nativeUpdate) {
+      // A native self-updating binary can live outside PATH (~/.local/bin,
+      // %USERPROFILE%\bin), so the update must invoke the resolved binary
+      // itself rather than a bare command name.
+      const nativeCommandPath = commandPaths.find((commandPath) =>
+        nativeUpdate.isCommandPath(commandPath),
       );
+      if (nativeCommandPath !== undefined) {
+        return makeProviderMaintenanceCapabilities({
+          provider: definition.provider,
+          packageName: definition.npmPackageName,
+          updateExecutable: nativeCommandPath,
+          updateArgs: nativeUpdate.args,
+          updateLockKey: nativeUpdate.lockKey,
+        });
+      }
     }
     if (commandPaths.some(isVitePlusGlobalCommandPath)) {
       return makeVitePlusGlobalProviderMaintenanceCapabilities(definition);

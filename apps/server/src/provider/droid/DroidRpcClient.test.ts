@@ -14,7 +14,12 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
-import { DroidRpcError, DroidRpcSpawnError, makeDroidRpcClient } from "./DroidRpcClient.ts";
+import {
+  DROID_LOSSLESS_BACKLOG_HARD_LIMIT,
+  DroidRpcError,
+  DroidRpcSpawnError,
+  makeDroidRpcClient,
+} from "./DroidRpcClient.ts";
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
@@ -766,6 +771,56 @@ it.effect("resolves responses queued behind a lossless notification burst", () =
     assert.deepStrictEqual(result, { transportAlive: true });
 
     yield* within(client.shutdown, "client shutdown did not complete");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+);
+
+it.effect("terminates the transport when a lossless backlog exceeds the hard cap", () =>
+  Effect.gen(function* () {
+    const script = `
+      const notification = JSON.stringify({
+        jsonrpc: "2.0",
+        type: "notification",
+        method: "droid.session_notification",
+        params: {
+          notification: {
+            type: "assistant_text_delta",
+            messageId: "message-flood",
+            textDelta: "x"
+          }
+        }
+      }) + "\\n";
+      const total = ${DROID_LOSSLESS_BACKLOG_HARD_LIMIT + 64};
+      let written = 0;
+      const writeMore = () => {
+        while (written < total) {
+          written += 1;
+          if (!process.stdout.write(notification)) {
+            process.stdout.once("drain", writeMore);
+            return;
+          }
+        }
+      };
+      writeMore();
+      process.stdin.resume();
+      setInterval(() => {}, 1_000);
+    `;
+    const client = yield* makeDroidRpcClient({
+      command: process.execPath,
+      args: ["-e", script],
+    });
+
+    // No notification consumer: past the hard cap the reader must fail the
+    // transport instead of suspending or retaining the backlog without bound.
+    const exit = yield* within(client.exits, "backlog overflow did not terminate the transport");
+    assert.include(exit.description, "Droid stdout stream failed");
+
+    const requestResult = yield* Effect.result(
+      client.request("droid.list_models", {}, { timeoutMs: undefined }),
+    );
+    assert.equal(requestResult._tag, "Failure");
+    if (requestResult._tag === "Failure") {
+      assert.equal(requestResult.failure.kind, "process-exit");
+    }
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
 );
 

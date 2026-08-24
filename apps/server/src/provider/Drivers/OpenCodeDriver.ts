@@ -69,7 +69,6 @@ const UPDATE = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "opencode-ai",
   homebrewFormula: "anomalyco/tap/opencode",
   nativeUpdate: {
-    executable: "opencode",
     args: ["upgrade"],
     lockKey: "opencode-native",
     isCommandPath: isOpenCodeNativeCommandPath,

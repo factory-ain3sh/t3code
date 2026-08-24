@@ -194,6 +194,37 @@ export function grokPromptSettlementBelongsToContext(input: {
   );
 }
 
+/**
+ * Decide what a prompt settlement may do against the live session context.
+ * "settle" consumes a prompt slot and may complete the turn. A stale-but-
+ * same-session settlement ("emit-stale-terminal") still owes the read model a
+ * terminal event for its own turn. Everything else drops: a replacement
+ * session can resume the same ACP session id under a new lease, and a late
+ * predecessor settlement must neither emit a terminal event stamped with the
+ * replacement's lease nor consume its prompt slots.
+ */
+export function grokPromptSettlementAction(input: {
+  readonly liveAcpSessionId: string;
+  readonly expectedAcpSessionId: string;
+  readonly liveSessionLease: ProviderSessionLease;
+  readonly expectedSessionLease: ProviderSessionLease;
+  readonly liveActiveTurnId: TurnId | undefined;
+  readonly liveSessionActiveTurnId: TurnId | undefined;
+  readonly turnId: TurnId;
+  readonly turnInterrupted: boolean;
+}): "settle" | "emit-stale-terminal" | "drop" {
+  if (
+    input.liveSessionLease !== input.expectedSessionLease ||
+    input.liveAcpSessionId !== input.expectedAcpSessionId
+  ) {
+    return "drop";
+  }
+  if (grokPromptSettlementBelongsToContext(input)) {
+    return "settle";
+  }
+  return input.turnInterrupted ? "drop" : "emit-stale-terminal";
+}
+
 export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapterLiveOptions) {
   return Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("grok");
@@ -268,6 +299,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       threadId: ThreadId,
       turnId: TurnId,
       expectedAcpSessionId: string,
+      expectedSessionLease: ProviderSessionLease,
       options?: {
         readonly errorMessage?: string;
         readonly completedStopReason?: EffectAcpSchema.StopReason | null;
@@ -281,23 +313,24 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         if (!liveCtx) {
           return;
         }
-        const settlementBelongsToLiveContext = grokPromptSettlementBelongsToContext({
+        const action = grokPromptSettlementAction({
           liveAcpSessionId: liveCtx.acpSessionId,
           expectedAcpSessionId,
+          liveSessionLease: liveCtx.session.sessionLease,
+          expectedSessionLease,
           liveActiveTurnId: liveCtx.activeTurnId,
           liveSessionActiveTurnId: liveCtx.session.activeTurnId,
           turnId,
+          turnInterrupted: liveCtx.interruptedTurnIds.has(turnId),
         });
-        if (!settlementBelongsToLiveContext) {
+        if (action === "drop") {
+          return;
+        }
+        if (action === "emit-stale-terminal") {
           // interruptTurn already consumed every prompt slot for this turn. A
           // late prompt result must neither emit a second terminal event nor
-          // consume a slot belonging to a newer turn on the same ACP session.
-          if (
-            liveCtx.acpSessionId !== expectedAcpSessionId ||
-            liveCtx.interruptedTurnIds.has(turnId)
-          ) {
-            return;
-          }
+          // consume a slot belonging to a newer turn on the same ACP session,
+          // but the read model still needs a terminal event for its own turn.
           if (options?.emitTurnCompletion !== false) {
             if (options?.errorMessage !== undefined) {
               yield* offerRuntimeEvent({
@@ -998,11 +1031,17 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 yield* Effect.yieldNow;
               }
               if (ctx.interruptedTurnIds.has(turnId)) {
-                yield* settlePromptInFlight(input.threadId, turnId, ctx.acpSessionId, {
-                  completedStopReason: "cancelled",
-                  emitTurnCompletion: false,
-                  settleAllPrompts: true,
-                });
+                yield* settlePromptInFlight(
+                  input.threadId,
+                  turnId,
+                  ctx.acpSessionId,
+                  ctx.session.sessionLease,
+                  {
+                    completedStopReason: "cancelled",
+                    emitTurnCompletion: false,
+                    settleAllPrompts: true,
+                  },
+                );
                 return yield* new ProviderAdapterRequestError({
                   provider: PROVIDER,
                   method: "session/prompt",
@@ -1035,6 +1074,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               return {
                 acp: ctx.acp,
                 acpSessionId: ctx.acpSessionId,
+                sessionLease: ctx.session.sessionLease,
                 displayModel,
                 promptParts,
                 turnId,
@@ -1046,10 +1086,16 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   if (!liveCtx) {
                     return;
                   }
-                  yield* settlePromptInFlight(input.threadId, turnId, liveCtx.acpSessionId, {
-                    errorMessage: "Grok prompt preparation failed.",
-                    emitTurnCompletion: false,
-                  });
+                  yield* settlePromptInFlight(
+                    input.threadId,
+                    turnId,
+                    liveCtx.acpSessionId,
+                    liveCtx.session.sessionLease,
+                    {
+                      errorMessage: "Grok prompt preparation failed.",
+                      emitTurnCompletion: false,
+                    },
+                  );
                 }),
               ),
             );
@@ -1095,6 +1141,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   input.threadId,
                   prepared.turnId,
                   prepared.acpSessionId,
+                  prepared.sessionLease,
                   {
                     errorMessage: "Grok session changed before the turn completed.",
                     settleAllPrompts: true,
@@ -1222,6 +1269,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         input.threadId,
                         prepared.turnId,
                         prepared.acpSessionId,
+                        prepared.sessionLease,
                         {
                           errorMessage: "Grok session changed before the turn completed.",
                           settleAllPrompts: true,
@@ -1249,6 +1297,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       input.threadId,
                       prepared.turnId,
                       prepared.acpSessionId,
+                      prepared.sessionLease,
                       {
                         completedStopReason: completedStopReasonFromPromptResponse(promptResult),
                       },
@@ -1261,9 +1310,15 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               const errorMessage = yield* Ref.get(promptFailureMessageRef);
               yield* withThreadLock(
                 input.threadId,
-                settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
-                  errorMessage: errorMessage ?? "Grok prompt request failed.",
-                }),
+                settlePromptInFlight(
+                  input.threadId,
+                  prepared.turnId,
+                  prepared.acpSessionId,
+                  prepared.sessionLease,
+                  {
+                    errorMessage: errorMessage ?? "Grok prompt request failed.",
+                  },
+                ),
               );
             }).pipe(Effect.catch(() => Effect.void)),
           ),
@@ -1330,10 +1385,16 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             );
             if (interruptedTurnId) {
               ctx.interruptedTurnIds.add(interruptedTurnId);
-              yield* settlePromptInFlight(threadId, interruptedTurnId, ctx.acpSessionId, {
-                completedStopReason: "cancelled",
-                settleAllPrompts: true,
-              });
+              yield* settlePromptInFlight(
+                threadId,
+                interruptedTurnId,
+                ctx.acpSessionId,
+                ctx.session.sessionLease,
+                {
+                  completedStopReason: "cancelled",
+                  settleAllPrompts: true,
+                },
+              );
             } else if (
               ctx.promptsInFlight > 0 ||
               ctx.session.status === "running" ||

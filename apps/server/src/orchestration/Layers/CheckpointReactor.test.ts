@@ -1702,7 +1702,7 @@ describe("CheckpointReactor", () => {
     expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
   });
 
-  it("clears a recovered revert intent even when its rewind cursor fails to persist", async () => {
+  it("retains a recovered revert intent when its rewind cursor fails to persist", async () => {
     const harness = await createHarness({
       pendingRevertRecovery: true,
       rollbackResumeCursor: { sessionId: "session-rewound" },
@@ -1711,9 +1711,11 @@ describe("CheckpointReactor", () => {
 
     await harness.drain();
 
-    // The revert itself completed; only the cursor write failed. A retained
-    // intent would replay the destructive restore at the next startup, so the
-    // stale cursor is the lesser damage.
+    // The destructive phase completed but the rewound cursor never persisted.
+    // The intent is the recovery state that reconciles the rewound provider
+    // with the stored cursor, so it survives for the startup replay (which is
+    // safe: the rollback replay is a no-op, the restore is idempotent, and
+    // the execute-time progress fence blocks replay over newer work).
     expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
     expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
     const binding = await harness.runtime.runPromise(
@@ -1723,9 +1725,40 @@ describe("CheckpointReactor", () => {
     if (Option.isSome(binding)) {
       expect(binding.value.resumeCursor).toEqual({ sessionId: "session-a" });
       expect(binding.value.runtimePayload).toMatchObject({
-        checkpointRevertIntent: null,
+        checkpointRevertIntent: { threadId: "thread-1" },
       });
     }
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+    ).toBe(true);
+  });
+
+  it("clears a missing-checkpoint revert intent before rolling back the provider", async () => {
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      seedFilesystemCheckpoints: false,
+    });
+
+    await harness.drain();
+
+    // The ref pre-check proves the checkpoint exists before anything
+    // destructive runs: a deterministically missing ref clears the intent
+    // terminally with the provider conversation untouched.
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    const binding = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value.runtimePayload).toMatchObject({ checkpointRevertIntent: null });
+    }
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+    ).toBe(true);
   });
 
   it("clears a recovered revert intent terminally when the provider rollback fails", async () => {

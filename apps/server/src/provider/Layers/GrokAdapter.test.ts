@@ -20,13 +20,18 @@ import {
   GrokSettings,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionLease,
   ThreadId,
   TurnId,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
-import { grokPromptSettlementBelongsToContext, makeGrokAdapter } from "./GrokAdapter.ts";
+import {
+  grokPromptSettlementAction,
+  grokPromptSettlementBelongsToContext,
+  makeGrokAdapter,
+} from "./GrokAdapter.ts";
 const decodeGrokSettings = Schema.decodeSync(GrokSettings);
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
@@ -119,6 +124,70 @@ it("requires a settlement to match the live Grok turn", () => {
       liveSessionActiveTurnId: staleTurnId,
       turnId: staleTurnId,
     }),
+  );
+});
+
+it("binds prompt settlements to the session lease that issued them", () => {
+  const staleTurnId = TurnId.make("stale-turn");
+  const replacementTurnId = TurnId.make("replacement-turn");
+  const issuingLease = ProviderSessionLease.make("lease-issuing");
+  const replacementLease = ProviderSessionLease.make("lease-replacement");
+
+  // A replacement session that resumed the same ACP session id must not
+  // receive the predecessor's terminal event or lose a prompt slot to it.
+  assert.equal(
+    grokPromptSettlementAction({
+      liveAcpSessionId: "mock-session-1",
+      expectedAcpSessionId: "mock-session-1",
+      liveSessionLease: replacementLease,
+      expectedSessionLease: issuingLease,
+      liveActiveTurnId: replacementTurnId,
+      liveSessionActiveTurnId: replacementTurnId,
+      turnId: staleTurnId,
+      turnInterrupted: false,
+    }),
+    "drop",
+  );
+  // Same incarnation, stale turn: the read model still gets a terminal event.
+  assert.equal(
+    grokPromptSettlementAction({
+      liveAcpSessionId: "mock-session-1",
+      expectedAcpSessionId: "mock-session-1",
+      liveSessionLease: issuingLease,
+      expectedSessionLease: issuingLease,
+      liveActiveTurnId: replacementTurnId,
+      liveSessionActiveTurnId: replacementTurnId,
+      turnId: staleTurnId,
+      turnInterrupted: false,
+    }),
+    "emit-stale-terminal",
+  );
+  // Interrupted turns already settled through interruptTurn.
+  assert.equal(
+    grokPromptSettlementAction({
+      liveAcpSessionId: "mock-session-1",
+      expectedAcpSessionId: "mock-session-1",
+      liveSessionLease: issuingLease,
+      expectedSessionLease: issuingLease,
+      liveActiveTurnId: replacementTurnId,
+      liveSessionActiveTurnId: replacementTurnId,
+      turnId: staleTurnId,
+      turnInterrupted: true,
+    }),
+    "drop",
+  );
+  assert.equal(
+    grokPromptSettlementAction({
+      liveAcpSessionId: "mock-session-1",
+      expectedAcpSessionId: "mock-session-1",
+      liveSessionLease: issuingLease,
+      expectedSessionLease: issuingLease,
+      liveActiveTurnId: staleTurnId,
+      liveSessionActiveTurnId: staleTurnId,
+      turnId: staleTurnId,
+      turnInterrupted: false,
+    }),
+    "settle",
   );
 });
 
