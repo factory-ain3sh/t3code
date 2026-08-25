@@ -71,6 +71,7 @@ const CheckpointRevertIntent = Schema.Struct({
   anchorTurnId: Schema.optional(TurnId),
   checkpointRef: CheckpointRef,
   staleCheckpointRefs: Schema.Array(CheckpointRef),
+  staleTurnIds: Schema.Array(TurnId),
   createdAt: IsoDateTime,
 });
 type CheckpointRevertIntent = typeof CheckpointRevertIntent.Type;
@@ -868,16 +869,18 @@ const make = Effect.gen(function* () {
     // The intent executes exactly-once against the thread state it was minted
     // for. A turn that landed between persist and execution (or before a
     // startup replay) means the checkpoint set has moved on: reverting now
-    // would wipe work the intent never accounted for.
+    // would wipe work the intent never accounted for. Progress is judged by
+    // turn identity, not checkpoint ref: refs are deterministic per turn
+    // count, so a turn landed after a partially bookkept revert reuses a
+    // discarded ref and would be invisible to a ref comparison.
     const thread = yield* resolveThreadDetail(intent.threadId);
-    const staleRefs = new Set(intent.staleCheckpointRefs);
+    const staleTurnIds = new Set(intent.staleTurnIds);
     const progressed =
       thread === undefined ||
       thread.session?.activeTurnId != null ||
       thread.checkpoints.some(
         (checkpoint) =>
-          checkpoint.checkpointTurnCount > intent.turnCount &&
-          !staleRefs.has(checkpoint.checkpointRef),
+          checkpoint.checkpointTurnCount > intent.turnCount && !staleTurnIds.has(checkpoint.turnId),
       );
     if (progressed) {
       yield* clearCheckpointRevertIntent(intent).pipe(Effect.orElseSucceed(() => false));
@@ -1144,6 +1147,7 @@ const make = Effect.gen(function* () {
       ...(staleCheckpoints[0] !== undefined ? { anchorTurnId: staleCheckpoints[0].turnId } : {}),
       checkpointRef: targetCheckpointRef,
       staleCheckpointRefs: staleCheckpoints.map((checkpoint) => checkpoint.checkpointRef),
+      staleTurnIds: staleCheckpoints.map((checkpoint) => checkpoint.turnId),
       createdAt: now,
     };
 

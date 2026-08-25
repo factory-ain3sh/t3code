@@ -351,6 +351,7 @@ describe("CheckpointReactor", () => {
     readonly gitStatusRefreshCalls?: Array<string>;
     readonly pendingRevertRecovery?: boolean;
     readonly pendingRevertStaleCheckpointRefs?: ReadonlyArray<string>;
+    readonly pendingRevertStaleTurnIds?: ReadonlyArray<string>;
     readonly holdLifecycleLockOnStart?: boolean;
     readonly replacementBeforeRecovery?: boolean;
     readonly onRollbackConversation?: (input: {
@@ -644,6 +645,7 @@ describe("CheckpointReactor", () => {
               staleCheckpointRefs: options?.pendingRevertStaleCheckpointRefs ?? [
                 checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
               ],
+              staleTurnIds: options?.pendingRevertStaleTurnIds ?? [asTurnId("turn-2")],
               createdAt,
             },
           },
@@ -1589,6 +1591,7 @@ describe("CheckpointReactor", () => {
             anchorTurnId: asTurnId("turn-2"),
             checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
             staleCheckpointRefs: [checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2)],
+            staleTurnIds: [asTurnId("turn-2")],
             createdAt,
           },
         },
@@ -2051,6 +2054,7 @@ describe("CheckpointReactor", () => {
     const harness = await createHarness({
       pendingRevertRecovery: true,
       pendingRevertStaleCheckpointRefs: [],
+      pendingRevertStaleTurnIds: [],
       holdLifecycleLockOnStart: true,
     });
     const createdAt = "2026-01-01T00:00:00.000Z";
@@ -2073,6 +2077,60 @@ describe("CheckpointReactor", () => {
     harness.releaseLifecycleLock?.();
     await harness.drain();
 
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v3\n");
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2)),
+    ).toBe(true);
+
+    const binding = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: null,
+      });
+    }
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(
+      thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+    ).toBe(true);
+  });
+
+  it("treats a new turn on a recycled checkpoint ref as progress, not staleness", async () => {
+    // Checkpoint refs are deterministic per turn count. After a revert whose
+    // bookkeeping stopped between thread.revert.complete and the intent
+    // clear, a new turn recycles a discarded ref, so a ref-based progress
+    // fence would replay the rollback over the new work.
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      holdLifecycleLockOnStart: true,
+    });
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    // The recovery replay is parked on the lifecycle lock; land a NEW turn's
+    // checkpoint on the ref the intent recorded as stale.
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-recycled-ref-diff"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-2-replacement"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 2,
+      createdAt,
+    });
+    await waitForThread(harness.readModel, (entry) => entry.checkpoints.length >= 1);
+    harness.releaseLifecycleLock?.();
+    await harness.drain();
+
+    // Turn identity, not the recycled ref, decides progress: the replay must
+    // cancel without rolling back the provider or the working tree.
     expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
     expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v3\n");
     expect(
