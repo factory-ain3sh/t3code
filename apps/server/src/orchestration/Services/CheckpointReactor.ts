@@ -26,6 +26,14 @@ export interface CheckpointReactorShape {
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
 
   /**
+   * Enqueue replay of persisted checkpoint revert intents.
+   *
+   * Runs as its own startup phase after provider-session reconciliation, so
+   * the replay never races the orphan sweep that settles crashed sessions.
+   */
+  readonly recoverPersistedIntents: () => Effect.Effect<void>;
+
+  /**
    * Resolves when the internal processing queue is empty and idle.
    * Intended for test use to replace timing-sensitive sleeps.
    */

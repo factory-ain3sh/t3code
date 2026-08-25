@@ -855,9 +855,13 @@ const make = Effect.gen(function* () {
     const binding = Option.getOrUndefined(
       yield* providerSessionDirectory.getBinding(intent.threadId),
     );
+    // A null lease is a stopped, unowned session: runStopAll nulls every
+    // binding lease on graceful shutdown while the merged runtime payload
+    // keeps this intent, and locked recovery re-owns the session below. Only
+    // a different live lease means the session was replaced.
     if (
       binding?.providerInstanceId !== intent.providerInstanceId ||
-      binding.sessionLease !== intent.sessionLease
+      (binding.sessionLease !== null && binding.sessionLease !== intent.sessionLease)
     ) {
       yield* clearUnexecutableRevertIntent(
         intent,
@@ -1274,7 +1278,13 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processInputSafely);
 
-  const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {
+  // Replays persisted revert intents. A dedicated startup phase sequenced
+  // after provider-session reconciliation: enqueued from start(), the replay
+  // races the orphan sweep, which can stomp a freshly recovered lease with
+  // its stale liveness snapshot.
+  const recoverPersistedIntents: CheckpointReactorShape["recoverPersistedIntents"] = Effect.fn(
+    "recoverPersistedIntents",
+  )(function* () {
     const bindings = yield* providerSessionDirectory.listBindings().pipe(
       Effect.catch((error) =>
         Effect.logWarning("Failed to list provider sessions for checkpoint recovery.", {
@@ -1288,7 +1298,9 @@ const make = Effect.gen(function* () {
         yield* worker.enqueue({ source: "recovery", intent: intent.value });
       }
     }
+  });
 
+  const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {
     yield* forkParked(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
         if (
@@ -1315,6 +1327,7 @@ const make = Effect.gen(function* () {
 
   return {
     start,
+    recoverPersistedIntents,
     drain: worker.drain,
   } satisfies CheckpointReactorShape;
 });

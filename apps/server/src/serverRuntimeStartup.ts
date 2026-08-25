@@ -29,6 +29,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationReactor from "./orchestration/Services/OrchestrationReactor.ts";
+import * as CheckpointReactor from "./orchestration/Services/CheckpointReactor.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -387,6 +388,7 @@ export const make = (options?: StartupOptions) =>
     const serverConfig = yield* ServerConfig.ServerConfig;
     const keybindings = yield* Keybindings.Keybindings;
     const orchestrationReactor = yield* OrchestrationReactor.OrchestrationReactor;
+    const checkpointReactor = yield* CheckpointReactor.CheckpointReactor;
     const providerSessionReaper = yield* ProviderSessionReaper.ProviderSessionReaper;
     const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -441,6 +443,11 @@ export const make = (options?: StartupOptions) =>
       );
 
       yield* runStartupPhase("provider-sessions.reconcile", reconcileProviderSessions);
+
+      // Sequenced after reconciliation on purpose: the replay recovers
+      // sessions and mints fresh leases, which the orphan sweep would stomp
+      // with its stale liveness snapshot if the two ran concurrently.
+      yield* runStartupPhase("checkpoints.recover", checkpointReactor.recoverPersistedIntents());
 
       const welcomeBase = yield* resolveWelcomeBase;
       const environment = yield* serverEnvironment.getDescriptor;

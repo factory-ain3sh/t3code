@@ -25,6 +25,7 @@ import * as ServerConfig from "../src/config.ts";
 import * as ServerEnvironment from "../src/environment/ServerEnvironment.ts";
 import * as Keybindings from "../src/keybindings.ts";
 import { OrchestrationLayerLive } from "../src/orchestration/runtimeLayer.ts";
+import * as CheckpointReactor from "../src/orchestration/Services/CheckpointReactor.ts";
 import * as OrchestrationEngine from "../src/orchestration/Services/OrchestrationEngine.ts";
 import * as OrchestrationReactor from "../src/orchestration/Services/OrchestrationReactor.ts";
 import * as ProjectionSnapshotQuery from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -71,6 +72,11 @@ const startupDependencies = Layer.mergeAll(
   ServerSettings.layerTest(),
   Layer.succeed(OrchestrationReactor.OrchestrationReactor, {
     start: () => Effect.void,
+  }),
+  Layer.succeed(CheckpointReactor.CheckpointReactor, {
+    start: () => Effect.void,
+    recoverPersistedIntents: () => Effect.void,
+    drain: Effect.void,
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
     start: () => Effect.void,

@@ -352,6 +352,9 @@ describe("CheckpointReactor", () => {
     readonly pendingRevertRecovery?: boolean;
     readonly pendingRevertStaleCheckpointRefs?: ReadonlyArray<string>;
     readonly pendingRevertStaleTurnIds?: ReadonlyArray<string>;
+    readonly pendingRevertBindingLease?: null;
+    readonly reLeaseDuringRollback?: boolean;
+    readonly skipStartupRecovery?: boolean;
     readonly holdLifecycleLockOnStart?: boolean;
     readonly replacementBeforeRecovery?: boolean;
     readonly onRollbackConversation?: (input: {
@@ -526,6 +529,19 @@ describe("CheckpointReactor", () => {
         })
         .pipe(Effect.orDie);
     }
+    // Models the real rollbackConversation's locked recovery of a stopped,
+    // unowned session: same instance, fresh lease minted mid-rollback.
+    if (options?.reLeaseDuringRollback) {
+      replaceBindingDuringRollback = providerSessionDirectory
+        .upsert({
+          threadId: ThreadId.make("thread-1"),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-recovered"),
+          runtimePayload: { cwd },
+        })
+        .pipe(Effect.orDie);
+    }
     const drain = () => Effect.runPromise(reactor.drain);
 
     const createdAt = "2026-01-01T00:00:00.000Z";
@@ -629,7 +645,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           provider: ProviderDriverKind.make("codex"),
           providerInstanceId: ProviderInstanceId.make("codex"),
-          sessionLease,
+          sessionLease: options?.pendingRevertBindingLease === null ? null : sessionLease,
           runtimePayload: {
             checkpointRevertIntent: {
               commandId: CommandId.make("server:checkpoint-revert-complete:recovery"),
@@ -687,6 +703,11 @@ describe("CheckpointReactor", () => {
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
     await Effect.runPromise(provider.awaitSubscription);
+    // Mirrors the startup phases: subscriptions from start(), then the
+    // persisted-intent replay as its own later phase.
+    if (options?.skipStartupRecovery !== true) {
+      await Effect.runPromise(reactor.recoverPersistedIntents());
+    }
 
     // Tears down the reactor's start scope and starts it again over the same
     // persisted state, the in-process equivalent of a server restart: startup
@@ -698,6 +719,7 @@ describe("CheckpointReactor", () => {
       scope = await Effect.runPromise(Scope.make("sequential"));
       await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
       await Effect.runPromise(provider.awaitSubscription);
+      await Effect.runPromise(reactor.recoverPersistedIntents());
     };
 
     return {
@@ -713,6 +735,7 @@ describe("CheckpointReactor", () => {
       drain,
       releaseLifecycleLock,
       restartReactor,
+      recoverPersistedIntents: () => Effect.runPromise(reactor.recoverPersistedIntents()),
     };
   }
 
@@ -1337,15 +1360,13 @@ describe("CheckpointReactor", () => {
       }),
     );
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-revert-request"),
-        threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
-        createdAt,
-      }),
-    );
+    await harness.dispatch({
+      type: "thread.checkpoint.revert",
+      commandId: CommandId.make("cmd-revert-request"),
+      threadId: ThreadId.make("thread-1"),
+      turnCount: 1,
+      createdAt,
+    });
 
     await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
     const thread = await waitForThread(
@@ -1372,38 +1393,34 @@ describe("CheckpointReactor", () => {
     const harness = await createHarness({ providerName: ProviderDriverKind.make("claudeAgent") });
     const createdAt = "2026-01-01T00:00:00.000Z";
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-claude"),
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-set-claude"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
         threadId: ThreadId.make("thread-1"),
-        session: {
-          threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "claudeAgent",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
-        },
-        createdAt,
-      }),
-    );
-
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.turn.diff.complete",
-        commandId: CommandId.make("cmd-diff-claude-1"),
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-claude-1"),
-        completedAt: createdAt,
-        checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
         status: "ready",
-        files: [],
-        checkpointTurnCount: 1,
-        createdAt,
-      }),
-    );
+        providerName: "claudeAgent",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: createdAt,
+      },
+      createdAt,
+    });
+
+    await harness.dispatch({
+      type: "thread.turn.diff.complete",
+      commandId: CommandId.make("cmd-diff-claude-1"),
+      threadId: ThreadId.make("thread-1"),
+      turnId: asTurnId("turn-claude-1"),
+      completedAt: createdAt,
+      checkpointRef: checkpointRefForThreadTurn(ThreadId.make("thread-1"), 1),
+      status: "ready",
+      files: [],
+      checkpointTurnCount: 1,
+      createdAt,
+    });
     await harness.dispatch({
       type: "thread.turn.diff.complete",
       commandId: CommandId.make("cmd-diff-claude-2"),
@@ -1432,6 +1449,65 @@ describe("CheckpointReactor", () => {
       turnIds: [asTurnId("turn-claude-1")],
       anchorTurnId: asTurnId("turn-claude-2"),
     });
+  });
+
+  it("parks persisted intents until startup recovery is invoked", async () => {
+    // Recovery is a dedicated startup phase sequenced after provider-session
+    // reconciliation. Replaying from start() would race the orphan sweep,
+    // which can stomp a freshly recovered lease with its stale liveness
+    // snapshot.
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      skipStartupRecovery: true,
+    });
+
+    await harness.drain();
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    const parked = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(parked)).toBe(true);
+    if (Option.isSome(parked)) {
+      expect(parked.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: { turnCount: 1 },
+      });
+    }
+
+    await harness.recoverPersistedIntents();
+    await harness.drain();
+    expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+  });
+
+  it("recovers a retained intent after a graceful shutdown cleared the session lease", async () => {
+    // runStopAll nulls every binding lease on graceful shutdown while the
+    // merged runtime payload keeps the intent. The replay must treat the
+    // unowned session as recoverable, not as a replacement to clear against;
+    // rollbackConversation's locked recovery then mints the fresh lease the
+    // completion bookkeeping lands on.
+    const harness = await createHarness({
+      pendingRevertRecovery: true,
+      pendingRevertBindingLease: null,
+      reLeaseDuringRollback: true,
+    });
+
+    await harness.drain();
+
+    expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+    expect(NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 2)),
+    ).toBe(false);
+    const binding = await harness.runtime.runPromise(
+      harness.providerSessionDirectory.getBinding(ThreadId.make("thread-1")),
+    );
+    expect(Option.isSome(binding)).toBe(true);
+    if (Option.isSome(binding)) {
+      expect(binding.value.sessionLease).toBe(ProviderSessionLease.make("lease-recovered"));
+      expect(binding.value.runtimePayload).toMatchObject({
+        checkpointRevertIntent: null,
+      });
+    }
   });
 
   it("recovers a persisted revert intent and clears it after completion", async () => {

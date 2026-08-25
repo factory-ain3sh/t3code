@@ -52,6 +52,7 @@ describe("OrchestrationReactor", () => {
               started.push("checkpoint-reactor");
               return Effect.void;
             },
+            recoverPersistedIntents: () => Effect.void,
             drain: Effect.void,
           }),
         ),
