@@ -103,6 +103,7 @@ it.effect("reconciles multiple active and archived orphans but skips live sessio
     threads: [starting, running, staleActiveTurn, archived, live, settled],
     liveThreadIds: [live.id],
     directory: {
+      invalidateOwnership: () => Effect.void,
       matchesOwnership: () => Effect.succeed(false),
       updateResumeCursorIfOwned: () => Effect.succeed(false),
       updateRuntimePayloadIfOwned: () => Effect.succeed(false),
@@ -176,6 +177,7 @@ it.effect(
     return runReconciliation({
       threads: [absent, corrupt, upsertFailure],
       directory: {
+        invalidateOwnership: () => Effect.void,
         matchesOwnership: () => Effect.succeed(false),
         updateResumeCursorIfOwned: () => Effect.succeed(false),
         updateRuntimePayloadIfOwned: () => Effect.succeed(false),
@@ -227,6 +229,7 @@ it.effect("retries failed projections and continues after a persistent failure",
   return runReconciliation({
     threads: [transient, persistent, later],
     directory: {
+      invalidateOwnership: () => Effect.void,
       matchesOwnership: () => Effect.succeed(false),
       updateResumeCursorIfOwned: () => Effect.succeed(false),
       updateRuntimePayloadIfOwned: () => Effect.succeed(false),
@@ -278,6 +281,7 @@ it.effect("does not fail startup when the live provider session inventory cannot
       listSessions: () => Effect.die("provider inventory unavailable"),
     }),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, {
+      invalidateOwnership: () => Effect.die("unused"),
       matchesOwnership: () => Effect.die("unused"),
       updateResumeCursorIfOwned: () => Effect.die("unused"),
       updateRuntimePayloadIfOwned: () => Effect.die("unused"),

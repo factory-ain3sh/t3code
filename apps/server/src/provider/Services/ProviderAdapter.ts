@@ -103,12 +103,13 @@ export const makeRequireActiveProviderSession = <Session extends { readonly stop
   sessions: ReadonlyMap<ThreadId, Session>,
   provider: ProviderDriverKind,
 ) => {
-  return (threadId: ThreadId): Effect.Effect<Session, ProviderAdapterSessionNotFoundError> => {
-    const session = sessions.get(threadId);
-    return session === undefined || session.stopped
-      ? Effect.fail(new ProviderAdapterSessionNotFoundError({ provider, threadId }))
-      : Effect.succeed(session);
-  };
+  return (threadId: ThreadId): Effect.Effect<Session, ProviderAdapterSessionNotFoundError> =>
+    Effect.suspend(() => {
+      const session = sessions.get(threadId);
+      return session === undefined || session.stopped
+        ? Effect.fail(new ProviderAdapterSessionNotFoundError({ provider, threadId }))
+        : Effect.succeed(session);
+    });
 };
 
 export interface ProviderAdapterShape<TError> {

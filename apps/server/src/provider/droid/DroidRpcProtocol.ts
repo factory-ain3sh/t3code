@@ -6,6 +6,7 @@ import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
@@ -48,6 +49,7 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
   kind: Schema.Literals([
     "encode",
     "write",
+    "protocol",
     "timeout",
     "rpc",
     "process-exit",
@@ -74,6 +76,8 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
         return "Failed to encode Droid JSON-RPC message";
       case "write":
         return "Failed to write to Droid process stdin because it is closed";
+      case "protocol":
+        return this.rpcMessage ?? "Droid sent an invalid JSON-RPC message";
       case "timeout":
         return `Droid request ${this.method} timed out after ${this.timeoutMs}ms`;
       case "rpc":
@@ -218,7 +222,7 @@ type DroidRpcLifecycle =
     };
 
 interface LineFramingState {
-  readonly fragments: ReadonlyArray<string>;
+  readonly remainder: string;
   readonly bytes: number;
 }
 
@@ -231,6 +235,18 @@ interface QueuedDelivery<A> {
   readonly value: A;
   readonly encodedBytes: number;
 }
+
+type OutgoingFrame =
+  | {
+      readonly _tag: "Request";
+      readonly encoded: string;
+      readonly requestId: string;
+      readonly deferred: Deferred.Deferred<unknown, DroidRpcError>;
+    }
+  | {
+      readonly _tag: "Uncorrelated";
+      readonly encoded: string;
+    };
 
 const decodeJsonRpcMessage = Schema.decodeUnknownEffect(Schema.fromJsonString(JsonRpcMessage));
 const decodeNotification = Schema.decodeUnknownEffect(DroidSessionNotification);
@@ -284,7 +300,7 @@ const consumeChunk = (
   handleLine: (line: FramedLine) => Effect.Effect<void, DroidRpcError>,
 ): Effect.Effect<LineFramingState, DroidRpcError> =>
   Effect.gen(function* () {
-    let fragments = state.fragments;
+    let remainder = state.remainder;
     let bytes = state.bytes;
     let cursor = 0;
     const delimiters = /\r\n|\r|\n/g;
@@ -301,17 +317,17 @@ const consumeChunk = (
         });
       }
       yield* handleLine({
-        line: fragments.length === 0 ? segment : [...fragments, segment].join(""),
+        line: remainder.length === 0 ? segment : remainder + segment,
         bytes,
       });
-      fragments = [];
+      remainder = "";
       bytes = 0;
       cursor = index + delimiter[0].length;
     }
 
-    const remainder = chunk.slice(cursor);
-    if (remainder.length > 0) {
-      bytes += Buffer.byteLength(remainder, "utf8");
+    const tail = chunk.slice(cursor);
+    if (tail.length > 0) {
+      bytes += Buffer.byteLength(tail, "utf8");
       if (bytes > maxMessageBytes) {
         return yield* new DroidRpcError({
           kind: "frame-too-large",
@@ -319,10 +335,10 @@ const consumeChunk = (
           limitBytes: maxMessageBytes,
         });
       }
-      fragments = [...fragments, remainder];
+      remainder += tail;
     }
 
-    return { fragments, bytes };
+    return { remainder, bytes };
   });
 
 function jsonRpcErrorFromMessage(
@@ -367,7 +383,7 @@ export const makeDroidRpcProtocol = (
     const maxBacklogItems = limits.maxBacklogItems ?? losslessBacklogHardLimit;
     const requestTombstoneLimit =
       limits.timedOutRequestRetentionLimit ?? timedOutRequestRetentionLimit;
-    const outgoing = yield* Queue.bounded<string, Cause.Done<void>>(outgoingQueueCapacity);
+    const outgoing = yield* Queue.bounded<OutgoingFrame, Cause.Done<void>>(outgoingQueueCapacity);
     const notifications = yield* Queue.unbounded<
       QueuedDelivery<DroidNotificationEnvelope>,
       Cause.Done<void>
@@ -383,13 +399,19 @@ export const makeDroidRpcProtocol = (
       pending: new Map(),
     });
     const framing = yield* SynchronizedRef.make<LineFramingState>({
-      fragments: [],
+      remainder: "",
       bytes: 0,
     });
     const nextRequestId = yield* Ref.make(0);
     const droppedLossyNotificationCount = yield* Ref.make(0);
 
-    const writeEnvelope = (message: Record<string, unknown>): Effect.Effect<void, DroidRpcError> =>
+    const writeEnvelope = (
+      message: Record<string, unknown>,
+      requestIdentity?: {
+        readonly requestId: string;
+        readonly deferred: Deferred.Deferred<unknown, DroidRpcError>;
+      },
+    ): Effect.Effect<void, DroidRpcError> =>
       encodeJsonRpcMessage(message).pipe(
         Effect.map((encoded) => `${encoded}\n`),
         Effect.mapError(
@@ -411,7 +433,14 @@ export const makeDroidRpcProtocol = (
                 }),
               );
         }),
-        Effect.flatMap((encoded) => Queue.offer(outgoing, encoded)),
+        Effect.flatMap((encoded) =>
+          Queue.offer(
+            outgoing,
+            requestIdentity === undefined
+              ? { _tag: "Uncorrelated", encoded }
+              : { _tag: "Request", encoded, ...requestIdentity },
+          ),
+        ),
         Effect.flatMap((offered) =>
           offered
             ? Effect.void
@@ -648,6 +677,15 @@ export const makeDroidRpcProtocol = (
           });
           return;
         }
+        if (
+          decoded.success.type === "agent_turn_completed" &&
+          decoded.success.turnId === undefined
+        ) {
+          return yield* new DroidRpcError({
+            kind: "protocol",
+            rpcMessage: "Droid agent_turn_completed notification is missing turnId",
+          });
+        }
         const envelope = {
           sessionId:
             typeof message.params.sessionId === "string" ? message.params.sessionId : undefined,
@@ -710,18 +748,18 @@ export const makeDroidRpcProtocol = (
       );
 
     const endInput = SynchronizedRef.modifyEffect(framing, (state) => {
-      if (state.fragments.length === 0) {
+      if (state.remainder.length === 0) {
         return Effect.succeed([undefined, state] as const);
       }
       const framed = {
-        line: state.fragments.join(""),
+        line: state.remainder,
         bytes: state.bytes,
       } satisfies FramedLine;
       return handleLine(framed).pipe(
         Effect.as([
           undefined,
           {
-            fragments: [],
+            remainder: "",
             bytes: 0,
           },
         ] as const),
@@ -796,29 +834,18 @@ export const makeDroidRpcProtocol = (
         });
         const timeoutMs =
           options === undefined ? DROID_SESSION_REQUEST_TIMEOUT_MS : options.timeoutMs;
-        const exchange = writeEnvelope({
-          jsonrpc: "2.0",
-          type: "request",
-          factoryApiVersion,
-          factoryProtocolVersion,
-          id: requestId,
-          method,
-          params,
-        }).pipe(
-          Effect.tap(() =>
-            SynchronizedRef.update(lifecycle, (state) => {
-              if (state._tag === "Exited") return state;
-              const entry = state.pending.get(requestId);
-              if (entry === undefined || entry._tag !== "Pending" || entry.deferred !== deferred) {
-                return state;
-              }
-              const next = new Map(state.pending);
-              next.set(requestId, { ...entry, sent: true });
-              return { ...state, pending: next };
-            }),
-          ),
-          Effect.andThen(Deferred.await(deferred)),
-        );
+        const exchange = writeEnvelope(
+          {
+            jsonrpc: "2.0",
+            type: "request",
+            factoryApiVersion,
+            factoryProtocolVersion,
+            id: requestId,
+            method,
+            params,
+          },
+          { requestId, deferred },
+        ).pipe(Effect.andThen(Deferred.await(deferred)));
         const result =
           timeoutMs === undefined
             ? exchange
@@ -903,7 +930,28 @@ export const makeDroidRpcProtocol = (
       request,
       notifications: deliveryStream(notifications, notificationBacklogBytes),
       serverRequests: deliveryStream(serverRequests, serverRequestBacklogBytes),
-      outgoing: Stream.fromQueue(outgoing),
+      outgoing: Stream.fromQueue(outgoing).pipe(
+        Stream.filterMapEffect((frame): Effect.Effect<Result.Result<string, void>> => {
+          if (frame._tag === "Uncorrelated") return Effect.succeed(Result.succeed(frame.encoded));
+          return SynchronizedRef.modify(
+            lifecycle,
+            (state): readonly [Result.Result<string, void>, DroidRpcLifecycle] => {
+              if (state._tag === "Exited") return [Result.fail(undefined), state] as const;
+              const entry = state.pending.get(frame.requestId);
+              if (
+                entry === undefined ||
+                entry._tag !== "Pending" ||
+                entry.deferred !== frame.deferred
+              ) {
+                return [Result.fail(undefined), state] as const;
+              }
+              const next = new Map(state.pending);
+              next.set(frame.requestId, { ...entry, sent: true });
+              return [Result.succeed(frame.encoded), { ...state, pending: next }] as const;
+            },
+          );
+        }),
+      ),
       acceptChunk,
       endInput,
       beginShutdown,

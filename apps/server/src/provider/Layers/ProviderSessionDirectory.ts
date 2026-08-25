@@ -274,6 +274,9 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       ),
     );
 
+  const invalidateOwnership: ProviderSessionDirectoryShape["invalidateOwnership"] = (threadId) =>
+    withThreadWriteLock(threadId, setOwnership(threadId, undefined));
+
   const matchesOwnership: ProviderSessionDirectoryShape["matchesOwnership"] = (input) =>
     Ref.get(ownershipByThread).pipe(
       Effect.map((current) => {
@@ -368,6 +371,7 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
     upsert,
     getProvider,
     getBinding,
+    invalidateOwnership,
     matchesOwnership,
     updateResumeCursorIfOwned,
     updateRuntimePayloadIfOwned,

@@ -140,14 +140,21 @@ export const makeDroidRpcClient = (
       ),
     );
 
-    const finalizeExit = (exit: DroidProcessExit) =>
+    const finalizeExit = (
+      exit: DroidProcessExit,
+      beforePublishing: Effect.Effect<void> = Effect.void,
+    ) =>
       SynchronizedRef.getAndSet(exitFinalized, true).pipe(
         Effect.flatMap((alreadyFinalized) =>
           alreadyFinalized
             ? Effect.void
             : protocol
                 .handleExit(exit)
-                .pipe(Effect.andThen(Deferred.succeed(exitDeferred, exit)), Effect.asVoid),
+                .pipe(
+                  Effect.andThen(beforePublishing),
+                  Effect.andThen(Deferred.succeed(exitDeferred, exit)),
+                  Effect.asVoid,
+                ),
         ),
       );
 
@@ -160,11 +167,13 @@ export const makeDroidRpcClient = (
               transitioned
                 ? protocol.closeOutgoing.pipe(
                     Effect.andThen(
-                      child
-                        .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.seconds(2) })
-                        .pipe(Effect.ignore),
+                      finalizeExit(
+                        exit,
+                        child
+                          .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.seconds(2) })
+                          .pipe(Effect.ignore),
+                      ),
                     ),
-                    Effect.andThen(finalizeExit(exit)),
                   )
                 : Effect.void,
             ),
@@ -232,9 +241,9 @@ export const makeDroidRpcClient = (
         Effect.gen(function* () {
           yield* protocol.beginShutdown(exit);
           yield* protocol.closeOutgoing;
-          yield* Fiber.await(stdoutFiber);
-          yield* Fiber.await(stderrFiber);
           yield* finalizeExit(exit);
+          yield* Fiber.interrupt(stdoutFiber);
+          yield* Fiber.interrupt(stderrFiber);
         }),
       ),
       Effect.forkIn(runtimeScope),

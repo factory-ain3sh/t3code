@@ -90,9 +90,10 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
                   structuredOutput = notification.structuredOutput;
                   return Effect.void;
                 }),
-                Effect.catchTag("SchemaError", (cause) =>
-                  failTurn("Droid returned invalid structured output.", cause),
-                ),
+                Effect.catchTags({
+                  SchemaError: (cause) =>
+                    failTurn("Droid returned invalid structured output.", cause),
+                }),
               );
             case "agent_turn_completed":
               return Deferred.succeed(turnDone, notification.reason).pipe(Effect.asVoid);
@@ -158,9 +159,10 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         return yield* failWith("Droid returned no structured output.");
 
       return yield* Schema.decodeUnknownEffect(outputSchema)(structuredOutput).pipe(
-        Effect.catchTag("SchemaError", (cause) =>
-          Effect.fail(failWith("Droid returned invalid structured output.", cause)),
-        ),
+        Effect.catchTags({
+          SchemaError: (cause) =>
+            Effect.fail(failWith("Droid returned invalid structured output.", cause)),
+        }),
       );
     }).pipe(
       Effect.mapError((cause) =>

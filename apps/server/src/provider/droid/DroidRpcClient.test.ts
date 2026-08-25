@@ -148,6 +148,53 @@ describe("DroidRpcClient", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
   );
 
+  it.effect("settles pending requests before interrupting inherited process pipes", () => {
+    const markerDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "droid-rpc-pipes-"));
+    const pidPath = NodePath.join(markerDir, "descendant-pid");
+    return Effect.gen(function* () {
+      const client = yield* makeDroidRpcClient({
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            'const fs = require("node:fs");',
+            'const { spawn } = require("node:child_process");',
+            'process.stdin.once("data", () => {',
+            '  const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"],',
+            '    { stdio: ["ignore", "inherit", "inherit"] });',
+            "  fs.writeFileSync(process.argv[1], String(descendant.pid));",
+            "  process.exit(9);",
+            "});",
+          ].join("\n"),
+          pidPath,
+        ],
+      });
+      const request = yield* client
+        .request("droid.pending_at_exit", {}, { timeoutMs: undefined })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      const result = yield* within(
+        Effect.result(Fiber.join(request)),
+        "pending request was blocked by inherited process pipes",
+      );
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure.kind, "process-exit");
+      assert.equal((yield* within(client.exits, "process exit was not detected")).code, 9);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (NodeFS.existsSync(pidPath)) {
+            const processId = Number(NodeFS.readFileSync(pidPath, "utf8"));
+            if (isProcessAlive(processId)) process.kill(processId, "SIGKILL");
+          }
+          NodeFS.rmSync(markerDir, { recursive: true, force: true });
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      TestClock.withLive,
+    );
+  });
+
   it.effect("kills a process whose stdout closes before exit", () =>
     Effect.gen(function* () {
       const markerDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "droid-rpc-exit-"));

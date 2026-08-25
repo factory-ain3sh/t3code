@@ -7,7 +7,7 @@ import * as NodeReadline from "node:readline";
 import * as NodeTimersPromises from "node:timers/promises";
 
 const scenarioNames = new Set(
-  `default rpc-roundtrip permission permission-empty-options permission-unknown-options permission-accept-only park-hitl permission-flood ask-user hang-turn hang-first-turn late-terminal usage-reset
+  `default rpc-roundtrip permission permission-empty-options permission-unknown-options permission-accept-only park-hitl permission-flood permission-flood-retirement ask-user hang-turn hang-first-turn late-terminal interrupt-late-terminal-order usage-reset
   exit-hitl interrupt-race fail-init fail-update-settings load-spec-mode-report steering-coalesced steering-separate exit-mid-turn unknown-notification omit-usage start-race spec-autonomy-handoff
   spec-handoff late-spec-approval foreign-spec-envelope future-terminal-reason compaction child-session hanging-child-session
   child-session-exit taskless-progress report-selected-model incomplete-items shared-tool-isolation`.split(
@@ -37,7 +37,7 @@ const permissionModes: Record<string, "default" | "empty" | "unknown" | "accept-
   "park-hitl": "default",
 };
 const permissionFloodCount =
-  currentScenario === "permission-flood"
+  currentScenario === "permission-flood" || currentScenario === "permission-flood-retirement"
     ? Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "24")
     : 0;
 
@@ -129,6 +129,7 @@ let currentSettings = {
 };
 let activeTurn: { readonly turnId: string; completed: boolean } | undefined;
 let interruptRequestBlocked = false;
+let interruptSequence = 0;
 let sharedToolRole: "delayed" | "execute" | undefined;
 const pendingServerRequests = new Map<
   string,
@@ -503,6 +504,15 @@ async function runPermissionFlow(turnId: string): Promise<boolean> {
       await NodeTimersPromises.setTimeout(5);
     }
     if (env.permissionFloodReadyFile) NodeFS.writeFileSync(env.permissionFloodReadyFile, "");
+    if (currentScenario === "permission-flood-retirement") {
+      if (!env.coordinationDir) {
+        throw new Error("permission-flood-retirement requires T3_DROID_MOCK_COORDINATION_DIR");
+      }
+      input.pause();
+      void waitForFile(NodePath.join(env.coordinationDir, "release-native-responses")).then(() =>
+        input.resume(),
+      );
+    }
     await Promise.all(requests);
   }
   return false;
@@ -619,6 +629,7 @@ async function runTurn(turnId: string): Promise<void> {
   if (
     currentScenario === "hang-turn" ||
     currentScenario === "interrupt-race" ||
+    (currentScenario === "interrupt-late-terminal-order" && turnSequence <= 2) ||
     (currentScenario === "hang-first-turn" && turnSequence === 1)
   ) {
     return;
@@ -758,6 +769,42 @@ function loadSession(id: string, params: unknown): void {
   });
 }
 async function interrupt(id: string): Promise<void> {
+  if (currentScenario === "interrupt-late-terminal-order") {
+    if (!env.interruptOrderDir) {
+      throw new Error("interrupt-late-terminal-order requires T3_DROID_MOCK_INTERRUPT_ORDER_DIR");
+    }
+    interruptSequence += 1;
+    const sequence = interruptSequence;
+    await NodeFSP.writeFile(
+      NodePath.join(env.interruptOrderDir, `interrupt-${sequence}-received`),
+      "",
+    );
+    if (sequence === 1) {
+      const interruptedTurnId = activeTurn?.turnId;
+      if (interruptedTurnId !== undefined) firstTurnId = interruptedTurnId;
+      respond(id, {});
+      await waitForFile(NodePath.join(env.interruptOrderDir, "release-interrupt-1"));
+      if (interruptedTurnId !== undefined) {
+        emitTerminalForSession(currentSessionId, "cancelled", interruptedTurnId);
+        if (activeTurn?.turnId === interruptedTurnId) activeTurn = undefined;
+      }
+      return;
+    }
+    if (sequence === 2) {
+      const interruptedTurnId = activeTurn?.turnId;
+      respond(id, {});
+      if (firstTurnId !== undefined) {
+        emitTerminalForSession(currentSessionId, "cancelled", firstTurnId);
+      }
+      notify({ type: "session_title_updated", title: "late old terminal observed" });
+      await waitForFile(NodePath.join(env.interruptOrderDir, "release-interrupt-2"));
+      if (interruptedTurnId !== undefined) {
+        emitTerminalForSession(currentSessionId, "cancelled", interruptedTurnId);
+        if (activeTurn?.turnId === interruptedTurnId) activeTurn = undefined;
+      }
+      return;
+    }
+  }
   if (env.interruptOrderDir) {
     interruptRequestBlocked = true;
     await NodeFSP.writeFile(NodePath.join(env.interruptOrderDir, "interrupt-received"), "");

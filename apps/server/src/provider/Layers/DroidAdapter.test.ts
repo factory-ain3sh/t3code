@@ -277,7 +277,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(session.provider, "droid");
       assert.equal(session.model, "mock-deep");
       assert.deepStrictEqual(session.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-1",
         turnIds: [],
       });
@@ -689,7 +689,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
-  it.effect("drains a parked Droid permission before stopping its session scope", () =>
+  it.effect("retires a parked Droid permission before stopping its session scope", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-stop-drain");
       const { adapter } = yield* makeDroidScenario({
@@ -814,6 +814,40 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       yield* Effect.promise(() => waitForFile(floodReadyFile));
       yield* waitForType(threadId, "request.opened");
       assert.isAtMost(eventsOfType(eventsForThread(events, threadId), "request.opened").length, 16);
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
+  );
+
+  it.effect("retires saturated Droid permission handlers without waiting on native responses", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-permission-saturated-retirement");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-permission-retirement-")),
+      );
+      const floodReadyFile = NodePath.join(coordinationDir, "flood-ready");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "permission-flood-retirement",
+        T3_DROID_MOCK_PERMISSION_FLOOD_COUNT: "24",
+        T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE: floodReadyFile,
+        T3_DROID_MOCK_COORDINATION_DIR: coordinationDir,
+      });
+      const { waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      const turn = yield* sendDroidTurn(adapter, threadId, "retire saturated permission requests");
+      yield* Effect.promise(() => waitForFile(floodReadyFile));
+      yield* waitForType(threadId, "request.opened", 16);
+      const interrupted = yield* adapter
+        .interruptTurn(threadId, turn.turnId)
+        .pipe(Effect.timeoutOption("1 second"), Effect.forkChild);
+      yield* waitForType(threadId, "request.resolved", 16);
+      yield* Effect.yieldNow;
+      yield* advanceTestClock(1_000);
+      assert.isTrue(Option.isSome(yield* Fiber.join(interrupted)));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-native-responses"), ""),
+      );
+      yield* adapter.stopSession(threadId);
+      yield* waitForType(threadId, "session.exited");
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
@@ -1048,50 +1082,65 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
-  it.effect("does not let a late Droid interrupt cancel a replacement turn", () =>
+  it.effect("holds the interrupt barrier for its correlated terminal notification", () =>
     Effect.gen(function* () {
-      const threadId = ThreadId.make("droid-interrupt-replacement-order");
+      const threadId = ThreadId.make("droid-interrupt-terminal-barrier");
       const coordinationDir = yield* Effect.promise(() =>
-        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-interrupt-order-")),
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-interrupt-terminal-barrier-")),
       );
-      const interruptReceived = NodePath.join(coordinationDir, "interrupt-received");
-      const releaseInterrupt = NodePath.join(coordinationDir, "release-interrupt");
-      const overlapReceipt = NodePath.join(coordinationDir, "turn-started-before-interrupt");
       const { adapter } = yield* makeDroidScenario({
-        T3_DROID_MOCK_SCENARIO: "hang-first-turn",
+        T3_DROID_MOCK_SCENARIO: "interrupt-late-terminal-order",
         T3_DROID_MOCK_INTERRUPT_ORDER_DIR: coordinationDir,
       });
       const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const interruptedTurn = yield* sendDroidTurn(adapter, threadId, "mock hang this turn");
-      yield* adapter.interruptTurn(threadId, interruptedTurn.turnId);
-      const interruptedTerminal = yield* waitForType(threadId, "turn.completed");
-      yield* Effect.promise(() => waitForFile(interruptReceived));
-      const replacementFiber = yield* sendDroidTurn(
+      const firstTurn = yield* sendDroidTurn(adapter, threadId, "first interrupted run");
+      yield* adapter.interruptTurn(threadId, firstTurn.turnId);
+      const firstTerminal = yield* waitForType(threadId, "turn.completed");
+      yield* Effect.promise(() =>
+        waitForFile(NodePath.join(coordinationDir, "interrupt-1-received")),
+      );
+      const secondTurnFiber = yield* sendDroidTurn(
         adapter,
         threadId,
-        "replacement after interrupt",
+        "second interrupted run",
       ).pipe(Effect.forkChild);
-      const replacementBeforeInterruptFiber = yield* Fiber.join(replacementFiber).pipe(
+      const secondTurnBeforeFirstTerminal = yield* Fiber.join(secondTurnFiber).pipe(
         Effect.timeoutOption("1 second"),
         Effect.forkChild,
       );
       yield* advanceTestClock(1_000);
-      const replacementBeforeInterrupt = yield* Fiber.join(replacementBeforeInterruptFiber);
-      yield* Effect.promise(() => NodeFSP.writeFile(releaseInterrupt, ""));
-      const replacementTurn = yield* Fiber.join(replacementFiber);
-      const replacementTerminal = yield* waitForType(threadId, "turn.completed", 2);
-      const overlap = yield* Effect.promise(() =>
-        NodeFSP.access(overlapReceipt).then(
-          () => true,
-          () => false,
-        ),
+      assert.isTrue(Option.isNone(yield* Fiber.join(secondTurnBeforeFirstTerminal)));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-interrupt-1"), ""),
       );
-      assert.equal(interruptedTerminal.payload.state, "cancelled");
-      assert.equal(Option.isNone(replacementBeforeInterrupt), true);
-      assert.equal(overlap, false);
-      assert.equal(String(replacementTerminal.turnId), String(replacementTurn.turnId));
-      assert.equal(replacementTerminal.payload.state, "completed");
+      const secondTurn = yield* Fiber.join(secondTurnFiber);
+      yield* adapter.interruptTurn(threadId, secondTurn.turnId);
+      const secondTerminal = yield* waitForType(threadId, "turn.completed", 2);
+      yield* Effect.promise(() =>
+        waitForFile(NodePath.join(coordinationDir, "interrupt-2-received")),
+      );
+      yield* waitForType(threadId, "thread.metadata.updated");
+      const thirdTurnFiber = yield* sendDroidTurn(
+        adapter,
+        threadId,
+        "replacement after both interrupts",
+      ).pipe(Effect.forkChild);
+      const thirdTurnBeforeSecondTerminal = yield* Fiber.join(thirdTurnFiber).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(1_000);
+      assert.isTrue(Option.isNone(yield* Fiber.join(thirdTurnBeforeSecondTerminal)));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-interrupt-2"), ""),
+      );
+      const thirdTurn = yield* Fiber.join(thirdTurnFiber);
+      const thirdTerminal = yield* waitForType(threadId, "turn.completed", 3);
+      assert.equal(firstTerminal.payload.state, "cancelled");
+      assert.equal(secondTerminal.payload.state, "cancelled");
+      assert.equal(String(thirdTerminal.turnId), String(thirdTurn.turnId));
+      assert.equal(thirdTerminal.payload.state, "completed");
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
@@ -1102,12 +1151,12 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { adapter } = yield* makeDroidScenario();
       const { waitForType } = yield* collectDroidEvents(adapter);
       const session = yield* startDroidSession(adapter, threadId, "full-access", {
-        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known", turnIds: [] },
+        resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
       });
       const started = yield* waitForType(threadId, "session.started");
       assert.equal(session.status, "ready");
       assert.deepStrictEqual(session.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-known",
         turnIds: [],
       });
@@ -1123,7 +1172,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access", {
-        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known", turnIds: [] },
+        resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
       });
       const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock report interaction mode");
       yield* waitForType(threadId, "turn.completed");
@@ -1153,7 +1202,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 1,
+          schemaVersion: 2,
           sessionId: "mock-session-known",
           turnIds: [],
         },
@@ -1206,12 +1255,13 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { adapter } = yield* makeDroidScenario();
       const error = yield* Effect.flip(
         startDroidSession(adapter, threadId, "full-access", {
-          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-missing", turnIds: [] },
+          resumeCursor: { schemaVersion: 2, sessionId: "mock-session-missing", turnIds: [] },
         }),
       );
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
-        assert.include(error.detail, "Mock session not found");
+        assert.equal(error.detail, "Droid session request 'droid.load_session' failed.");
+        assert.include(String(error.cause), "Mock session not found");
       }
       assert.isFalse(yield* adapter.hasSession(threadId));
     }),
@@ -1225,12 +1275,13 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       const error = yield* Effect.flip(
         startDroidSession(adapter, threadId, "approval-required", {
-          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known", turnIds: [] },
+          resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
         }),
       );
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
-        assert.include(error.detail, "Mock settings update failure");
+        assert.equal(error.detail, "Droid session request 'droid.update_session_settings' failed.");
+        assert.include(String(error.cause), "Mock settings update failure");
       }
       assert.isFalse(yield* adapter.hasSession(threadId));
     }),
@@ -1243,7 +1294,8 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const error = yield* Effect.flip(startDroidSession(adapter, threadId, "full-access"));
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
-        assert.include(error.detail, "Mock initialization failure");
+        assert.equal(error.detail, "Droid session request 'droid.initialize_session' failed.");
+        assert.include(String(error.cause), "Mock initialization failure");
       }
       assert.isFalse(yield* adapter.hasSession(threadId));
     }),
@@ -1323,7 +1375,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       // the rewound session and the session still takes turns.
       const nextTurn = yield* sendDroidTurn(adapter, threadId, "turn after the rewind");
       assert.deepStrictEqual(nextTurn.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
         turnIds: [nextTurn.turnId],
       });
@@ -1461,7 +1513,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "spec_handoff");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-spec-successor",
         turnIds: [sentTurn.turnId],
       });
@@ -1562,7 +1614,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.notInclude(threadText, "late implementation successor");
       assert.notInclude(threadText, "unapproved implementation successor");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-1",
         turnIds: [specTurn.turnId, foreignTurn.turnId],
       });
@@ -1587,7 +1639,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.include(text, "hello from droid mock");
       assert.equal(terminal.payload.state, "completed");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-1",
         turnIds: [sentTurn.turnId],
       });
@@ -1801,7 +1853,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const persistedAnchor = TurnId.make("persisted-anchor");
       yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 1,
+          schemaVersion: 2,
           sessionId: "mock-session-known",
           turnIds: [...persistedTurnIds, persistedAnchor],
         },
@@ -1815,7 +1867,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });
@@ -1828,7 +1880,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { adapter } = yield* makeDroidScenario();
       yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 1,
+          schemaVersion: 2,
           sessionId: "mock-session-known",
           turnIds: [TurnId.make("persisted-turn-1"), TurnId.make("persisted-anchor")],
         },
@@ -1858,7 +1910,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 1,
+          schemaVersion: 2,
           sessionId: "mock-session-known",
           turnIds: persistedTurnIds,
         },
@@ -1874,7 +1926,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });
@@ -1886,7 +1938,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(repeated.resumeCursor, {
-        schemaVersion: 1,
+        schemaVersion: 2,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });

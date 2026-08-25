@@ -76,7 +76,7 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 
 const PROVIDER = ProviderDriverKind.make("droid");
-const DROID_RESUME_VERSION = 1 as const;
+const DROID_RESUME_VERSION = 2 as const;
 const DROID_RUNTIME_EVENT_CAPACITY = 256;
 const DroidResumeCursor = Schema.Struct({
   schemaVersion: Schema.Literal(DROID_RESUME_VERSION),
@@ -119,8 +119,10 @@ type PendingApprovalResolution =
 
 interface PendingApproval {
   readonly resolution: Deferred.Deferred<PendingApprovalResolution>;
-  readonly completed: Deferred.Deferred<void>;
   readonly supportedDecisions: ReadonlyArray<DroidApprovalDecision>;
+  readonly turnId: TurnId;
+  readonly requestType: CanonicalRequestType;
+  retired: boolean;
 }
 
 type PendingUserInputResolution =
@@ -129,7 +131,15 @@ type PendingUserInputResolution =
 
 interface PendingUserInput {
   readonly resolution: Deferred.Deferred<PendingUserInputResolution>;
-  readonly completed: Deferred.Deferred<void>;
+  readonly turnId: TurnId;
+  retired: boolean;
+}
+
+interface DroidPendingInterrupt {
+  readonly barrier: Deferred.Deferred<void>;
+  readonly candidateRunMessageIds: ReadonlySet<string>;
+  rpcSettled: boolean;
+  terminalSettled: boolean;
 }
 
 interface DroidPhysicalRun {
@@ -151,7 +161,7 @@ interface DroidSessionContext {
   session: ProviderAdapterSession;
   readonly scope: Scope.Closeable;
   readonly rpc: DroidRpcClient;
-  pendingInterrupt: Deferred.Deferred<void> | undefined;
+  pendingInterrupt: DroidPendingInterrupt | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
@@ -441,10 +451,9 @@ function refreshDroidResumeCursor(ctx: DroidSessionContext): void {
   };
 }
 
-function cancelAndAwaitPending<A>(
+function cancelPending<A>(
   pendingRequests: ReadonlyArray<{
     readonly resolution: Deferred.Deferred<A>;
-    readonly completed: Deferred.Deferred<void>;
   }>,
   cancelled: A,
 ): Effect.Effect<void> {
@@ -452,13 +461,6 @@ function cancelAndAwaitPending<A>(
     pendingRequests,
     (pending) => Deferred.succeed(pending.resolution, cancelled).pipe(Effect.ignore),
     { discard: true },
-  ).pipe(
-    Effect.andThen(
-      Effect.forEach(pendingRequests, (pending) => Deferred.await(pending.completed), {
-        discard: true,
-        concurrency: "unbounded",
-      }),
-    ),
   );
 }
 
@@ -570,7 +572,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             new ProviderAdapterRequestError({
               provider: PROVIDER,
               method,
-              detail: cause.message,
+              detail: "Droid RPC request failed.",
               cause,
             }),
         ),
@@ -850,6 +852,19 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           if (!live || live.stopped || live.droidSessionId !== ctx.droidSessionId) return;
           const terminalMessageId = notification.turnId;
           if (terminalMessageId === undefined) return;
+          const pendingInterrupt = live.pendingInterrupt;
+          if (
+            pendingInterrupt !== undefined &&
+            pendingInterrupt.candidateRunMessageIds.has(terminalMessageId)
+          ) {
+            pendingInterrupt.terminalSettled = true;
+            if (pendingInterrupt.rpcSettled) {
+              if (live.pendingInterrupt === pendingInterrupt) {
+                live.pendingInterrupt = undefined;
+              }
+              yield* Deferred.succeed(pendingInterrupt.barrier, undefined);
+            }
+          }
           const run = live.physicalRuns.get(terminalMessageId);
           if (run === undefined || run.retired) return;
           run.retired = true;
@@ -1203,9 +1218,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
     const handlePermissionRequest = (
       ctx: DroidSessionContext,
       request: Extract<DroidServerRequest, { method: "droid.request_permission" }>,
-    ) => {
-      const completed = Deferred.makeUnsafe<void>();
-      return Effect.gen(function* () {
+    ) =>
+      Effect.gen(function* () {
         const params = request.params;
         yield* logNative(ctx.threadId, "droid.request_permission", request.rawParams);
         const approvalOptions = droidApprovalOptions(params.options);
@@ -1219,6 +1233,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const resolution = yield* Deferred.make<PendingApprovalResolution>();
         const requestType = droidCanonicalRequestType(primaryToolUse?.details.type);
+        let pending: PendingApproval | undefined;
         const turnId = yield* withThreadLock(
           ctx.threadId,
           Effect.gen(function* () {
@@ -1232,7 +1247,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               return;
             }
             if (primaryToolUse) rememberToolUse(ctx, primaryToolUse.toolUse);
-            ctx.pendingApprovals.set(requestId, { resolution, completed, supportedDecisions });
+            pending = {
+              resolution,
+              supportedDecisions,
+              turnId: activeTurnId,
+              requestType,
+              retired: false,
+            };
+            ctx.pendingApprovals.set(requestId, pending);
             yield* offerRuntimeEvent(ctx, {
               type: "request.opened",
               ...(yield* makeEventStamp()),
@@ -1258,26 +1280,30 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             return activeTurnId;
           }),
         );
-        if (turnId === undefined) return;
+        if (turnId === undefined || pending === undefined) return;
         const resolved = yield* Deferred.await(resolution).pipe(
           Effect.ensuring(
             Effect.sync(() => {
-              ctx.pendingApprovals.delete(requestId);
+              if (ctx.pendingApprovals.get(requestId) === pending) {
+                ctx.pendingApprovals.delete(requestId);
+              }
             }),
           ),
         );
-        yield* offerRuntimeEvent(ctx, {
-          type: "request.resolved",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          turnId,
-          requestId: runtimeRequestId,
-          payload: {
-            requestType,
-            ...(resolved._tag === "decision" ? { decision: resolved.decision } : {}),
-          },
-        });
+        if (!pending.retired) {
+          yield* offerRuntimeEvent(ctx, {
+            type: "request.resolved",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId,
+            requestId: runtimeRequestId,
+            payload: {
+              requestType,
+              ...(resolved._tag === "decision" ? { decision: resolved.decision } : {}),
+            },
+          });
+        }
         if (resolved._tag === "cancelled") {
           yield* request.fail(
             -32800,
@@ -1341,20 +1367,19 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           // successor's stream is still arriving.
           ctx.currentInteractionMode = "auto";
         }
-      }).pipe(Effect.ensuring(Deferred.succeed(completed, undefined).pipe(Effect.asVoid)));
-    };
+      });
 
     const handleAskUserRequest = (
       ctx: DroidSessionContext,
       request: Extract<DroidServerRequest, { method: "droid.ask_user" }>,
-    ) => {
-      const completed = Deferred.makeUnsafe<void>();
-      return Effect.gen(function* () {
+    ) =>
+      Effect.gen(function* () {
         const params = request.params;
         yield* logNative(ctx.threadId, "droid.ask_user", request.params);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const resolution = yield* Deferred.make<PendingUserInputResolution>();
+        let pending: PendingUserInput | undefined;
         const turnId = yield* withThreadLock(
           ctx.threadId,
           Effect.gen(function* () {
@@ -1367,7 +1392,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               yield* request.fail(-32800, "Droid user-input request is no longer active.");
               return;
             }
-            ctx.pendingUserInputs.set(requestId, { resolution, completed });
+            pending = {
+              resolution,
+              turnId: activeTurnId,
+              retired: false,
+            };
+            ctx.pendingUserInputs.set(requestId, pending);
             yield* offerRuntimeEvent(ctx, {
               type: "user-input.requested",
               ...(yield* makeEventStamp()),
@@ -1396,24 +1426,28 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             return activeTurnId;
           }),
         );
-        if (turnId === undefined) return;
+        if (turnId === undefined || pending === undefined) return;
         const resolved = yield* Deferred.await(resolution).pipe(
           Effect.ensuring(
             Effect.sync(() => {
-              ctx.pendingUserInputs.delete(requestId);
+              if (ctx.pendingUserInputs.get(requestId) === pending) {
+                ctx.pendingUserInputs.delete(requestId);
+              }
             }),
           ),
         );
         const resolvedAnswers = resolved._tag === "answered" ? resolved.answers : {};
-        yield* offerRuntimeEvent(ctx, {
-          type: "user-input.resolved",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          turnId,
-          requestId: runtimeRequestId,
-          payload: { answers: resolvedAnswers },
-        });
+        if (!pending.retired) {
+          yield* offerRuntimeEvent(ctx, {
+            type: "user-input.resolved",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId,
+            requestId: runtimeRequestId,
+            payload: { answers: resolvedAnswers },
+          });
+        }
         if (resolved._tag === "cancelled") {
           yield* request.respond({ cancelled: true, answers: [] });
           return;
@@ -1425,8 +1459,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             return { index: question.index, question: question.question, answer };
           }),
         });
-      }).pipe(Effect.ensuring(Deferred.succeed(completed, undefined).pipe(Effect.asVoid)));
-    };
+      });
 
     const handleServerRequest = (ctx: DroidSessionContext, request: DroidServerRequest) => {
       const handler = Effect.gen(function* () {
@@ -1452,20 +1485,74 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       );
     };
 
-    const retireAndDrainPendingRequests = (ctx: DroidSessionContext) =>
+    const retirePendingRequests = (ctx: DroidSessionContext) =>
       Effect.gen(function* () {
-        const pendingApprovalHandlers = Array.from(ctx.pendingApprovals.values());
-        const pendingUserInputHandlers = Array.from(ctx.pendingUserInputs.values());
+        const pendingApprovalHandlers = Array.from(ctx.pendingApprovals);
+        const pendingUserInputHandlers = Array.from(ctx.pendingUserInputs);
         ctx.pendingApprovals.clear();
         ctx.pendingUserInputs.clear();
-        yield* cancelAndAwaitPending(pendingApprovalHandlers, { _tag: "cancelled" });
-        yield* cancelAndAwaitPending(pendingUserInputHandlers, { _tag: "cancelled" });
+        for (const [, pending] of pendingApprovalHandlers) pending.retired = true;
+        for (const [, pending] of pendingUserInputHandlers) pending.retired = true;
+        yield* cancelPending(
+          pendingApprovalHandlers.map(([, pending]) => pending),
+          { _tag: "cancelled" },
+        );
+        yield* cancelPending(
+          pendingUserInputHandlers.map(([, pending]) => pending),
+          { _tag: "cancelled" },
+        );
+        yield* Effect.forEach(
+          pendingApprovalHandlers,
+          ([requestId, pending]) =>
+            makeEventStamp().pipe(
+              Effect.flatMap((stamp) =>
+                offerRuntimeEvent(ctx, {
+                  type: "request.resolved",
+                  ...stamp,
+                  provider: PROVIDER,
+                  threadId: ctx.threadId,
+                  turnId: pending.turnId,
+                  requestId: RuntimeRequestId.make(requestId),
+                  payload: { requestType: pending.requestType },
+                }),
+              ),
+            ),
+          { discard: true },
+        );
+        yield* Effect.forEach(
+          pendingUserInputHandlers,
+          ([requestId, pending]) =>
+            makeEventStamp().pipe(
+              Effect.flatMap((stamp) =>
+                offerRuntimeEvent(ctx, {
+                  type: "user-input.resolved",
+                  ...stamp,
+                  provider: PROVIDER,
+                  threadId: ctx.threadId,
+                  turnId: pending.turnId,
+                  requestId: RuntimeRequestId.make(requestId),
+                  payload: { answers: {} },
+                }),
+              ),
+            ),
+          { discard: true },
+        );
       });
+
+    const releasePendingInterrupt = (ctx: DroidSessionContext) => {
+      const pendingInterrupt = ctx.pendingInterrupt;
+      if (pendingInterrupt === undefined) return Effect.void;
+      ctx.pendingInterrupt = undefined;
+      pendingInterrupt.rpcSettled = true;
+      pendingInterrupt.terminalSettled = true;
+      return Deferred.succeed(pendingInterrupt.barrier, undefined).pipe(Effect.asVoid);
+    };
 
     const stopSessionInternal = (ctx: DroidSessionContext) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        yield* releasePendingInterrupt(ctx);
         const activeTurnId = ctx.session.activeTurnId;
         if (activeTurnId !== undefined) {
           yield* settleTurn(ctx, activeTurnId, {
@@ -1474,7 +1561,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           });
         }
         yield* settleOpenChildTasks(ctx, () => true);
-        yield* retireAndDrainPendingRequests(ctx);
+        yield* retirePendingRequests(ctx);
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
         sessions.delete(ctx.threadId);
         yield* offerRuntimeEvent(ctx, {
@@ -1564,7 +1651,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                 new ProviderAdapterProcessError({
                   provider: PROVIDER,
                   threadId: input.threadId,
-                  detail: cause.message,
+                  detail: "Failed to start Droid process.",
                   cause,
                 }),
             ),
@@ -1580,7 +1667,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   new ProviderAdapterProcessError({
                     provider: PROVIDER,
                     threadId: input.threadId,
-                    detail: cause.message,
+                    detail: `Droid session request '${method}' failed.`,
                     cause,
                   }),
               ),
@@ -1787,6 +1874,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   const live = sessions.get(input.threadId);
                   if (live !== ctx || live.stopped) return;
                   live.stopped = true;
+                  yield* releasePendingInterrupt(live);
                   const activeTurnId = live.session.activeTurnId;
                   if (activeTurnId !== undefined) {
                     yield* settleTurn(live, activeTurnId, {
@@ -1795,10 +1883,10 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                     });
                   }
                   yield* settleOpenChildTasks(live, () => true);
-                  yield* retireAndDrainPendingRequests(live);
+                  yield* retirePendingRequests(live);
                   sessions.delete(input.threadId);
-                  // Pending request handlers publish their resolution and
-                  // finish the native RPC before their owning scope closes.
+                  // Retirement publishes canonical request resolution before
+                  // the owning scope interrupts any blocked native response.
                   yield* Effect.ignore(Scope.close(live.scope, Exit.void));
                   yield* offerRuntimeEvent(ctx, {
                     type: "session.exited",
@@ -1826,7 +1914,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         Effect.gen(function* () {
           const ctx = yield* requireSession(input.threadId);
           if (ctx.pendingInterrupt !== undefined) {
-            return { _tag: "PendingInterrupt" as const, barrier: ctx.pendingInterrupt };
+            return { _tag: "PendingInterrupt" as const, barrier: ctx.pendingInterrupt.barrier };
           }
           const text = input.input?.trim();
           const attachments = input.attachments ?? [];
@@ -1899,7 +1987,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                     new ProviderAdapterRequestError({
                       provider: PROVIDER,
                       method: "droid.add_user_message",
-                      detail: cause.message,
+                      detail: "Failed to read Droid turn attachment.",
                       cause,
                     }),
                 ),
@@ -2046,7 +2134,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               }
               return;
             }
-            yield* retireAndDrainPendingRequests(ctx);
+            yield* retirePendingRequests(ctx);
+            const candidateRunMessageIds = new Set(
+              Array.from(ctx.pendingTurnMessageIds).filter((messageId) => {
+                const run = ctx.physicalRuns.get(messageId);
+                return run !== undefined && !run.retired && run.logicalTurnId === interruptedTurnId;
+              }),
+            );
             if (interruptedTurnId !== undefined) {
               // Settle immediately; the late cancelled completion notification
               // is dropped by settleTurn's cleared-active-turn guard.
@@ -2057,15 +2151,25 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               ctx.interruptedTurnIds.delete(interruptedTurnId);
             }
             const barrier = yield* Deferred.make<void>();
-            ctx.pendingInterrupt = barrier;
+            const pendingInterrupt: DroidPendingInterrupt = {
+              barrier,
+              candidateRunMessageIds,
+              rpcSettled: false,
+              terminalSettled: candidateRunMessageIds.size === 0,
+            };
+            ctx.pendingInterrupt = pendingInterrupt;
             yield* requestViaRpc(ctx, "droid.interrupt_session", {}).pipe(
               Effect.ignore,
               Effect.ensuring(
                 Effect.sync(() => {
-                  if (ctx.pendingInterrupt === barrier) {
-                    ctx.pendingInterrupt = undefined;
+                  pendingInterrupt.rpcSettled = true;
+                  if (pendingInterrupt.terminalSettled) {
+                    if (ctx.pendingInterrupt === pendingInterrupt) {
+                      ctx.pendingInterrupt = undefined;
+                    }
+                    Deferred.doneUnsafe(pendingInterrupt.barrier, Effect.void);
                   }
-                }).pipe(Effect.andThen(Deferred.succeed(barrier, undefined)), Effect.asVoid),
+                }),
               ),
               Effect.forkIn(ctx.scope),
             );

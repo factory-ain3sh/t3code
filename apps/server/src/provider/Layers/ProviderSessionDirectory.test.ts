@@ -547,9 +547,9 @@ it.effect("serializes a full-row upsert with ownership patches on the same threa
   Effect.gen(function* () {
     // upsert reads the row and replaces it in a second statement; an
     // ownership patch issued inside that window must not be erased by the
-    // stale snapshot. The gate parks upsert's row write mid-window while a
-    // payload patch is issued; the directory's per-thread write mutex must
-    // hold the patch until the replacement lands, then merge it on top.
+    // stale snapshot, and ownership invalidation must not interleave with the
+    // write that would otherwise reinstall the replaced lease. The gate parks
+    // upsert's row write mid-window while both operations queue behind it.
     const writeGate = yield* Deferred.make<void>();
     const writeEntered = yield* Deferred.make<void>();
     const armed = yield* Ref.make(false);
@@ -611,10 +611,21 @@ it.effect("serializes a full-row upsert with ownership patches on the same threa
           runtimePayload: { checkpointRevertIntent: { turnCount: 1 } },
         })
         .pipe(Effect.forkScoped);
+      const invalidation = yield* directory.invalidateOwnership(threadId).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      assert.equal(invalidation.pollUnsafe(), undefined);
 
       yield* Deferred.succeed(writeGate, undefined);
       yield* Fiber.join(fullRowWrite);
       assert.equal(yield* Fiber.join(ownershipPatch), true);
+      yield* Fiber.join(invalidation);
+      assert.isFalse(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-a"),
+        }),
+      );
 
       const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
       assert.deepEqual(binding.runtimePayload, {

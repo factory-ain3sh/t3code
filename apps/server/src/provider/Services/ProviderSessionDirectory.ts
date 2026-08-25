@@ -70,6 +70,9 @@ export interface ProviderSessionDirectoryShape {
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<ProviderRuntimeBinding>, ProviderSessionDirectoryReadError>;
 
+  /** Clear volatile routing ownership without changing the persisted binding. */
+  readonly invalidateOwnership: (threadId: ThreadId) => Effect.Effect<void>;
+
   readonly matchesOwnership: (input: {
     readonly threadId: ThreadId;
     readonly providerInstanceId: ProviderInstanceId;

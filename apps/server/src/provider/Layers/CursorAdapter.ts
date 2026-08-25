@@ -180,6 +180,20 @@ function normalizeModeSearchText(mode: AcpSessionMode): string {
     .trim();
 }
 
+interface CursorPreparedPrompt {
+  readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly promptParts: ReadonlyArray<EffectAcpSchema.ContentBlock>;
+  readonly resolvedModel: string | undefined;
+  readonly sessionLease: ProviderSessionLease;
+  readonly sessionScope: Scope.Closeable;
+  readonly turnId: TurnId;
+  readonly turnStartResult: {
+    readonly threadId: ThreadId;
+    readonly turnId: TurnId;
+    readonly resumeCursor: ProviderAdapterSession["resumeCursor"];
+  };
+}
+
 function findModeByAliases(
   modes: ReadonlyArray<AcpSessionMode>,
   aliases: ReadonlyArray<string>,
@@ -542,14 +556,14 @@ export function makeCursorAdapter(
                   ) {
                     return;
                   }
-                  const registration = pendingPromptRegistrations.shift();
+                  const registration = pendingPromptRegistrations[0];
                   if (!registration) {
                     return;
                   }
-                  yield* Effect.yieldNow.pipe(
-                    Effect.andThen(Deferred.succeed(registration, undefined)),
-                    Effect.forkIn(sessionScope),
-                  );
+                  yield* Deferred.succeed(registration, undefined);
+                  if (pendingPromptRegistrations[0] === registration) {
+                    pendingPromptRegistrations.shift();
+                  }
                 }),
             },
             requestLogger: (event) => acpNativeLoggers.requestLogger?.(event) ?? Effect.void,
@@ -929,8 +943,147 @@ export function makeCursorAdapter(
         }).pipe(Effect.scoped),
       );
 
+    const forkCursorPrompt = (
+      threadId: ThreadId,
+      prepared: CursorPreparedPrompt,
+      registration: Deferred.Deferred<void, ProviderAdapterError>,
+    ) =>
+      prepared.acp.prompt({ prompt: prepared.promptParts }).pipe(
+        Effect.mapError((error) =>
+          mapAcpToAdapterError(PROVIDER, threadId, "session/prompt", error),
+        ),
+        Effect.matchEffect({
+          onFailure: (error) =>
+            Deferred.fail(registration, error).pipe(
+              Effect.ignore,
+              Effect.andThen(
+                withThreadLock(
+                  threadId,
+                  Effect.gen(function* () {
+                    const ctx = sessions.get(threadId);
+                    if (
+                      !ctx ||
+                      ctx.session.sessionLease !== prepared.sessionLease ||
+                      ctx.acp !== prepared.acp
+                    ) {
+                      return;
+                    }
+                    const registrationIndex = ctx.pendingPromptRegistrations.indexOf(registration);
+                    if (registrationIndex >= 0) {
+                      ctx.pendingPromptRegistrations.splice(registrationIndex, 1);
+                    }
+                    yield* prepared.acp.drainEvents;
+                    const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
+                    ctx.promptsInFlight = remainingPrompts;
+                    if (
+                      remainingPrompts > 0 ||
+                      ctx.activeTurnId !== prepared.turnId ||
+                      ctx.session.activeTurnId !== prepared.turnId
+                    ) {
+                      return;
+                    }
+                    const updatedAt = yield* nowIso;
+                    const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
+                    ctx.activeTurnId = undefined;
+                    ctx.session = {
+                      ...readySession,
+                      status: "ready",
+                      updatedAt,
+                      lastError: error.message,
+                    };
+                    yield* offerRuntimeEvent({
+                      sessionLease: prepared.sessionLease,
+                      type: "turn.completed",
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      threadId,
+                      turnId: prepared.turnId,
+                      payload: {
+                        ...(ctx.session.resumeCursor !== undefined
+                          ? { resumeCursor: ctx.session.resumeCursor }
+                          : {}),
+                        state: "failed",
+                        errorMessage: error.message,
+                      },
+                    });
+                  }),
+                ),
+              ),
+            ),
+          onSuccess: (result) =>
+            withThreadLock(
+              threadId,
+              Effect.gen(function* () {
+                const ctx = sessions.get(threadId);
+                if (
+                  !ctx ||
+                  ctx.session.sessionLease !== prepared.sessionLease ||
+                  ctx.acp !== prepared.acp
+                ) {
+                  return;
+                }
+                const turnRecord = ctx.turns.find((turn) => turn.id === prepared.turnId);
+                if (turnRecord) {
+                  turnRecord.items.push({
+                    prompt: prepared.promptParts,
+                    result,
+                  });
+                } else {
+                  ctx.turns.push({
+                    id: prepared.turnId,
+                    items: [{ prompt: prepared.promptParts, result }],
+                  });
+                }
+                const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
+                ctx.promptsInFlight = remainingPrompts;
+                if (
+                  remainingPrompts > 0 ||
+                  ctx.activeTurnId !== prepared.turnId ||
+                  ctx.session.activeTurnId !== prepared.turnId
+                ) {
+                  return;
+                }
+                const updatedAt = yield* nowIso;
+                const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
+                ctx.activeTurnId = undefined;
+                ctx.session = {
+                  ...readySession,
+                  status: "ready",
+                  updatedAt,
+                  model: prepared.resolvedModel,
+                };
+                yield* prepared.acp.drainEvents;
+                yield* offerRuntimeEvent({
+                  sessionLease: prepared.sessionLease,
+                  type: "turn.completed",
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  threadId,
+                  turnId: prepared.turnId,
+                  payload: {
+                    ...(ctx.session.resumeCursor !== undefined
+                      ? { resumeCursor: ctx.session.resumeCursor }
+                      : {}),
+                    state: result.stopReason === "cancelled" ? "cancelled" : "completed",
+                    stopReason: result.stopReason ?? null,
+                  },
+                });
+              }),
+            ),
+        }),
+        Effect.catchCause((cause) =>
+          Effect.logError("Failed to settle Cursor prompt.", {
+            cause,
+            threadId,
+            turnId: prepared.turnId,
+          }),
+        ),
+        Effect.forkIn(prepared.sessionScope),
+      );
+
     const sendTurn: CursorAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
+        const registration = yield* Deferred.make<void, ProviderAdapterError>();
         const prepared = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
@@ -1027,7 +1180,7 @@ export function makeCursorAdapter(
                 payload: { model: resolvedModel },
               });
             }
-            return {
+            const prepared: CursorPreparedPrompt = {
               acp: ctx.acp,
               promptParts,
               resolvedModel,
@@ -1040,174 +1193,32 @@ export function makeCursorAdapter(
                 resumeCursor: ctx.session.resumeCursor,
               },
             };
+            ctx.pendingPromptRegistrations.push(registration);
+            yield* forkCursorPrompt(input.threadId, prepared, registration);
+            yield* Deferred.await(registration);
+            return prepared;
           }),
         );
 
-        const registration = yield* Deferred.make<void, ProviderAdapterError>();
-        const registrationQueueOwner = sessions.get(input.threadId);
-        if (
-          !registrationQueueOwner ||
-          registrationQueueOwner.session.sessionLease !== prepared.sessionLease ||
-          registrationQueueOwner.acp !== prepared.acp
-        ) {
-          return yield* new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "session/prompt",
-            detail: "Cursor session changed before the prompt could be registered.",
-          });
-        }
-        registrationQueueOwner.pendingPromptRegistrations.push(registration);
-
-        yield* prepared.acp.prompt({ prompt: prepared.promptParts }).pipe(
-          Effect.mapError((error) =>
-            mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-          ),
-          Effect.matchEffect({
-            onFailure: (error) =>
-              Deferred.fail(registration, error).pipe(
-                Effect.ignore,
-                Effect.andThen(
-                  withThreadLock(
-                    input.threadId,
-                    Effect.gen(function* () {
-                      const ctx = sessions.get(input.threadId);
-                      if (
-                        !ctx ||
-                        ctx.session.sessionLease !== prepared.sessionLease ||
-                        ctx.acp !== prepared.acp
-                      ) {
-                        return;
-                      }
-                      const registrationIndex =
-                        ctx.pendingPromptRegistrations.indexOf(registration);
-                      if (registrationIndex >= 0) {
-                        ctx.pendingPromptRegistrations.splice(registrationIndex, 1);
-                      }
-                      const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
-                      ctx.promptsInFlight = remainingPrompts;
-                      if (
-                        remainingPrompts > 0 ||
-                        ctx.activeTurnId !== prepared.turnId ||
-                        ctx.session.activeTurnId !== prepared.turnId
-                      ) {
-                        return;
-                      }
-                      const updatedAt = yield* nowIso;
-                      const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-                      ctx.activeTurnId = undefined;
-                      ctx.session = {
-                        ...readySession,
-                        status: "ready",
-                        updatedAt,
-                        lastError: error.message,
-                      };
-                      yield* offerRuntimeEvent({
-                        sessionLease: prepared.sessionLease,
-                        type: "turn.completed",
-                        ...(yield* makeEventStamp()),
-                        provider: PROVIDER,
-                        threadId: input.threadId,
-                        turnId: prepared.turnId,
-                        payload: {
-                          ...(ctx.session.resumeCursor !== undefined
-                            ? { resumeCursor: ctx.session.resumeCursor }
-                            : {}),
-                          state: "failed",
-                          errorMessage: error.message,
-                        },
-                      });
-                    }),
-                  ),
-                ),
-              ),
-            onSuccess: (result) =>
-              withThreadLock(
-                input.threadId,
-                Effect.gen(function* () {
-                  const ctx = sessions.get(input.threadId);
-                  if (
-                    !ctx ||
-                    ctx.session.sessionLease !== prepared.sessionLease ||
-                    ctx.acp !== prepared.acp
-                  ) {
-                    return;
-                  }
-                  const turnRecord = ctx.turns.find((turn) => turn.id === prepared.turnId);
-                  if (turnRecord) {
-                    turnRecord.items.push({
-                      prompt: prepared.promptParts,
-                      result,
-                    });
-                  } else {
-                    ctx.turns.push({
-                      id: prepared.turnId,
-                      items: [{ prompt: prepared.promptParts, result }],
-                    });
-                  }
-                  const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
-                  ctx.promptsInFlight = remainingPrompts;
-                  if (
-                    remainingPrompts > 0 ||
-                    ctx.activeTurnId !== prepared.turnId ||
-                    ctx.session.activeTurnId !== prepared.turnId
-                  ) {
-                    return;
-                  }
-                  const updatedAt = yield* nowIso;
-                  const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-                  ctx.activeTurnId = undefined;
-                  ctx.session = {
-                    ...readySession,
-                    status: "ready",
-                    updatedAt,
-                    model: prepared.resolvedModel,
-                  };
-                  yield* prepared.acp.drainEvents;
-                  yield* offerRuntimeEvent({
-                    sessionLease: prepared.sessionLease,
-                    type: "turn.completed",
-                    ...(yield* makeEventStamp()),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId: prepared.turnId,
-                    payload: {
-                      ...(ctx.session.resumeCursor !== undefined
-                        ? { resumeCursor: ctx.session.resumeCursor }
-                        : {}),
-                      state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-                      stopReason: result.stopReason ?? null,
-                    },
-                  });
-                }),
-              ),
-          }),
-          Effect.catchCause((cause) =>
-            Effect.logError("Failed to settle Cursor prompt.", {
-              cause,
-              threadId: input.threadId,
-              turnId: prepared.turnId,
-            }),
-          ),
-          Effect.forkIn(prepared.sessionScope),
-        );
-
-        yield* Deferred.await(registration);
         return prepared.turnStartResult;
       });
 
     const interruptTurn: CursorAdapterShape["interruptTurn"] = (threadId) =>
-      Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
-        yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
-        yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        yield* Effect.ignore(
-          ctx.acp.cancel.pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(threadId);
+          yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
+          yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+          yield* Effect.ignore(
+            ctx.acp.cancel.pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
+              ),
             ),
-          ),
-        );
-      });
+          );
+        }),
+      );
 
     const respondToRequest: CursorAdapterShape["respondToRequest"] = (
       threadId,

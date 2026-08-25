@@ -594,6 +594,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+      yield* directory.invalidateOwnership(input.binding.threadId);
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
@@ -835,6 +836,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           });
           const adapter = yield* registry.getByInstance(resolvedInstanceId);
           yield* prepareMcpSession(threadId, resolvedInstanceId);
+          yield* directory.invalidateOwnership(threadId);
           const session = yield* adapter
             .startSession({
               ...input,
@@ -1027,32 +1029,35 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         payload: rawInput,
       });
       let metricProvider = "unknown";
-      return yield* Effect.gen(function* () {
-        const routed = yield* resolveRoutableSession({
-          threadId: input.threadId,
-          operation: "ProviderService.interruptTurn",
-          allowRecovery: true,
-          lifecycleLockHeld: false,
-        });
-        metricProvider = routed.adapter.provider;
-        yield* Effect.annotateCurrentSpan({
-          "provider.operation": "interrupt-turn",
-          "provider.kind": routed.adapter.provider,
-          "provider.thread_id": input.threadId,
-          "provider.turn_id": input.turnId,
-        });
-        yield* routed.adapter.interruptTurn(routed.threadId, input.turnId);
-        yield* analytics.record("provider.turn.interrupted", {
-          provider: routed.adapter.provider,
-        });
-      }).pipe(
-        withMetrics({
-          counter: providerTurnsTotal,
-          outcomeAttributes: () =>
-            providerMetricAttributes(metricProvider, {
-              operation: "interrupt",
-            }),
-        }),
+      return yield* withSessionLifecycleLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const routed = yield* resolveRoutableSession({
+            threadId: input.threadId,
+            operation: "ProviderService.interruptTurn",
+            allowRecovery: true,
+            lifecycleLockHeld: true,
+          });
+          metricProvider = routed.adapter.provider;
+          yield* Effect.annotateCurrentSpan({
+            "provider.operation": "interrupt-turn",
+            "provider.kind": routed.adapter.provider,
+            "provider.thread_id": input.threadId,
+            "provider.turn_id": input.turnId,
+          });
+          yield* routed.adapter.interruptTurn(routed.threadId, input.turnId);
+          yield* analytics.record("provider.turn.interrupted", {
+            provider: routed.adapter.provider,
+          });
+        }).pipe(
+          withMetrics({
+            counter: providerTurnsTotal,
+            outcomeAttributes: () =>
+              providerMetricAttributes(metricProvider, {
+                operation: "interrupt",
+              }),
+          }),
+        ),
       );
     },
   );
@@ -1166,6 +1171,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           if (routed.isActive) {
             yield* routed.adapter.stopSession(routed.threadId);
           }
+          yield* directory.invalidateOwnership(input.threadId);
           yield* clearMcpSession(input.threadId);
           yield* directory.upsert({
             threadId: input.threadId,

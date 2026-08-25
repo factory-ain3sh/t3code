@@ -123,6 +123,21 @@ interface GrokSessionContext {
   stopped: boolean;
 }
 
+interface GrokPreparedPrompt {
+  readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly acpSessionId: string;
+  readonly displayModel: string | undefined;
+  readonly promptParts: ReadonlyArray<EffectAcpSchema.ContentBlock>;
+  readonly sessionLease: ProviderSessionLease;
+  readonly sessionScope: Scope.Closeable;
+  readonly turnId: TurnId;
+  readonly turnStartResult: {
+    readonly threadId: ThreadId;
+    readonly turnId: TurnId;
+    readonly resumeCursor: ProviderAdapterSession["resumeCursor"];
+  };
+}
+
 function settlePendingApprovalsAsCancelled(
   pendingApprovals: ReadonlyMap<ApprovalRequestId, PendingApproval>,
 ): Effect.Effect<void> {
@@ -620,14 +635,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   ) {
                     return;
                   }
-                  const registration = pendingPromptRegistrations.shift();
+                  const registration = pendingPromptRegistrations[0];
                   if (!registration) {
                     return;
                   }
-                  yield* Effect.yieldNow.pipe(
-                    Effect.andThen(Deferred.succeed(registration, undefined)),
-                    Effect.forkIn(sessionScope),
-                  );
+                  yield* Deferred.succeed(registration, undefined);
+                  if (pendingPromptRegistrations[0] === registration) {
+                    pendingPromptRegistrations.shift();
+                  }
                 }),
             },
             requestLogger: (event) => acpNativeLoggers.requestLogger?.(event) ?? Effect.void,
@@ -971,8 +986,102 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         }).pipe(Effect.scoped),
       );
 
+    const forkGrokPrompt = (
+      threadId: ThreadId,
+      prepared: GrokPreparedPrompt,
+      registration: Deferred.Deferred<void, ProviderAdapterError>,
+    ) =>
+      prepared.acp.prompt({ prompt: prepared.promptParts }).pipe(
+        Effect.mapError((error) =>
+          mapAcpToAdapterError(PROVIDER, threadId, "session/prompt", error),
+        ),
+        Effect.matchEffect({
+          onFailure: (error) =>
+            Deferred.fail(registration, error).pipe(
+              Effect.ignore,
+              Effect.andThen(
+                withThreadLock(
+                  threadId,
+                  Effect.gen(function* () {
+                    const ctx = sessions.get(threadId);
+                    if (
+                      ctx &&
+                      ctx.session.sessionLease === prepared.sessionLease &&
+                      ctx.acpSessionId === prepared.acpSessionId &&
+                      ctx.acp === prepared.acp
+                    ) {
+                      const registrationIndex =
+                        ctx.pendingPromptRegistrations.indexOf(registration);
+                      if (registrationIndex >= 0) {
+                        ctx.pendingPromptRegistrations.splice(registrationIndex, 1);
+                      }
+                    }
+                    yield* prepared.acp.drainEvents;
+                    yield* settlePromptInFlight(
+                      threadId,
+                      prepared.turnId,
+                      prepared.acpSessionId,
+                      prepared.sessionLease,
+                      { errorMessage: error.message },
+                    );
+                  }),
+                ),
+              ),
+            ),
+          onSuccess: (result) =>
+            withThreadLock(
+              threadId,
+              Effect.gen(function* () {
+                const ctx = sessions.get(threadId);
+                if (
+                  !ctx ||
+                  ctx.session.sessionLease !== prepared.sessionLease ||
+                  ctx.acpSessionId !== prepared.acpSessionId ||
+                  ctx.acp !== prepared.acp ||
+                  ctx.interruptedTurnIds.has(prepared.turnId)
+                ) {
+                  return;
+                }
+                for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
+                  yield* Effect.yieldNow;
+                }
+                yield* prepared.acp.drainEvents;
+                if (ctx.interruptedTurnIds.has(prepared.turnId)) {
+                  return;
+                }
+                appendPromptResultToTurn(ctx, prepared.turnId, prepared.promptParts, result);
+                if (prepared.displayModel) {
+                  ctx.session = {
+                    ...ctx.session,
+                    model: prepared.displayModel,
+                  };
+                }
+                yield* settlePromptInFlight(
+                  threadId,
+                  prepared.turnId,
+                  prepared.acpSessionId,
+                  prepared.sessionLease,
+                  {
+                    completedStopReason: completedStopReasonFromPromptResponse(result),
+                  },
+                );
+                ctx.interruptedTurnIds.delete(prepared.turnId);
+              }),
+            ),
+        }),
+        Effect.catchCause((cause) =>
+          Effect.logError("Failed to settle Grok prompt.", {
+            cause,
+            threadId,
+            turnId: prepared.turnId,
+          }),
+        ),
+        Effect.forkIn(prepared.sessionScope),
+      );
+
     const sendTurn: GrokAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
+        const registration = yield* Deferred.make<void, ProviderAdapterError>();
         const prepared = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
@@ -1066,7 +1175,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               });
             }
 
-            return {
+            const prepared: GrokPreparedPrompt = {
               acp: ctx.acp,
               acpSessionId: ctx.acpSessionId,
               displayModel,
@@ -1080,113 +1189,13 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 resumeCursor: ctx.session.resumeCursor,
               },
             };
+            ctx.pendingPromptRegistrations.push(registration);
+            yield* forkGrokPrompt(input.threadId, prepared, registration);
+            yield* Deferred.await(registration);
+            return prepared;
           }),
         );
 
-        const registration = yield* Deferred.make<void, ProviderAdapterError>();
-        const registrationQueueOwner = sessions.get(input.threadId);
-        if (
-          !registrationQueueOwner ||
-          registrationQueueOwner.session.sessionLease !== prepared.sessionLease ||
-          registrationQueueOwner.acpSessionId !== prepared.acpSessionId ||
-          registrationQueueOwner.acp !== prepared.acp
-        ) {
-          return yield* new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "session/prompt",
-            detail: "Grok session changed before the prompt could be registered.",
-          });
-        }
-        registrationQueueOwner.pendingPromptRegistrations.push(registration);
-
-        yield* prepared.acp.prompt({ prompt: prepared.promptParts }).pipe(
-          Effect.mapError((error) =>
-            mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-          ),
-          Effect.matchEffect({
-            onFailure: (error) =>
-              Deferred.fail(registration, error).pipe(
-                Effect.ignore,
-                Effect.andThen(
-                  withThreadLock(
-                    input.threadId,
-                    Effect.gen(function* () {
-                      const ctx = sessions.get(input.threadId);
-                      if (
-                        ctx &&
-                        ctx.session.sessionLease === prepared.sessionLease &&
-                        ctx.acpSessionId === prepared.acpSessionId &&
-                        ctx.acp === prepared.acp
-                      ) {
-                        const registrationIndex =
-                          ctx.pendingPromptRegistrations.indexOf(registration);
-                        if (registrationIndex >= 0) {
-                          ctx.pendingPromptRegistrations.splice(registrationIndex, 1);
-                        }
-                      }
-                      yield* settlePromptInFlight(
-                        input.threadId,
-                        prepared.turnId,
-                        prepared.acpSessionId,
-                        prepared.sessionLease,
-                        { errorMessage: error.message },
-                      );
-                    }),
-                  ),
-                ),
-              ),
-            onSuccess: (result) =>
-              withThreadLock(
-                input.threadId,
-                Effect.gen(function* () {
-                  const ctx = sessions.get(input.threadId);
-                  if (
-                    !ctx ||
-                    ctx.session.sessionLease !== prepared.sessionLease ||
-                    ctx.acpSessionId !== prepared.acpSessionId ||
-                    ctx.acp !== prepared.acp ||
-                    ctx.interruptedTurnIds.has(prepared.turnId)
-                  ) {
-                    return;
-                  }
-                  for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
-                    yield* Effect.yieldNow;
-                  }
-                  yield* prepared.acp.drainEvents;
-                  if (ctx.interruptedTurnIds.has(prepared.turnId)) {
-                    return;
-                  }
-                  appendPromptResultToTurn(ctx, prepared.turnId, prepared.promptParts, result);
-                  if (prepared.displayModel) {
-                    ctx.session = {
-                      ...ctx.session,
-                      model: prepared.displayModel,
-                    };
-                  }
-                  yield* settlePromptInFlight(
-                    input.threadId,
-                    prepared.turnId,
-                    prepared.acpSessionId,
-                    prepared.sessionLease,
-                    {
-                      completedStopReason: completedStopReasonFromPromptResponse(result),
-                    },
-                  );
-                  ctx.interruptedTurnIds.delete(prepared.turnId);
-                }),
-              ),
-          }),
-          Effect.catchCause((cause) =>
-            Effect.logError("Failed to settle Grok prompt.", {
-              cause,
-              threadId: input.threadId,
-              turnId: prepared.turnId,
-            }),
-          ),
-          Effect.forkIn(prepared.sessionScope),
-        );
-
-        yield* Deferred.await(registration);
         return prepared.turnStartResult;
       });
 

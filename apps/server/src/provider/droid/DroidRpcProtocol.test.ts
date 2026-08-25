@@ -172,6 +172,18 @@ describe("DroidRpcProtocol", () => {
     }),
   );
 
+  it.effect("assembles a message from many small fragments", () =>
+    Effect.gen(function* () {
+      const { fiber, protocol, request } = yield* pendingRequest();
+      const encoded = response(request.id, { text: "x".repeat(20_000) });
+      for (const fragment of encoded) {
+        yield* protocol.acceptChunk(fragment);
+      }
+      yield* protocol.acceptChunk("\n");
+      assert.deepStrictEqual(yield* Fiber.join(fiber), { text: "x".repeat(20_000) });
+    }),
+  );
+
   it.effect("skips malformed lines and unknown notifications", () =>
     Effect.gen(function* () {
       const protocol = yield* makeDroidRpcProtocol();
@@ -347,6 +359,37 @@ describe("DroidRpcProtocol", () => {
     }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
   });
 
+  it.effect("drops timed-out request frames that are still queued", () => {
+    const logs: string[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(String(Array.isArray(message) ? message[0] : message));
+    });
+    return Effect.gen(function* () {
+      const protocol = yield* makeDroidRpcProtocol();
+      yield* protocol.acceptChunk(`${askRequest(1)}\n`);
+      const serverResponse = yield* take(protocol.serverRequests);
+      yield* serverResponse.respond({ accepted: true });
+
+      const requestFiber = yield* protocol
+        .request("droid.queued", {}, { timeoutMs: 10 })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* TestClock.adjust("11 millis");
+      const timedOut = yield* Effect.result(Fiber.join(requestFiber));
+      assert.equal(timedOut._tag, "Failure");
+      if (timedOut._tag === "Failure") assert.equal(timedOut.failure.kind, "timeout");
+
+      yield* protocol.closeOutgoing;
+      const outgoing = yield* Stream.runCollect(protocol.outgoing);
+      assert.deepStrictEqual(
+        Array.from(outgoing, (encoded) => parse(encoded).id),
+        ["ask-1"],
+      );
+      yield* protocol.acceptChunk(`${response("1", { late: true })}\n`);
+      assert.include(logs, "Ignoring response for unknown Droid request 1");
+      assert.notInclude(logs, "Droid request droid.queued responded after timing out");
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
   it.effect("bounds timeout tombstones while retaining recent diagnostics", () => {
     const logs: string[] = [];
     const logger = Logger.make(({ message }) => {
@@ -393,6 +436,35 @@ describe("DroidRpcProtocol", () => {
       if (future._tag === "Failure") {
         assert.equal(future.failure.kind, "process-exit");
         assert.deepStrictEqual(future.failure.data, exit);
+      }
+    }),
+  );
+
+  it.effect("rejects completed turns without correlation ids", () =>
+    Effect.gen(function* () {
+      const protocol = yield* makeDroidRpcProtocol();
+      const result = yield* Effect.result(
+        protocol.acceptChunk(
+          `${notification({
+            type: "agent_turn_completed",
+            reason: "completed",
+            tokenUsage: {
+              inputTokens: 1,
+              outputTokens: 1,
+              cacheCreationTokens: 0,
+              cacheReadTokens: 0,
+              thinkingTokens: 0,
+            },
+          })}\n`,
+        ),
+      );
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure.kind, "protocol");
+        assert.equal(
+          result.failure.message,
+          "Droid agent_turn_completed notification is missing turnId",
+        );
       }
     }),
   );

@@ -224,6 +224,7 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
   upsert: () => Effect.void,
   updateResumeCursorIfOwned: () => Effect.succeed(false),
   updateRuntimePayloadIfOwned: () => Effect.succeed(false),
+  invalidateOwnership: () => Effect.void,
   matchesOwnership: () => Effect.succeed(true),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),

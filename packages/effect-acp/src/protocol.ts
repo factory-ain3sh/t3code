@@ -126,13 +126,13 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     });
 
     if (encoded) {
+      yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
+
       yield* logProtocol({
         direction: "outgoing",
         stage: "raw",
         payload: typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded),
       });
-
-      yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
     }
   });
 

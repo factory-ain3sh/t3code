@@ -50,6 +50,7 @@ import type {
   ProviderThreadRollbackTarget,
 } from "../Services/ProviderAdapter.ts";
 import {
+  makeRequireActiveProviderSession,
   rollbackTargetMatchesKnownHistory,
   rollbackTargetMatchesTurnPrefix,
 } from "../Services/ProviderAdapter.ts";
@@ -151,33 +152,50 @@ describe("provider rollback matchers", () => {
   });
 });
 
+describe("provider active session resolver", () => {
+  it.effect("observes a session added after the effect is constructed", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-deferred-session-lookup");
+      const session = { stopped: false, value: "late-session" };
+      const sessions = new Map<ThreadId, typeof session>();
+      const requireSession = makeRequireActiveProviderSession(sessions, CODEX_DRIVER);
+      const lookup = requireSession(threadId);
+
+      sessions.set(threadId, session);
+
+      assert.strictEqual(yield* lookup, session);
+    }),
+  );
+});
+
 function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderAdapterSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   let nextSessionLease = 0;
 
-  const startSession = vi.fn((input: ProviderSessionStartInput) =>
-    Effect.sync(() => {
-      const now = "2026-01-01T00:00:00.000Z";
-      const session: ProviderAdapterSession = {
-        provider,
-        ...(input.providerInstanceId !== undefined
-          ? { providerInstanceId: input.providerInstanceId }
-          : {}),
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        threadId: input.threadId,
-        sessionLease: ProviderSessionLease.make(`lease-${++nextSessionLease}`),
-        resumeCursor: input.resumeCursor ?? {
-          opaque: `resume-${String(input.threadId)}`,
-        },
-        cwd: input.cwd ?? process.cwd(),
-        createdAt: now,
-        updatedAt: now,
-      };
-      sessions.set(session.threadId, session);
-      return session;
-    }),
+  const startSession = vi.fn<ProviderAdapterShape<ProviderAdapterError>["startSession"]>(
+    (input: ProviderSessionStartInput) =>
+      Effect.sync(() => {
+        const now = "2026-01-01T00:00:00.000Z";
+        const session: ProviderAdapterSession = {
+          provider,
+          ...(input.providerInstanceId !== undefined
+            ? { providerInstanceId: input.providerInstanceId }
+            : {}),
+          status: "ready",
+          runtimeMode: input.runtimeMode,
+          threadId: input.threadId,
+          sessionLease: ProviderSessionLease.make(`lease-${++nextSessionLease}`),
+          resumeCursor: input.resumeCursor ?? {
+            opaque: `resume-${String(input.threadId)}`,
+          },
+          cwd: input.cwd ?? process.cwd(),
+          createdAt: now,
+          updatedAt: now,
+        };
+        sessions.set(session.threadId, session);
+        return session;
+      }),
   );
 
   const sendTurn = vi.fn((input: ProviderSendTurnInput) =>
@@ -390,6 +408,20 @@ const expectSome = <A>(option: Option.Option<A>): A => {
   }
   return option.value;
 };
+
+const getPersistedSessionLease = (
+  directory: ProviderSessionDirectory.ProviderSessionDirectory["Service"],
+  threadId: ThreadId,
+) =>
+  directory.getBinding(threadId).pipe(
+    Effect.map((binding) => {
+      const sessionLease = expectSome(binding).sessionLease;
+      if (sessionLease === null || sessionLease === undefined) {
+        throw new Error(`Expected an active session lease for thread '${threadId}'.`);
+      }
+      return sessionLease;
+    }),
+  );
 
 const assertStartCalledWith = (
   calls: ReadonlyArray<ReadonlyArray<unknown>>,
@@ -1116,24 +1148,54 @@ routing.layer("ProviderServiceLive routing", (it) => {
   it.effect("stops stale sessions in other providers after a successful replacement start", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       const threadId = asThreadId("thread-provider-replacement");
 
       const codexSession = yield* startTestSession(provider, threadId, {
         cwd: "/tmp/project-provider-replacement",
       });
+      const codexLease = yield* getPersistedSessionLease(directory, threadId);
+      let ownershipAtReplacementStart = true;
 
       routing.codex.stopSession.mockClear();
       routing.claude.stopSession.mockClear();
+      routing.claude.startSession.mockImplementationOnce((input) =>
+        directory
+          .matchesOwnership({
+            threadId,
+            providerInstanceId: codexInstanceId,
+            sessionLease: codexLease,
+          })
+          .pipe(
+            Effect.tap((matches) =>
+              Effect.sync(() => {
+                ownershipAtReplacementStart = matches;
+              }),
+            ),
+            Effect.andThen(
+              Effect.suspend(() => routing.claude.adapter.startSession(input)).pipe(Effect.orDie),
+            ),
+          ),
+      );
 
       const claudeSession = yield* startTestSession(provider, threadId, {
         driver: ProviderDriverKind.make("claudeAgent"),
         cwd: "/tmp/project-provider-replacement",
       });
+      const claudeLease = yield* getPersistedSessionLease(directory, threadId);
 
       assert.equal(codexSession.provider, "codex");
       assert.equal(claudeSession.provider, "claudeAgent");
+      assert.isFalse(ownershipAtReplacementStart);
       assert.deepEqual(routing.codex.stopSession.mock.calls, [[threadId]]);
       assert.equal(routing.claude.stopSession.mock.calls.length, 0);
+      assert.isTrue(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: claudeAgentInstanceId,
+          sessionLease: claudeLease,
+        }),
+      );
 
       const sessions = yield* provider.listSessions();
       assert.deepEqual(
@@ -1142,6 +1204,220 @@ routing.layer("ProviderServiceLive routing", (it) => {
           .map((session) => session.provider),
         ["claudeAgent"],
       );
+    }),
+  );
+
+  it.effect("leaves volatile ownership invalid when a replacement start fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-provider-replacement-failure");
+      yield* startTestSession(provider, threadId);
+      const originalLease = yield* getPersistedSessionLease(directory, threadId);
+      let ownershipAtReplacementStart = true;
+
+      routing.claude.startSession.mockImplementationOnce(() =>
+        directory
+          .matchesOwnership({
+            threadId,
+            providerInstanceId: codexInstanceId,
+            sessionLease: originalLease,
+          })
+          .pipe(
+            Effect.tap((matches) =>
+              Effect.sync(() => {
+                ownershipAtReplacementStart = matches;
+              }),
+            ),
+            Effect.andThen(
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: String(CLAUDE_AGENT_DRIVER),
+                  method: "startSession",
+                  detail: "simulated replacement failure",
+                }),
+              ),
+            ),
+          ),
+      );
+
+      const failure = yield* provider
+        .startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(failure, ProviderAdapterRequestError);
+      assert.isFalse(ownershipAtReplacementStart);
+      assert.isFalse(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: codexInstanceId,
+          sessionLease: originalLease,
+        }),
+      );
+      const persisted = expectSome(yield* directory.getBinding(threadId));
+      assert.equal(persisted.providerInstanceId, codexInstanceId);
+      assert.equal(persisted.sessionLease, originalLease);
+    }),
+  );
+
+  it.effect("invalidates ownership before recovering a replacement session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-recovery-ownership-invalidation");
+      const original = yield* startTestSession(provider, threadId);
+      const originalLease = yield* getPersistedSessionLease(directory, threadId);
+      yield* routing.codex.stopSession(threadId);
+      let ownershipAtRecoveryStart = true;
+
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        directory
+          .matchesOwnership({
+            threadId,
+            providerInstanceId: codexInstanceId,
+            sessionLease: originalLease,
+          })
+          .pipe(
+            Effect.tap((matches) =>
+              Effect.sync(() => {
+                ownershipAtRecoveryStart = matches;
+              }),
+            ),
+            Effect.andThen(
+              Effect.suspend(() => routing.codex.adapter.startSession(input)).pipe(Effect.orDie),
+            ),
+          ),
+      );
+
+      const recovered = yield* provider.recoverSession(threadId);
+      const recoveredLease = yield* getPersistedSessionLease(directory, threadId);
+
+      assert.isFalse(ownershipAtRecoveryStart);
+      assert.notEqual(recoveredLease, originalLease);
+      assert.isTrue(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: codexInstanceId,
+          sessionLease: recoveredLease,
+        }),
+      );
+      assert.equal(recovered.provider, original.provider);
+    }),
+  );
+
+  it.effect("invalidates ownership after stopping a session", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-stop-ownership-invalidation");
+      yield* startTestSession(provider, threadId);
+      const sessionLease = yield* getPersistedSessionLease(directory, threadId);
+      let ownershipAtStop = true;
+      const exited = yield* provider.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.type === "session.exited" && String(event.threadId) === String(threadId),
+        ),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true }),
+      );
+
+      routing.codex.stopSession.mockImplementationOnce((stoppedThreadId) =>
+        directory
+          .matchesOwnership({
+            threadId,
+            providerInstanceId: codexInstanceId,
+            sessionLease,
+          })
+          .pipe(
+            Effect.tap((matches) =>
+              Effect.sync(() => {
+                ownershipAtStop = matches;
+              }),
+            ),
+            Effect.andThen(
+              Effect.sync(() =>
+                routing.codex.emitRaw({
+                  type: "session.exited",
+                  sessionLease,
+                  eventId: asEventId("evt-stop-session"),
+                  provider: CODEX_DRIVER,
+                  createdAt: "2026-01-01T00:00:00.000Z",
+                  threadId,
+                  payload: { exitKind: "graceful" },
+                }),
+              ),
+            ),
+            Effect.andThen(
+              Effect.suspend(() => routing.codex.adapter.stopSession(stoppedThreadId)).pipe(
+                Effect.orDie,
+              ),
+            ),
+          ),
+      );
+
+      assert.equal(yield* provider.stopSession({ threadId }), "stopped");
+      assert.isTrue(ownershipAtStop);
+      assert.isTrue(Option.isSome(yield* Fiber.join(exited)));
+      assert.isFalse(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: codexInstanceId,
+          sessionLease,
+        }),
+      );
+    }),
+  );
+
+  it.effect("routes interrupt to replacement ownership after lifecycle mutation completes", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-interrupt-replacement-race");
+      yield* startTestSession(provider, threadId);
+
+      const replacementStartEntered = yield* Deferred.make<void>();
+      const allowReplacementStart = yield* Deferred.make<void>();
+      routing.claude.startSession.mockImplementationOnce((input) =>
+        Deferred.succeed(replacementStartEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowReplacementStart)),
+          Effect.andThen(
+            Effect.suspend(() => routing.claude.adapter.startSession(input)).pipe(Effect.orDie),
+          ),
+        ),
+      );
+      routing.codex.interruptTurn.mockClear();
+      routing.claude.interruptTurn.mockClear();
+
+      const replacementStart = yield* provider
+        .startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(replacementStartEntered);
+
+      const interruptAttempted = yield* Deferred.make<void>();
+      const interrupt = yield* Deferred.succeed(interruptAttempted, undefined).pipe(
+        Effect.andThen(provider.interruptTurn({ threadId })),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(interruptAttempted);
+      yield* Effect.yieldNow;
+      assert.equal(routing.codex.interruptTurn.mock.calls.length, 0);
+      assert.equal(routing.claude.interruptTurn.mock.calls.length, 0);
+
+      yield* Deferred.succeed(allowReplacementStart, undefined);
+      yield* Fiber.join(replacementStart);
+      yield* Fiber.join(interrupt);
+
+      assert.equal(routing.codex.interruptTurn.mock.calls.length, 0);
+      assert.deepEqual(routing.claude.interruptTurn.mock.calls, [[threadId, undefined]]);
     }),
   );
 
