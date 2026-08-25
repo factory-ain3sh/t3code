@@ -314,7 +314,7 @@ describe("ProviderCommandReactor", () => {
       },
     ];
 
-    const service = makeProviderServiceMock({
+    const service = makeProviderServiceMock(ProviderDriverKind.make("codex"), {
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
       interruptTurn: interruptTurn as ProviderServiceShape["interruptTurn"],

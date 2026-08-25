@@ -256,7 +256,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       const settings = yield* ServerSettingsService;
       const threadId = ThreadId.make("cursor-short-dispatch");
       const wrapperPath = yield* Effect.promise(() =>
-        makeMockAgentWrapper({ T3_ACP_PROMPT_DELAY_MS: "1500" }),
+        makeMockAgentWrapper({ T3_ACP_PROMPT_DELAY_MS: "500" }),
       );
       yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
@@ -290,7 +290,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       assert.equal(turn.threadId, threadId);
       assert.isTrue(runtimeEvents.every((event) => event.sessionLease === session.sessionLease));
 
-      yield* Deferred.await(turnCompleted);
+      yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
       const terminal = runtimeEvents.find(
         (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
       );
@@ -298,7 +298,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("queues the Cursor prompt before an immediate interrupt", () =>

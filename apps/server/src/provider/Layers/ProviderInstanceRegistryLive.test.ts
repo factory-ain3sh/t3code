@@ -136,12 +136,13 @@ const makeOpenCodeConfig = (overrides: Partial<OpenCodeSettings>): OpenCodeSetti
   ...overrides,
 });
 
-const makeDroidConfig = (overrides: Partial<DroidSettings>): DroidSettings => ({
-  enabled: false,
-  binaryPath: "droid",
-  customModels: [],
-  ...overrides,
-});
+const makeDroidConfig = (overrides: Partial<DroidSettings>) =>
+  ({
+    enabled: false,
+    binaryPath: "droid",
+    customModels: [],
+    ...overrides,
+  }) satisfies DroidSettings;
 
 describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
   // `ServerConfig.layerTest` needs `FileSystem` to materialize its scratch

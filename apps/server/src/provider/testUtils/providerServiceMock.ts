@@ -2,12 +2,14 @@ import { ProviderDriverKind, type ProviderInstanceId } from "@t3tools/contracts"
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 
+import { defaultProviderContinuationIdentity } from "../ProviderDriver.ts";
 import type { ProviderServiceShape } from "../Services/ProviderService.ts";
 
 export const unsupportedProviderTestCall = <A>() =>
   Effect.die(new Error("Unsupported provider call in test")) as Effect.Effect<A, never>;
 
 export function makeProviderServiceMock(
+  driverKind: ProviderDriverKind,
   overrides: Partial<ProviderServiceShape> = {},
 ): ProviderServiceShape {
   return {
@@ -25,19 +27,14 @@ export function makeProviderServiceMock(
         sessionModelSwitch: "in-session",
         conversationRollback: "unsupported",
       }),
-    getInstanceInfo: (instanceId: ProviderInstanceId) => {
-      const driverKind = ProviderDriverKind.make(String(instanceId));
-      return Effect.succeed({
+    getInstanceInfo: (instanceId: ProviderInstanceId) =>
+      Effect.succeed({
         instanceId,
         driverKind,
         displayName: undefined,
         enabled: true,
-        continuationIdentity: {
-          driverKind,
-          continuationKey: `${driverKind}:instance:${instanceId}`,
-        },
-      });
-    },
+        continuationIdentity: defaultProviderContinuationIdentity({ driverKind, instanceId }),
+      }),
     rollbackConversation: () => unsupportedProviderTestCall(),
     uploadFeedback: () => unsupportedProviderTestCall(),
     streamEvents: Stream.empty,

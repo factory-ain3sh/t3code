@@ -213,17 +213,18 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       binding.sessionLease !== null &&
       existingRuntime !== undefined &&
       existingRuntime.sessionLease !== binding.sessionLease;
+    const resolvedSessionLease =
+      binding.sessionLease !== undefined
+        ? binding.sessionLease
+        : ownerChanged
+          ? null
+          : (existingRuntime?.sessionLease ?? null);
     yield* repository
       .upsert({
         threadId: resolvedThreadId,
         providerName: binding.provider,
         providerInstanceId,
-        sessionLease:
-          binding.sessionLease !== undefined
-            ? binding.sessionLease
-            : ownerChanged
-              ? null
-              : (existingRuntime?.sessionLease ?? null),
+        sessionLease: resolvedSessionLease,
         adapterKey:
           binding.adapterKey ??
           (providerChanged ? binding.provider : (existingRuntime?.adapterKey ?? binding.provider)),
@@ -248,12 +249,7 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
     return {
       providerInstanceId,
-      sessionLease:
-        binding.sessionLease !== undefined
-          ? binding.sessionLease
-          : ownerChanged
-            ? null
-            : (existingRuntime?.sessionLease ?? null),
+      sessionLease: resolvedSessionLease,
     } satisfies ProviderSessionOwnership;
   });
 

@@ -1042,9 +1042,6 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 ) {
                   return;
                 }
-                for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
-                  yield* Effect.yieldNow;
-                }
                 yield* prepared.acp.drainEvents;
                 if (ctx.interruptedTurnIds.has(prepared.turnId)) {
                   return;

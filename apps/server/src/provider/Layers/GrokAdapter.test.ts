@@ -261,7 +261,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-short-dispatch");
       const wrapperPath = yield* Effect.promise(() =>
-        makeMockGrokWrapper({ T3_ACP_PROMPT_DELAY_MS: "1500" }),
+        makeMockGrokWrapper({ T3_ACP_PROMPT_DELAY_MS: "500" }),
       );
       const adapter = yield* makeTestAdapter(wrapperPath);
       const runtimeEvents: ProviderRuntimeEvent[] = [];
@@ -294,7 +294,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.equal(turn.threadId, threadId);
       assert.isTrue(runtimeEvents.every((event) => event.sessionLease === session.sessionLease));
 
-      yield* Deferred.await(turnCompleted);
+      yield* Deferred.await(turnCompleted).pipe(Effect.timeout("2 seconds"));
       const terminal = runtimeEvents.find(
         (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
       );
@@ -302,7 +302,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("queues the Grok prompt before an immediate interrupt", () =>

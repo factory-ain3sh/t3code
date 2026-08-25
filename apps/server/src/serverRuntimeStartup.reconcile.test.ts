@@ -45,7 +45,7 @@ const makeThread = (
 });
 
 const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
-  makeProviderServiceMock({
+  makeProviderServiceMock(ProviderDriverKind.make("codex"), {
     listSessions: () => Effect.succeed(liveThreadIds.map((threadId) => ({ threadId }) as never)),
   });
 

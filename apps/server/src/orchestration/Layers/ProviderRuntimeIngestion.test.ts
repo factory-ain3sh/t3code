@@ -78,7 +78,7 @@ function createProviderServiceHarness() {
   const runtimeSessions: ProviderSession[] = [];
   const sessionLease = ProviderSessionLease.make("lease-provider-runtime-ingestion");
 
-  const service: ProviderServiceShape = makeProviderServiceMock({
+  const service: ProviderServiceShape = makeProviderServiceMock(ProviderDriverKind.make("codex"), {
     listSessions: () => Effect.succeed([...runtimeSessions]),
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);

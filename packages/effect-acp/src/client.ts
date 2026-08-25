@@ -31,6 +31,7 @@ export interface AcpClientOptions {
 
 type AcpClientRaw = {
   readonly notifications: Stream.Stream<AcpProtocol.AcpIncomingNotification>;
+  readonly drainIncoming: Effect.Effect<void>;
   readonly request: (method: string, payload: unknown) => Effect.Effect<unknown, AcpError.AcpError>;
   readonly notify: (method: string, payload: unknown) => Effect.Effect<void, AcpError.AcpError>;
 };
@@ -459,6 +460,7 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
   return AcpClient.of({
     raw: {
       notifications: transport.incoming,
+      drainIncoming: transport.drainIncoming,
       request: transport.request,
       notify: transport.notify,
     },

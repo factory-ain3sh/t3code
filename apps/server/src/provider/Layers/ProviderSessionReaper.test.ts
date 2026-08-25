@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ProjectId,
+  ProviderDriverKind,
   ThreadId,
   TurnId,
   ProviderInstanceId,
@@ -187,7 +188,12 @@ describe("ProviderSessionReaper", () => {
     }).pipe(
       Layer.provideMerge(directoryLayer),
       Layer.provideMerge(runtimeRepositoryLayer),
-      Layer.provideMerge(Layer.succeed(ProviderService, makeProviderServiceMock({ stopSession }))),
+      Layer.provideMerge(
+        Layer.succeed(
+          ProviderService,
+          makeProviderServiceMock(ProviderDriverKind.make("codex"), { stopSession }),
+        ),
+      ),
       Layer.provideMerge(snapshotQuery),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(
@@ -307,26 +313,29 @@ describe("ProviderSessionReaper", () => {
       name: "an active turn",
       thread: { status: "running" as const, activeTurnId: TurnId.make("turn-reaper-active") },
       row: {},
+      fresh: false,
     },
     {
       name: "live background work",
       thread: { backgroundLiveness: "working" as const },
       row: {},
+      fresh: false,
     },
     {
       name: "the inactivity threshold",
       thread: {},
-      row: { fresh: true },
+      row: {},
+      fresh: true,
     },
     {
       name: "an already-stopped runtime",
       thread: { status: "stopped" as const },
       row: { status: "stopped" as const },
+      fresh: false,
     },
-  ])("skips sessions with $name", async ({ name, thread, row }) => {
+  ])("skips sessions with $name", async ({ name, thread, row, fresh }) => {
     const threadId = ThreadId.make(`thread-reaper-skip-${name.replaceAll(" ", "-")}`);
-    const lastSeenAt =
-      "fresh" in row ? DateTime.formatIso(await Effect.runPromise(DateTime.now)) : staleAt;
+    const lastSeenAt = fresh ? DateTime.formatIso(await Effect.runPromise(DateTime.now)) : staleAt;
     const harness = await createHarness({
       readModel: makeReadModel([readModelThread(threadId, { ...thread, updatedAt: lastSeenAt })]),
     });

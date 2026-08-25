@@ -5,6 +5,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as Stdio from "effect/Stdio";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
@@ -62,6 +63,7 @@ export interface AcpPatchedProtocol {
   readonly clientProtocol: RpcClient.Protocol["Service"];
   readonly serverProtocol: RpcServer.Protocol["Service"];
   readonly incoming: Stream.Stream<AcpIncomingNotification>;
+  readonly drainIncoming: Effect.Effect<void>;
   readonly request: (method: string, payload: unknown) => Effect.Effect<unknown, AcpError.AcpError>;
   readonly notify: (method: string, payload: unknown) => Effect.Effect<void, AcpError.AcpError>;
 }
@@ -80,10 +82,12 @@ const parserFactory = RpcSerialization.ndJsonRpc();
 export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(function* (
   options: AcpPatchedProtocolOptions,
 ): Effect.fn.Return<AcpPatchedProtocol, never, Scope.Scope> {
+  const runtimeScope = yield* Scope.Scope;
   const parser = parserFactory.makeUnsafe();
   const serverQueue = yield* Queue.unbounded<RpcMessage.FromClientEncoded>();
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.unbounded<AcpIncomingNotification>();
+  const incomingDispatchSemaphore = yield* Semaphore.make(1);
   const disconnects = yield* Queue.unbounded<number>();
   const outgoing = yield* Queue.unbounded<string | Uint8Array, Cause.Done<void>>();
   const nextRequestId = yield* Ref.make(1);
@@ -332,6 +336,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
               ),
             ),
         }),
+        Effect.forkIn(runtimeScope),
         Effect.asVoid,
       );
     }
@@ -408,51 +413,53 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
 
   yield* options.stdio.stdin.pipe(
     Stream.runForEach((data) =>
-      logProtocol({
-        direction: "incoming",
-        stage: "raw",
-        payload: typeof data === "string" ? data : new TextDecoder().decode(data),
-      }).pipe(
-        Effect.flatMap(() =>
-          Effect.try({
-            try: () =>
-              parser.decode(data) as ReadonlyArray<
-                RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
-              >,
-            catch: (cause) =>
-              new AcpError.AcpProtocolParseError({
-                operation: "decode-wire-message",
-                cause,
-              }),
-          }),
-        ),
-        Effect.tap((messages) =>
-          logProtocol({
-            direction: "incoming",
-            stage: "decoded",
-            payload: messages,
-          }),
-        ),
-        Effect.tapErrorTag("AcpProtocolParseError", (error) =>
-          logProtocol({
-            direction: "incoming",
-            stage: "decode_failed",
-            payload: {
-              operation: error.operation,
-              ...(error.method === undefined ? {} : { method: error.method }),
-              ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
-              ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
-              ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
-              ...(error.maximumPathDepth === undefined
-                ? {}
-                : { maximumPathDepth: error.maximumPathDepth }),
-            },
-          }),
-        ),
-        Effect.flatMap((messages) =>
-          Effect.forEach(messages, routeDecodedMessage, {
-            discard: true,
-          }),
+      incomingDispatchSemaphore.withPermit(
+        logProtocol({
+          direction: "incoming",
+          stage: "raw",
+          payload: typeof data === "string" ? data : new TextDecoder().decode(data),
+        }).pipe(
+          Effect.flatMap(() =>
+            Effect.try({
+              try: () =>
+                parser.decode(data) as ReadonlyArray<
+                  RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded
+                >,
+              catch: (cause) =>
+                new AcpError.AcpProtocolParseError({
+                  operation: "decode-wire-message",
+                  cause,
+                }),
+            }),
+          ),
+          Effect.tap((messages) =>
+            logProtocol({
+              direction: "incoming",
+              stage: "decoded",
+              payload: messages,
+            }),
+          ),
+          Effect.tapErrorTag("AcpProtocolParseError", (error) =>
+            logProtocol({
+              direction: "incoming",
+              stage: "decode_failed",
+              payload: {
+                operation: error.operation,
+                ...(error.method === undefined ? {} : { method: error.method }),
+                ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+                ...(error.issueCount === undefined ? {} : { issueCount: error.issueCount }),
+                ...(error.issueKinds === undefined ? {} : { issueKinds: error.issueKinds }),
+                ...(error.maximumPathDepth === undefined
+                  ? {}
+                  : { maximumPathDepth: error.maximumPathDepth }),
+              },
+            }),
+          ),
+          Effect.flatMap((messages) =>
+            Effect.forEach(messages, routeDecodedMessage, {
+              discard: true,
+            }),
+          ),
         ),
       ),
     ),
@@ -555,6 +562,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     get incoming() {
       return Stream.fromQueue(notificationQueue);
     },
+    drainIncoming: incomingDispatchSemaphore.withPermit(Effect.void),
     request: sendRequest,
     notify: sendNotification,
   } satisfies AcpPatchedProtocol;
