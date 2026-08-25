@@ -64,6 +64,7 @@ export interface DroidRpcClient {
   readonly request: DroidRpcProtocol["request"];
   readonly notifications: Stream.Stream<DroidNotificationEnvelope>;
   readonly serverRequests: Stream.Stream<DroidServerRequest>;
+  readonly latestServerRequestSequence: Effect.Effect<number>;
   readonly exits: Effect.Effect<DroidProcessExit>;
   readonly shutdown: Effect.Effect<void>;
 }
@@ -278,6 +279,7 @@ export const makeDroidRpcClient = (
       request: protocol.request,
       notifications: protocol.notifications,
       serverRequests: protocol.serverRequests,
+      latestServerRequestSequence: protocol.latestServerRequestSequence,
       exits,
       shutdown,
     } satisfies DroidRpcClient;

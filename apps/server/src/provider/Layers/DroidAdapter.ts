@@ -176,6 +176,8 @@ interface DroidSessionContext {
   pendingInterrupt: DroidPendingInterrupt | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
+  /** Highest native server-request sequence that predates the active turn. */
+  serverRequestSequenceFloor: number;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
   /** Turns already interrupted; late completions must not resurrect them. */
   readonly interruptedTurnIds: Set<TurnId>;
@@ -1295,6 +1297,19 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       return true;
     };
 
+    const activeTurnForServerRequest = (
+      ctx: DroidSessionContext,
+      request: DroidServerRequest,
+    ): TurnId | undefined => {
+      const activeTurnId = ctx.session.activeTurnId;
+      return ctx.stopped ||
+        activeTurnId === undefined ||
+        request.sequence <= ctx.serverRequestSequenceFloor ||
+        !acceptsSessionEnvelope(ctx, request.sessionId)
+        ? undefined
+        : activeTurnId;
+    };
+
     const handlePermissionRequest = (
       ctx: DroidSessionContext,
       request: Extract<DroidServerRequest, { method: "droid.request_permission" }>,
@@ -1319,12 +1334,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             const turnId = yield* withThreadLock(
               ctx.threadId,
               Effect.gen(function* () {
-                const activeTurnId = ctx.session.activeTurnId;
-                if (
-                  ctx.stopped ||
-                  activeTurnId === undefined ||
-                  !acceptsSessionEnvelope(ctx, request.sessionId)
-                ) {
+                const activeTurnId = activeTurnForServerRequest(ctx, request);
+                if (activeTurnId === undefined) {
                   yield* request.fail(-32800, "Droid permission request is no longer active.");
                   return;
                 }
@@ -1460,12 +1471,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             const turnId = yield* withThreadLock(
               ctx.threadId,
               Effect.gen(function* () {
-                const activeTurnId = ctx.session.activeTurnId;
-                if (
-                  ctx.stopped ||
-                  activeTurnId === undefined ||
-                  !acceptsSessionEnvelope(ctx, request.sessionId)
-                ) {
+                const activeTurnId = activeTurnForServerRequest(ctx, request);
+                if (activeTurnId === undefined) {
                   yield* request.fail(-32800, "Droid user-input request is no longer active.");
                   return;
                 }
@@ -1860,6 +1867,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             updatedAt: now,
           };
 
+          const serverRequestSequenceFloor = yield* rpc.latestServerRequestSequence;
           const ctx: DroidSessionContext = {
             threadId: input.threadId,
             droidSessionId,
@@ -1869,6 +1877,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             pendingInterrupt: undefined,
             pendingApprovals: new Map(),
             pendingUserInputs: new Map(),
+            serverRequestSequenceFloor,
             turns: (resumeCursor?.turnIds ?? []).map((id) => ({ id, items: [] })),
             interruptedTurnIds: new Set(),
             pendingTurnMessageIds: new Set(),
@@ -2123,6 +2132,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           const steeringTurnId =
             ctx.pendingTurnMessageIds.size > 0 ? ctx.session.activeTurnId : undefined;
           const turnId = steeringTurnId ?? TurnId.make(messageId);
+          if (steeringTurnId === undefined) {
+            ctx.serverRequestSequenceFloor = yield* ctx.rpc.latestServerRequestSequence;
+          }
           ctx.pendingTurnMessageIds.add(messageId);
           ctx.physicalRuns.set(messageId, {
             logicalTurnId: turnId,

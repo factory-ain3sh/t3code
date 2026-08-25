@@ -35,7 +35,11 @@ import {
   selectDroidPermissionOutcome,
   settleDroidNativeServerResponse,
 } from "./DroidAdapter.ts";
-import { DROID_SESSION_REQUEST_TIMEOUT_MS, DroidRpcError } from "../droid/DroidRpcClient.ts";
+import {
+  DROID_SERVER_REQUEST_CONCURRENCY,
+  DROID_SESSION_REQUEST_TIMEOUT_MS,
+  DroidRpcError,
+} from "../droid/DroidRpcClient.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -959,6 +963,69 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       yield* Effect.promise(() =>
         NodeFSP.writeFile(NodePath.join(coordinationDir, "release-native-responses"), ""),
       );
+      yield* adapter.stopSession(threadId);
+      yield* waitForType(threadId, "session.exited");
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
+  );
+
+  it.effect("rejects a queued sessionless request from the previous turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-sessionless-request-turn-boundary");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-sessionless-request-boundary-")),
+      );
+      const floodReadyFile = NodePath.join(coordinationDir, "flood-ready");
+      const staleRejectedFile = NodePath.join(coordinationDir, "stale-request-rejected");
+      const firstQueuedRequestIndex = DROID_SERVER_REQUEST_CONCURRENCY;
+      const floodCount = firstQueuedRequestIndex + 1;
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "permission-flood-turn-boundary",
+        T3_DROID_MOCK_PERMISSION_FLOOD_COUNT: String(floodCount),
+        T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE: floodReadyFile,
+        T3_DROID_MOCK_PERMISSION_FLOOD_PROBE_INDEX: String(firstQueuedRequestIndex),
+        T3_DROID_MOCK_COORDINATION_DIR: coordinationDir,
+      });
+      const { events, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      const firstTurn = yield* sendDroidTurn(adapter, threadId, "queue old permission requests");
+      yield* Effect.promise(() => waitForFile(floodReadyFile));
+      const lastOpenedOnFirstTurn = yield* waitForType(
+        threadId,
+        "request.opened",
+        DROID_SERVER_REQUEST_CONCURRENCY,
+      );
+      assert.equal(String(lastOpenedOnFirstTurn.turnId), String(firstTurn.turnId));
+      const firstTerminal = yield* waitForType(threadId, "turn.completed");
+      assert.equal(String(firstTerminal.turnId), String(firstTurn.turnId));
+
+      const replacementTurn = yield* sendDroidTurn(adapter, threadId, "start a replacement turn");
+      const firstOpened = eventsOfType(
+        eventsForTurn(events, threadId, firstTurn.turnId),
+        "request.opened",
+      )[0];
+      assert.isDefined(firstOpened);
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(firstOpened.requestId)),
+        "accept",
+      );
+
+      const staleOutcome = yield* Effect.race(
+        Effect.promise(() => waitForFile(staleRejectedFile)).pipe(Effect.as("rejected" as const)),
+        waitForType(threadId, "request.opened", floodCount).pipe(
+          Effect.map((event) =>
+            String(event.turnId) === String(replacementTurn.turnId)
+              ? ("opened-on-replacement" as const)
+              : ("opened-elsewhere" as const),
+          ),
+        ),
+      );
+      assert.equal(staleOutcome, "rejected");
+      assert.isEmpty(
+        eventsOfType(eventsForTurn(events, threadId, replacementTurn.turnId), "request.opened"),
+      );
+
       yield* adapter.stopSession(threadId);
       yield* waitForType(threadId, "session.exited");
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));

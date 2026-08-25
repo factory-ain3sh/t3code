@@ -7,7 +7,7 @@ import * as NodeReadline from "node:readline";
 import * as NodeTimersPromises from "node:timers/promises";
 
 const scenarioNames = new Set(
-  `default rpc-roundtrip permission permission-empty-options permission-unknown-options permission-accept-only park-hitl permission-flood permission-flood-retirement ask-user hang-turn hang-first-turn late-terminal interrupt-late-terminal-order usage-reset
+  `default rpc-roundtrip permission permission-empty-options permission-unknown-options permission-accept-only park-hitl permission-flood permission-flood-retirement permission-flood-turn-boundary ask-user hang-turn hang-first-turn late-terminal interrupt-late-terminal-order usage-reset
   exit-hitl interrupt-race fail-init fail-update-settings hang-update-settings fail-add-user-message fail-interrupt load-spec-mode-report steering-coalesced steering-separate exit-mid-turn unknown-notification omit-usage start-race spec-autonomy-handoff
   spec-handoff spec-successor-permission late-spec-approval foreign-spec-envelope future-terminal-reason compaction child-session hanging-child-session
   child-session-exit taskless-progress report-selected-model incomplete-items shared-tool-isolation`.split(
@@ -22,6 +22,7 @@ if (!scenarioNames.has(currentScenario)) {
 const env = {
   permissionResponseFile: process.env.T3_DROID_MOCK_PERMISSION_RESPONSE_FILE,
   permissionFloodReadyFile: process.env.T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE,
+  permissionFloodProbeIndex: process.env.T3_DROID_MOCK_PERMISSION_FLOOD_PROBE_INDEX,
   startRaceDir: process.env.T3_DROID_MOCK_START_RACE_DIR,
   interruptOrderDir: process.env.T3_DROID_MOCK_INTERRUPT_ORDER_DIR,
   settingsLogPath: process.env.T3_DROID_MOCK_SETTINGS_LOG,
@@ -37,7 +38,9 @@ const permissionModes: Record<string, "default" | "empty" | "unknown" | "accept-
   "park-hitl": "default",
 };
 const permissionFloodCount =
-  currentScenario === "permission-flood" || currentScenario === "permission-flood-retirement"
+  currentScenario === "permission-flood" ||
+  currentScenario === "permission-flood-retirement" ||
+  currentScenario === "permission-flood-turn-boundary"
     ? Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "24")
     : 0;
 
@@ -525,7 +528,10 @@ async function runPermissionFlow(turnId: string): Promise<boolean> {
       return true;
     }
   }
-  if (permissionFloodCount > 0) {
+  if (
+    permissionFloodCount > 0 &&
+    (currentScenario !== "permission-flood-turn-boundary" || turnSequence === 1)
+  ) {
     const requests: Array<Promise<unknown>> = [];
     for (let index = 0; index < permissionFloodCount; index += 1) {
       requests.push(
@@ -540,6 +546,21 @@ async function runPermissionFlow(turnId: string): Promise<boolean> {
       await NodeTimersPromises.setTimeout(5);
     }
     if (env.permissionFloodReadyFile) NodeFS.writeFileSync(env.permissionFloodReadyFile, "");
+    if (currentScenario === "permission-flood-turn-boundary") {
+      if (!env.coordinationDir) {
+        throw new Error("permission-flood-turn-boundary requires T3_DROID_MOCK_COORDINATION_DIR");
+      }
+      const probeIndex = Number(env.permissionFloodProbeIndex);
+      for (const [index, request] of requests.entries()) {
+        void request.catch(() =>
+          index === probeIndex
+            ? NodeFSP.writeFile(NodePath.join(env.coordinationDir!, "stale-request-rejected"), "")
+            : undefined,
+        );
+      }
+      emitTurnCompleted("completed", turnId);
+      return true;
+    }
     if (currentScenario === "permission-flood-retirement") {
       if (!env.coordinationDir) {
         throw new Error("permission-flood-retirement requires T3_DROID_MOCK_COORDINATION_DIR");
@@ -667,6 +688,7 @@ async function runTurn(turnId: string): Promise<void> {
   textComplete(`assistant-${turnId}`);
   if (
     currentScenario === "hang-turn" ||
+    (currentScenario === "permission-flood-turn-boundary" && turnSequence === 2) ||
     currentScenario === "interrupt-race" ||
     currentScenario === "fail-interrupt" ||
     (currentScenario === "interrupt-late-terminal-order" && turnSequence <= 2) ||

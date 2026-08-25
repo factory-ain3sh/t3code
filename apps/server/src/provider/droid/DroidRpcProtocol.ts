@@ -103,6 +103,7 @@ export class DroidRpcError extends Schema.TaggedErrorClass<DroidRpcError>()("Dro
 interface DroidServerRequestBase {
   readonly id: string;
   readonly sessionId: string | undefined;
+  readonly sequence: number;
   readonly respond: (result: unknown) => Effect.Effect<void, DroidRpcError>;
   readonly fail: (code: number, message: string) => Effect.Effect<void, DroidRpcError>;
 }
@@ -133,6 +134,7 @@ export interface DroidRpcProtocol {
   ) => Effect.Effect<unknown, DroidRpcError>;
   readonly notifications: Stream.Stream<DroidNotificationEnvelope>;
   readonly serverRequests: Stream.Stream<DroidServerRequest>;
+  readonly latestServerRequestSequence: Effect.Effect<number>;
   readonly outgoing: Stream.Stream<string>;
   readonly acceptChunk: (chunk: string) => Effect.Effect<void, DroidRpcError>;
   readonly endInput: Effect.Effect<void, DroidRpcError>;
@@ -403,6 +405,7 @@ export const makeDroidRpcProtocol = (
       bytes: 0,
     });
     const nextRequestId = yield* Ref.make(0);
+    const nextServerRequestSequence = yield* Ref.make(0);
     const droppedLossyNotificationCount = yield* Ref.make(0);
 
     const writeEnvelope = (
@@ -469,7 +472,12 @@ export const makeDroidRpcProtocol = (
           : { error: { code: result.code, message: result.message } }),
       });
 
-    const makeServerRequestBase = (id: string, method: string, sessionId: string | undefined) =>
+    const makeServerRequestBase = (
+      id: string,
+      method: string,
+      sessionId: string | undefined,
+      sequence: number,
+    ) =>
       Effect.gen(function* () {
         const answered = yield* SynchronizedRef.make(false);
         const answerOnce = (
@@ -491,6 +499,7 @@ export const makeDroidRpcProtocol = (
         return {
           id,
           sessionId,
+          sequence,
           respond: (result: unknown) => answerOnce({ _tag: "Success", value: result }),
           fail: (code: number, message: string) => answerOnce({ _tag: "Failure", code, message }),
         };
@@ -574,6 +583,10 @@ export const makeDroidRpcProtocol = (
       encodedBytes: number,
     ): Effect.Effect<void, DroidRpcError> =>
       Effect.gen(function* () {
+        const sequence = yield* Ref.updateAndGet(
+          nextServerRequestSequence,
+          (current) => current + 1,
+        );
         const sessionId =
           Predicate.isObject(message.params) && typeof message.params.sessionId === "string"
             ? message.params.sessionId
@@ -591,7 +604,12 @@ export const makeDroidRpcProtocol = (
             }).pipe(Effect.ignore);
             return;
           }
-          const requestBase = yield* makeServerRequestBase(message.id, message.method, sessionId);
+          const requestBase = yield* makeServerRequestBase(
+            message.id,
+            message.method,
+            sessionId,
+            sequence,
+          );
           yield* offerLossless(
             "server-requests",
             serverRequests,
@@ -622,7 +640,12 @@ export const makeDroidRpcProtocol = (
             }).pipe(Effect.ignore);
             return;
           }
-          const requestBase = yield* makeServerRequestBase(message.id, message.method, sessionId);
+          const requestBase = yield* makeServerRequestBase(
+            message.id,
+            message.method,
+            sessionId,
+            sequence,
+          );
           yield* offerLossless(
             "server-requests",
             serverRequests,
@@ -930,6 +953,7 @@ export const makeDroidRpcProtocol = (
       request,
       notifications: deliveryStream(notifications, notificationBacklogBytes),
       serverRequests: deliveryStream(serverRequests, serverRequestBacklogBytes),
+      latestServerRequestSequence: Ref.get(nextServerRequestSequence),
       outgoing: Stream.fromQueue(outgoing).pipe(
         Stream.filterMapEffect((frame): Effect.Effect<Result.Result<string, void>> => {
           if (frame._tag === "Uncorrelated") return Effect.succeed(Result.succeed(frame.encoded));
