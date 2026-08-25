@@ -108,6 +108,13 @@ function createProviderServiceHarness(
       readonly anchorTurnId?: TurnId;
     }) =>
       Effect.gen(function* () {
+        // Faithful to the real ProviderService, which rejects an empty target
+        // without an anchor before session routing.
+        if (input.turnIds.length === 0 && input.anchorTurnId === undefined) {
+          return yield* Effect.die(
+            new Error("Rollback target must include at least one turn ID or an anchor turn ID."),
+          );
+        }
         if (onRollbackConversation) {
           yield* onRollbackConversation(input);
         }
@@ -1831,6 +1838,48 @@ describe("CheckpointReactor", () => {
       turnIds: [],
       anchorTurnId: asTurnId("turn-1"),
     });
+  });
+
+  it("completes a turn-zero revert on a thread with no checkpoints without a provider rollback", async () => {
+    const harness = await createHarness();
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-set-empty-revert"),
+      threadId: ThreadId.make("thread-1"),
+      session: {
+        threadId: ThreadId.make("thread-1"),
+        status: "ready",
+        providerName: "codex",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: createdAt,
+      },
+      createdAt,
+    });
+
+    await harness.dispatch({
+      type: "thread.checkpoint.revert",
+      commandId: CommandId.make("cmd-revert-empty-target"),
+      threadId: ThreadId.make("thread-1"),
+      turnCount: 0,
+      createdAt,
+    });
+
+    await waitForEvent(harness.engine, (event) => event.type === "thread.reverted");
+    await harness.drain();
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    // The provider recorded no turns, so the intent carries an empty target
+    // that must never reach ProviderService (which rejects it) and the revert
+    // completes as a pure tree restore.
+    expect(harness.provider.rollbackConversation).not.toHaveBeenCalled();
+    expect(
+      thread?.activities.some((activity) => activity.kind === "checkpoint.revert.failed"),
+    ).toBe(false);
   });
 
   it("appends an error activity when revert is requested without an active session", async () => {

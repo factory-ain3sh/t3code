@@ -42,6 +42,8 @@ import * as ServerRuntimeStartup from "../src/serverRuntimeStartup.ts";
 import * as ServerSettings from "../src/serverSettings.ts";
 import * as AnalyticsService from "../src/telemetry/AnalyticsService.ts";
 
+const startupSequence: Array<string> = [];
+
 const providerInstanceId = ProviderInstanceId.make("codex");
 const projectId = ProjectId.make("project-startup-orphan");
 const threadId = ThreadId.make("thread-startup-orphan");
@@ -75,7 +77,10 @@ const startupDependencies = Layer.mergeAll(
   }),
   Layer.succeed(CheckpointReactor.CheckpointReactor, {
     start: () => Effect.void,
-    recoverPersistedIntents: () => Effect.void,
+    recoverPersistedIntents: () =>
+      Effect.sync(() => {
+        startupSequence.push("checkpoints.recover");
+      }),
     drain: Effect.void,
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
@@ -258,10 +263,11 @@ it.effect(
       }).pipe(Effect.provide(firstRuntime));
 
       const secondRuntime = makePersistedRuntimeLayer(config.dbPath);
-      const startupLayer = ServerRuntimeStartup.layer.pipe(
-        Layer.provideMerge(secondRuntime),
-        Layer.provideMerge(startupDependencies),
-      );
+      const startupLayer = ServerRuntimeStartup.layerWithOptions({
+        activate: Effect.sync(() => {
+          startupSequence.push("activate");
+        }),
+      }).pipe(Layer.provideMerge(secondRuntime), Layer.provideMerge(startupDependencies));
 
       const result = yield* Effect.gen(function* () {
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
@@ -335,6 +341,7 @@ it.effect(
           stoppedBindingStatus: stoppedBinding.status,
           stoppedBindingResumeCursor: stoppedBinding.resumeCursor,
           stoppedBindingRuntimePayload: stoppedBinding.runtimePayload,
+          startupSequence: [...startupSequence],
         };
       }).pipe(Effect.provide(startupLayer));
 
@@ -356,6 +363,11 @@ it.effect(
           activeTurnId: null,
           unrelated: "also-preserve-me",
         },
+        // Recovery must run after activation, so the provider-runtime events
+        // its replay emits reach ingestion subscriptions that fork parked at
+        // the activation boundary instead of vanishing into an unsubscribed
+        // PubSub.
+        startupSequence: ["activate", "checkpoints.recover"],
       });
     }).pipe(
       Effect.provide(

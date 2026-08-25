@@ -444,11 +444,6 @@ export const make = (options?: StartupOptions) =>
 
       yield* runStartupPhase("provider-sessions.reconcile", reconcileProviderSessions);
 
-      // Sequenced after reconciliation on purpose: the replay recovers
-      // sessions and mints fresh leases, which the orphan sweep would stomp
-      // with its stale liveness snapshot if the two ran concurrently.
-      yield* runStartupPhase("checkpoints.recover", checkpointReactor.recoverPersistedIntents());
-
       const welcomeBase = yield* resolveWelcomeBase;
       const environment = yield* serverEnvironment.getDescriptor;
       yield* Effect.logDebug("startup phase: preparing welcome payload");
@@ -537,6 +532,13 @@ export const make = (options?: StartupOptions) =>
         }),
       );
       yield* options?.activate ?? Effect.void;
+
+      // Sequenced after provider-sessions.reconcile so the replay's fresh
+      // leases cannot be stomped by the orphan sweep's stale liveness
+      // snapshot, and after activation so the provider-runtime events the
+      // replay emits reach ingestion subscriptions instead of publishing into
+      // a PubSub whose subscribers are still parked.
+      yield* runStartupPhase("checkpoints.recover", checkpointReactor.recoverPersistedIntents());
 
       yield* Effect.logDebug("Accepting commands");
       yield* commandGate.signalCommandReady;

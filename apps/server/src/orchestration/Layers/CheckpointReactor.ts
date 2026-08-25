@@ -858,9 +858,13 @@ const make = Effect.gen(function* () {
     // A null lease is a stopped, unowned session: runStopAll nulls every
     // binding lease on graceful shutdown while the merged runtime payload
     // keeps this intent, and locked recovery re-owns the session below. Only
-    // a different live lease means the session was replaced.
+    // a different live lease means the session was replaced. The driver kind
+    // is compared too: an instance rebound to a different driver between
+    // persist and replay must not execute an intent minted against the old
+    // provider's turn history.
     if (
-      binding?.providerInstanceId !== intent.providerInstanceId ||
+      binding?.provider !== intent.provider ||
+      binding.providerInstanceId !== intent.providerInstanceId ||
       (binding.sessionLease !== null && binding.sessionLease !== intent.sessionLease)
     ) {
       yield* clearUnexecutableRevertIntent(
@@ -917,36 +921,44 @@ const make = Effect.gen(function* () {
 
     // Roll back the provider conversation before touching the working tree. A
     // failure here is pre-destructive: nothing has moved, so the intent clears
-    // terminally instead of arming an eternal startup replay.
-    const rollback = yield* providerService
-      .rollbackConversation({
-        threadId: intent.threadId,
-        turnIds: intent.turnIds,
-        ...(intent.anchorTurnId !== undefined ? { anchorTurnId: intent.anchorTurnId } : {}),
-      })
-      .pipe(
-        Effect.map(Option.some),
-        Effect.catchCause((cause) => {
-          if (Cause.hasInterruptsOnly(cause)) {
-            return Effect.failCause(cause);
-          }
-          return Effect.gen(function* () {
-            yield* clearCheckpointRevertIntent(intent).pipe(Effect.orElseSucceed(() => false));
-            yield* appendRevertFailureActivity({
+    // terminally instead of arming an eternal startup replay. A turn-zero
+    // revert on a thread with no checkpoints is the exception: it retains no
+    // turns and anchors on none, an empty target ProviderService rejects, so
+    // there is no conversation to rewind and the restore proceeds directly.
+    const rollback: Option.Option<{ readonly resumeCursor?: unknown }> =
+      intent.turnIds.length === 0 && intent.anchorTurnId === undefined
+        ? Option.some({ resumeCursor: undefined })
+        : yield* providerService
+            .rollbackConversation({
               threadId: intent.threadId,
-              turnCount: intent.turnCount,
-              detail: Cause.pretty(cause).slice(0, 2000),
-              createdAt: intent.createdAt,
-            }).pipe(Effect.catch(() => Effect.void));
-            yield* Effect.logWarning("Checkpoint revert failed; the intent was cleared.", {
-              threadId: intent.threadId,
-              turnCount: intent.turnCount,
-              cause: Cause.pretty(cause),
-            });
-            return Option.none();
-          });
-        }),
-      );
+              turnIds: intent.turnIds,
+              ...(intent.anchorTurnId !== undefined ? { anchorTurnId: intent.anchorTurnId } : {}),
+            })
+            .pipe(
+              Effect.map(Option.some),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) {
+                  return Effect.failCause(cause);
+                }
+                return Effect.gen(function* () {
+                  yield* clearCheckpointRevertIntent(intent).pipe(
+                    Effect.orElseSucceed(() => false),
+                  );
+                  yield* appendRevertFailureActivity({
+                    threadId: intent.threadId,
+                    turnCount: intent.turnCount,
+                    detail: Cause.pretty(cause).slice(0, 2000),
+                    createdAt: intent.createdAt,
+                  }).pipe(Effect.catch(() => Effect.void));
+                  yield* Effect.logWarning("Checkpoint revert failed; the intent was cleared.", {
+                    threadId: intent.threadId,
+                    turnCount: intent.turnCount,
+                    cause: Cause.pretty(cause),
+                  });
+                  return Option.none();
+                });
+              }),
+            );
     if (Option.isNone(rollback)) {
       return;
     }
