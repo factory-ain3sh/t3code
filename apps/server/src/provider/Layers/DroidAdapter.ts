@@ -168,7 +168,10 @@ interface DroidSessionContext {
   /** Tool names keyed by provider tool-use id within this Droid session. */
   readonly toolUseNames: Map<string, string>;
   /** Droid child (subagent) session ids mapped onto t3 task lifecycles. */
-  readonly childSessions: Map<string, { readonly description: string }>;
+  readonly childSessions: Map<
+    string,
+    { readonly description: string; readonly toolUseId?: string }
+  >;
   /**
    * Implementation session minted by a spec handoff. It streams into the same
    * t3 turn before the spec session's terminal notification arrives, and is
@@ -201,6 +204,28 @@ export function droidAutonomyLevelForRuntimeMode(
       return "medium";
     case "full-access":
       return "high";
+  }
+}
+
+/**
+ * Exit-spec-mode approval outcome that carries the thread's runtime mode into
+ * the implementation. Droid derives post-handoff autonomy from the selected
+ * outcome (`proceed_auto_run_*` raises it, `proceed_once` keeps normal
+ * prompting), not from session settings, so a full-access thread must answer
+ * with the high-autonomy variant or every implementation edit prompts.
+ */
+export function droidExitSpecModeOutcomeForRuntimeMode(
+  runtimeMode: ProviderSession["runtimeMode"],
+): string | undefined {
+  switch (runtimeMode) {
+    case "approval-required":
+      return undefined;
+    case "auto-accept-edits":
+      return "proceed_auto_run_low";
+    case "auto":
+      return "proceed_auto_run_medium";
+    case "full-access":
+      return "proceed_auto_run_high";
   }
 }
 
@@ -754,11 +779,16 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             live.lastCallTokenUsage,
           );
           // The spec session hands off to the implementation session it
-          // spawned; from here on the successor is the conversation.
-          if (notification.reason === "spec_handoff" && live.specSuccessorSessionId !== undefined) {
-            live.droidSessionId = live.specSuccessorSessionId;
-            live.specSuccessorSessionId = undefined;
-            refreshDroidResumeCursor(live);
+          // spawned; from here on the successor is the conversation, and it
+          // runs in ordinary auto mode (the settings re-assert at approval
+          // already told droid so).
+          if (notification.reason === "spec_handoff") {
+            live.currentInteractionMode = "auto";
+            if (live.specSuccessorSessionId !== undefined) {
+              live.droidSessionId = live.specSuccessorSessionId;
+              live.specSuccessorSessionId = undefined;
+              refreshDroidResumeCursor(live);
+            }
           }
           if (notification.turnId !== undefined) {
             live.pendingTurnMessageIds.delete(notification.turnId);
@@ -801,7 +831,10 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         if (notification.type === "child_session_available") {
           const description =
             notification.description ?? notification.subagentType ?? "Droid subagent";
-          ctx.childSessions.set(notification.childSessionId, { description });
+          ctx.childSessions.set(notification.childSessionId, {
+            description,
+            ...(notification.toolUseId !== undefined ? { toolUseId: notification.toolUseId } : {}),
+          });
           yield* offerRuntimeEvent({
             type: "task.started",
             ...(yield* makeEventStamp()),
@@ -950,6 +983,29 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               },
             });
             ctx.toolUseNames.delete(notification.toolUseId);
+            // Subagents run in daemon-hosted child processes, so their own
+            // turn completion never crosses the parent's stdio (verified live
+            // on droid 0.202.0). The parent's Task tool_result is the closure
+            // signal for the child task it spawned.
+            const settledChild = Array.from(ctx.childSessions).find(
+              ([, child]) => child.toolUseId === notification.toolUseId,
+            );
+            if (settledChild !== undefined) {
+              const [childSessionId, child] = settledChild;
+              ctx.childSessions.delete(childSessionId);
+              yield* offerRuntimeEvent({
+                type: "task.completed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: ctx.threadId,
+                turnId: ctx.session.activeTurnId,
+                payload: {
+                  taskId: RuntimeTaskId.make(childSessionId),
+                  status: notification.isError ? "failed" : "completed",
+                  summary: child.description,
+                },
+              });
+            }
             return;
           }
           case "tool_progress_update": {
@@ -1118,7 +1174,21 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           );
           return;
         }
-        const selectedOutcome = selectDroidPermissionOutcome(params.options, resolved.decision);
+        // Approving an exit_spec_mode prefers the outcome that carries the
+        // thread's runtime mode into the implementation; the generic
+        // first-proceed selection would pick `proceed_once`, which droid
+        // implements with no autonomy regardless of the session's settings.
+        const preferredSpecOutcome =
+          primaryToolUse?.details.type === "exit_spec_mode" && resolved.decision === "accept"
+            ? droidExitSpecModeOutcomeForRuntimeMode(ctx.session.runtimeMode)
+            : undefined;
+        const preferredSpecOption =
+          preferredSpecOutcome === undefined
+            ? undefined
+            : params.options.find((option) => option.outcome.trim() === preferredSpecOutcome);
+        const selectedOutcome =
+          preferredSpecOption?.outcome ??
+          selectDroidPermissionOutcome(params.options, resolved.decision);
         if (selectedOutcome === undefined) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
@@ -1152,6 +1222,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             }),
           ),
         );
+        if (approvedSpecHandoff && !selectedOutcome.trim().startsWith("proceed_new_session")) {
+          // An approved in-session handoff leaves spec mode immediately (the
+          // CLI resets interaction to auto before implementing). New-session
+          // handoffs flip at successor adoption instead, so the
+          // successor-acceptance gate stays keyed on "spec" while the
+          // successor's stream is still arriving.
+          ctx.currentInteractionMode = "auto";
+        }
       });
 
     const handleAskUserRequest = (

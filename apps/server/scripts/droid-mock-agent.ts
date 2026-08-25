@@ -23,6 +23,7 @@ const startRaceDir = process.env.T3_DROID_MOCK_START_RACE_DIR;
 const permissionFloodCount = Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "0");
 const permissionFloodReadyFile = process.env.T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE;
 const interruptOrderDir = process.env.T3_DROID_MOCK_INTERRUPT_ORDER_DIR;
+const settingsLogPath = process.env.T3_DROID_MOCK_SETTINGS_LOG;
 
 if (startRaceDir) {
   NodeFS.writeFileSync(NodePath.join(startRaceDir, `pid-${process.pid}`), String(process.pid));
@@ -48,6 +49,28 @@ let currentSettings = {
   interactionMode: "auto",
   autonomyLevel: "off",
 };
+// Mirrors the CLI: the approved ExitSpecMode OUTCOME decides implementation
+// autonomy (proceed_auto_run_* raises it, proceed_once keeps normal
+// prompting); interaction mode always returns to auto.
+function applyExitSpecModeOutcome(selectedOption: unknown): void {
+  const selected = typeof selectedOption === "string" ? selectedOption : "";
+  const autonomyLevel =
+    selected === "proceed_auto_run_high" || selected === "proceed_new_session_high"
+      ? "high"
+      : selected === "proceed_auto_run_medium" || selected === "proceed_new_session_medium"
+        ? "medium"
+        : selected === "proceed_auto_run_low" || selected === "proceed_new_session_low"
+          ? "low"
+          : "off";
+  currentSettings = { ...currentSettings, autonomyLevel, interactionMode: "auto" };
+  if (settingsLogPath) {
+    NodeFS.appendFileSync(
+      settingsLogPath,
+      `${JSON.stringify({ exitSpecModeSelectedOption: selected, resultingAutonomyLevel: autonomyLevel })}\n`,
+    );
+  }
+}
+
 let activeTurn:
   | {
       readonly turnId: string;
@@ -244,6 +267,60 @@ async function runTurn(params: {
     });
   }
 
+  if (params.text === "mock spec autonomy handoff") {
+    // Mirrors the CLI's real exit_spec_mode option list: the selected outcome,
+    // not any settings update, decides the implementation autonomy.
+    const result = (await requestClient("droid.request_permission", {
+      toolUses: [
+        {
+          toolUse: {
+            type: "tool_use",
+            id: `exit-spec-autonomy-tool-${turnId}`,
+            input: { plan: "Implement the approved plan." },
+            name: "ExitSpecMode",
+          },
+          details: {
+            type: "exit_spec_mode",
+            plan: "Implement the approved plan.",
+            title: "Approved plan",
+          },
+        },
+      ],
+      options: [
+        { label: "Proceed with implementation", value: "proceed_once" },
+        { label: "Proceed, and allow file edits (Low)", value: "proceed_auto_run_low" },
+        {
+          label: "Proceed, and allow reversible commands (Medium)",
+          value: "proceed_auto_run_medium",
+        },
+        { label: "Proceed, and allow all commands (High)", value: "proceed_auto_run_high" },
+        { label: "Proceed in a new session (no autonomy)", value: "proceed_new_session" },
+        { label: "Proceed in a new session (High autonomy)", value: "proceed_new_session_high" },
+        { label: "No, keep iterating on spec", value: "cancel" },
+      ],
+    })) as { selectedOption?: unknown };
+    if (result.selectedOption === "cancel") {
+      emitTurnCompleted("permission_rejected", turnId);
+      return;
+    }
+    applyExitSpecModeOutcome(result.selectedOption);
+    // proceed_once / proceed_auto_run_* implement in the SAME session; only
+    // proceed_new_session* fork a successor.
+    notify({
+      type: "assistant_text_delta",
+      messageId: `assistant-inline-impl-${turnId}`,
+      blockIndex: 0,
+      textDelta: "in-session implementation",
+    });
+    notify({
+      type: "assistant_text_complete",
+      messageId: `assistant-inline-impl-${turnId}`,
+      blockIndex: 0,
+    });
+    emitTurnCompleted("completed", turnId);
+    return;
+  }
+
   if (params.text === "mock spec handoff") {
     const result = (await requestClient("droid.request_permission", {
       toolUses: [
@@ -261,8 +338,10 @@ async function runTurn(params: {
           },
         },
       ],
+      // A successor session only follows the new-session outcomes; the
+      // in-session variants live in "mock spec autonomy handoff".
       options: [
-        { label: "Implement", value: "proceed_once" },
+        { label: "Implement", value: "proceed_new_session_high" },
         { label: "Cancel", value: "cancel" },
       ],
     })) as { selectedOption?: unknown };
@@ -270,6 +349,7 @@ async function runTurn(params: {
       emitTurnCompleted("permission_rejected", turnId);
       return;
     }
+    applyExitSpecModeOutcome(result.selectedOption);
     notifyForSession(specSuccessorSessionId, {
       type: "assistant_text_delta",
       messageId: `assistant-successor-${turnId}`,
@@ -372,6 +452,7 @@ async function runTurn(params: {
     notify({
       type: "child_session_available",
       childSessionId,
+      toolUseId: `child-task-${turnId}`,
       description: "Mock delegated task",
       timestamp: 1,
     });
@@ -391,7 +472,14 @@ async function runTurn(params: {
       blockIndex: 0,
       textDelta: "child-only output",
     });
-    emitTerminalForSession(childSessionId, "completed", `child-${turnId}`);
+    // The real CLI runs subagents in daemon-hosted processes: the child's own
+    // turn completion never crosses the parent's stdio. The parent's Task
+    // tool_result is the closure signal.
+    notify({
+      type: "tool_result",
+      toolUseId: `child-task-${turnId}`,
+      isError: false,
+    });
   }
 
   if (
@@ -882,6 +970,9 @@ async function handleRequest(message: {
       if (failUpdateSettings) {
         fail(message.id, -32603, "Mock settings update failure");
         return;
+      }
+      if (settingsLogPath) {
+        NodeFS.appendFileSync(settingsLogPath, `${JSON.stringify(message.params)}\n`);
       }
       if (typeof message.params === "object" && message.params !== null) {
         currentSettings = { ...currentSettings, ...message.params };

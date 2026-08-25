@@ -322,6 +322,7 @@ const SessionTitleUpdated = Schema.Struct({
 const ChildSessionAvailable = Schema.Struct({
   type: Schema.Literal("child_session_available"),
   childSessionId: Schema.String,
+  toolUseId: Schema.optional(Schema.String),
   subagentType: Schema.optional(Schema.String),
   description: Schema.optional(Schema.String),
 });

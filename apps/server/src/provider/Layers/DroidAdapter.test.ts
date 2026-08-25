@@ -1739,7 +1739,13 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("adopts a spec-handoff successor after streaming it into the plan turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-spec-handoff");
-      const { adapter } = yield* makeDroidScenario();
+      const settingsLogDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-spec-handoff-settings-")),
+      );
+      const settingsLogPath = NodePath.join(settingsLogDir, "settings.ndjson");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SETTINGS_LOG: settingsLogPath,
+      });
       const runtimeEvents: ProviderRuntimeEvent[] = [];
       const requestOpened =
         yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
@@ -1797,6 +1803,75 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         schemaVersion: 2,
         sessionId: "mock-session-spec-successor",
         turnIds: [sentTurn.turnId],
+      });
+
+      // Droid offered only the new-session variant here, so the adapter's
+      // generic first-proceed selection picks it and the successor machinery
+      // engages.
+      const outcomeLog = (yield* Effect.promise(() => NodeFSP.readFile(settingsLogPath, "utf8")))
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.deepEqual(outcomeLog.at(-1), {
+        exitSpecModeSelectedOption: "proceed_new_session_high",
+        resultingAutonomyLevel: "high",
+      });
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("carries the thread's runtime mode into an approved spec implementation", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-spec-autonomy-handoff");
+      const settingsLogDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-spec-autonomy-settings-")),
+      );
+      const settingsLogPath = NodePath.join(settingsLogDir, "settings.ndjson");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SETTINGS_LOG: settingsLogPath,
+      });
+      const requestOpened =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
+      const turnCompleted =
+        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "request.opened" && String(event.threadId) === String(threadId)
+          ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
+          : event.type === "turn.completed" && String(event.threadId) === String(threadId)
+            ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
+            : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* startDroidSession(adapter, threadId, "full-access");
+      yield* adapter.sendTurn({
+        threadId,
+        input: "mock spec autonomy handoff",
+        attachments: [],
+        interactionMode: "plan",
+      });
+      const opened = yield* Deferred.await(requestOpened);
+      assert.equal(opened.payload.requestType, "plan_approval");
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(opened.requestId)),
+        "accept",
+      );
+      const terminal = yield* Deferred.await(turnCompleted);
+      assert.equal(terminal.payload.state, "completed");
+
+      // Droid derives the implementation autonomy from the selected
+      // exit_spec_mode outcome. A full-access thread must answer with the
+      // high-autonomy variant, or the implementation prompts for every edit
+      // (repro'd live on droid 0.202.0 with the generic proceed_once).
+      const outcomeLog = (yield* Effect.promise(() => NodeFSP.readFile(settingsLogPath, "utf8")))
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.deepEqual(outcomeLog.at(-1), {
+        exitSpecModeSelectedOption: "proceed_auto_run_high",
+        resultingAutonomyLevel: "high",
       });
 
       yield* Fiber.interrupt(runtimeEventsFiber);
