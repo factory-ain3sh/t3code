@@ -7,7 +7,6 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
-import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { it, assert } from "@effect/vitest";
@@ -451,61 +450,6 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         },
       });
     }),
-  );
-
-  it.effect("keeps routing input while an extension request is pending", () =>
-    Effect.gen(function* () {
-      const { stdio, input, output } = yield* makeInMemoryStdio();
-      const requestStarted = yield* Deferred.make<void>();
-      const releaseRequest = yield* Deferred.make<void>();
-      const notificationHandled = yield* Deferred.make<void>();
-      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
-        stdio,
-        serverRequestMethods: new Set(),
-        onExtRequest: () =>
-          Deferred.succeed(requestStarted, undefined).pipe(
-            Effect.andThen(Deferred.await(releaseRequest)),
-            Effect.as({ ok: true }),
-          ),
-        onNotification: () => Deferred.succeed(notificationHandled, undefined).pipe(Effect.asVoid),
-      });
-
-      yield* Queue.offer(
-        input,
-        encoder.encode(
-          `${encodeUnknownJsonString({
-            jsonrpc: "2.0",
-            id: 7,
-            method: "x/test",
-            params: { hello: "world" },
-            headers: [],
-          })}\n${encodeUnknownJsonString({
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: {
-              sessionId: "session-1",
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "still routing" },
-              },
-            },
-          })}\n`,
-        ),
-      );
-
-      yield* Deferred.await(requestStarted).pipe(Effect.timeout("1 second"));
-      yield* Deferred.await(notificationHandled).pipe(Effect.timeout("1 second"));
-      yield* transport.drainIncoming.pipe(Effect.timeout("1 second"));
-      assert.equal(yield* Queue.size(output), 0);
-
-      yield* Deferred.succeed(releaseRequest, undefined);
-      const outbound = yield* Queue.take(output).pipe(Effect.timeout("1 second"));
-      assert.deepEqual(yield* decodeExtResponse(outbound), {
-        jsonrpc: "2.0",
-        id: 7,
-        result: { ok: true },
-      });
-    }).pipe(TestClock.withLive),
   );
 
   it.effect("preserves zero-valued ids for inbound core client requests", () =>

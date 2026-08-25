@@ -1042,6 +1042,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 ) {
                   return;
                 }
+                // Grok's `_x.ai/session/prompt_complete` fallback can resolve the
+                // prompt before later `session/update` frames from the same stdout
+                // burst reach the ACP event queue. Give the input fiber a bounded
+                // handoff window, then drain every update it enqueued before
+                // publishing the terminal event.
+                for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
+                  yield* Effect.yieldNow;
+                }
                 yield* prepared.acp.drainEvents;
                 if (ctx.interruptedTurnIds.has(prepared.turnId)) {
                   return;

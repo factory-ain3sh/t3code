@@ -188,7 +188,7 @@ export class AcpSessionRuntime extends Context.Service<
     readonly start: () => Effect.Effect<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError>;
     /** Stream of parsed ACP session events emitted after startup. */
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
-    /** Waits until the current ACP input batch and every resulting queued event are processed. */
+    /** Waits until the current event consumer has processed every queued event. */
     readonly drainEvents: Effect.Effect<void>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
@@ -714,7 +714,6 @@ export const make = (
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),
       drainEvents: Effect.gen(function* () {
-        yield* acp.raw.drainIncoming;
         const acknowledge = yield* Deferred.make<void>();
         yield* Queue.offer(eventQueue, {
           _tag: "EventStreamBarrier",
