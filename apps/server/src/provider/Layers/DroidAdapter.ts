@@ -1993,6 +1993,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   yield* releasePendingInterrupt(live);
                   const activeTurnId = live.session.activeTurnId;
                   if (activeTurnId !== undefined) {
+                    live.interruptedTurnIds.delete(activeTurnId);
                     yield* settleTurn(live, activeTurnId, {
                       state: "failed",
                       errorMessage: `Droid exited unexpectedly (${exit.description}).`,
