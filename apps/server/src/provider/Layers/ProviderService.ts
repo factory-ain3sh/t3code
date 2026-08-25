@@ -49,7 +49,11 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
-import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
+import {
+  type ProviderAdapterError,
+  ProviderAdapterSessionInvalidatedError,
+  ProviderValidationError,
+} from "../Errors.ts";
 import {
   type ProviderAdapterSession,
   type ProviderAdapterShape,
@@ -370,6 +374,47 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
+  const failAfterPersistingSessionInvalidation = (input: {
+    readonly error: ProviderAdapterSessionInvalidatedError;
+    readonly instanceId: ProviderInstanceId;
+    readonly provider: ProviderDriverKind;
+    readonly threadId: ThreadId;
+  }) =>
+    directory.invalidateOwnership(input.threadId).pipe(
+      Effect.andThen(
+        directory.upsert({
+          threadId: input.threadId,
+          provider: input.provider,
+          providerInstanceId: input.instanceId,
+          sessionLease: null,
+          status: "stopped",
+          resumeCursor: null,
+          runtimePayload: {
+            activeTurnId: null,
+            lastRuntimeEvent: "provider.session.invalidated",
+          },
+        }),
+      ),
+      Effect.ensuring(clearMcpSession(input.threadId)),
+      Effect.andThen(Effect.fail(input.error)),
+    );
+
+  const failRoutedSessionInvalidation =
+    (
+      routed: {
+        readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+        readonly instanceId: ProviderInstanceId;
+      },
+      threadId: ThreadId,
+    ) =>
+    (error: ProviderAdapterSessionInvalidatedError) =>
+      failAfterPersistingSessionInvalidation({
+        error,
+        instanceId: routed.instanceId,
+        provider: routed.adapter.provider,
+        threadId,
+      });
+
   const persistEventResumeCursor = (
     source: {
       readonly instanceId: ProviderInstanceId;
@@ -408,15 +453,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       providerInstanceId: source.instanceId,
       sessionLease: event.sessionLease,
     });
-    const matchesDurableOwnership = directory.getBinding(event.threadId).pipe(
-      Effect.map((binding) => {
-        const current = Option.getOrUndefined(binding);
-        return (
-          current?.providerInstanceId === source.instanceId &&
-          current.sessionLease === event.sessionLease
-        );
-      }),
-    );
+    const matchesOwnershipAfterHydration = directory
+      .getBinding(event.threadId)
+      .pipe(Effect.andThen(matchesIndexedOwnership));
     return matchesIndexedOwnership.pipe(
       Effect.flatMap((matches) =>
         matches
@@ -426,7 +465,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             // landed). Wait for the thread's lifecycle lock to free, re-read
             // once, and only then treat the event as genuinely stale.
             withSessionLifecycleLock(event.threadId, Effect.void).pipe(
-              Effect.andThen(matchesDurableOwnership),
+              Effect.andThen(matchesOwnershipAfterHydration),
               Effect.tap((matchesNow) =>
                 matchesNow
                   ? Effect.void
@@ -468,7 +507,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                       providerInstanceId: source.instanceId,
                       threadId: canonicalEvent.threadId,
                       cause: error,
-                    }).pipe(Effect.as(true)),
+                    }).pipe(Effect.as(false)),
                   ),
                   Effect.flatMap((cursorStillOwned) =>
                     cursorStillOwned
@@ -836,7 +875,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           });
           const adapter = yield* registry.getByInstance(resolvedInstanceId);
           yield* prepareMcpSession(threadId, resolvedInstanceId);
-          yield* directory.invalidateOwnership(threadId);
+          if (persistedBinding !== undefined) {
+            yield* directory.invalidateOwnership(threadId);
+          }
           const session = yield* adapter
             .startSession({
               ...input,
@@ -978,7 +1019,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         // rather than issuing a new one: sessions that go a long time between
         // browser tool calls used to lose the toolkit outright.
         yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
-        const turn = yield* routed.adapter.sendTurn(input);
+        const turn = yield* routed.adapter
+          .sendTurn(input)
+          .pipe(
+            Effect.catchTag(
+              "ProviderAdapterSessionInvalidatedError",
+              failRoutedSessionInvalidation(routed, input.threadId),
+            ),
+          );
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,
@@ -1045,7 +1093,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             "provider.thread_id": input.threadId,
             "provider.turn_id": input.turnId,
           });
-          yield* routed.adapter.interruptTurn(routed.threadId, input.turnId);
+          yield* routed.adapter
+            .interruptTurn(routed.threadId, input.turnId)
+            .pipe(
+              Effect.catchTag(
+                "ProviderAdapterSessionInvalidatedError",
+                failRoutedSessionInvalidation(routed, input.threadId),
+              ),
+            );
           yield* analytics.record("provider.turn.interrupted", {
             provider: routed.adapter.provider,
           });
@@ -1070,33 +1125,43 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         payload: rawInput,
       });
       let metricProvider = "unknown";
-      return yield* Effect.gen(function* () {
-        const routed = yield* resolveRoutableSession({
-          threadId: input.threadId,
-          operation: "ProviderService.respondToRequest",
-          allowRecovery: true,
-          lifecycleLockHeld: false,
-        });
-        metricProvider = routed.adapter.provider;
-        yield* Effect.annotateCurrentSpan({
-          "provider.operation": "respond-to-request",
-          "provider.kind": routed.adapter.provider,
-          "provider.thread_id": input.threadId,
-          "provider.request_id": input.requestId,
-        });
-        yield* routed.adapter.respondToRequest(routed.threadId, input.requestId, input.decision);
-        yield* analytics.record("provider.request.responded", {
-          provider: routed.adapter.provider,
-          decision: input.decision,
-        });
-      }).pipe(
-        withMetrics({
-          counter: providerTurnsTotal,
-          outcomeAttributes: () =>
-            providerMetricAttributes(metricProvider, {
-              operation: "approval-response",
-            }),
-        }),
+      return yield* withSessionLifecycleLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const routed = yield* resolveRoutableSession({
+            threadId: input.threadId,
+            operation: "ProviderService.respondToRequest",
+            allowRecovery: true,
+            lifecycleLockHeld: true,
+          });
+          metricProvider = routed.adapter.provider;
+          yield* Effect.annotateCurrentSpan({
+            "provider.operation": "respond-to-request",
+            "provider.kind": routed.adapter.provider,
+            "provider.thread_id": input.threadId,
+            "provider.request_id": input.requestId,
+          });
+          yield* routed.adapter
+            .respondToRequest(routed.threadId, input.requestId, input.decision)
+            .pipe(
+              Effect.catchTag(
+                "ProviderAdapterSessionInvalidatedError",
+                failRoutedSessionInvalidation(routed, input.threadId),
+              ),
+            );
+          yield* analytics.record("provider.request.responded", {
+            provider: routed.adapter.provider,
+            decision: input.decision,
+          });
+        }).pipe(
+          withMetrics({
+            counter: providerTurnsTotal,
+            outcomeAttributes: () =>
+              providerMetricAttributes(metricProvider, {
+                operation: "approval-response",
+              }),
+          }),
+        ),
       );
     },
   );
@@ -1110,29 +1175,39 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       payload: rawInput,
     });
     let metricProvider = "unknown";
-    return yield* Effect.gen(function* () {
-      const routed = yield* resolveRoutableSession({
-        threadId: input.threadId,
-        operation: "ProviderService.respondToUserInput",
-        allowRecovery: true,
-        lifecycleLockHeld: false,
-      });
-      metricProvider = routed.adapter.provider;
-      yield* Effect.annotateCurrentSpan({
-        "provider.operation": "respond-to-user-input",
-        "provider.kind": routed.adapter.provider,
-        "provider.thread_id": input.threadId,
-        "provider.request_id": input.requestId,
-      });
-      yield* routed.adapter.respondToUserInput(routed.threadId, input.requestId, input.answers);
-    }).pipe(
-      withMetrics({
-        counter: providerTurnsTotal,
-        outcomeAttributes: () =>
-          providerMetricAttributes(metricProvider, {
-            operation: "user-input-response",
-          }),
-      }),
+    return yield* withSessionLifecycleLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const routed = yield* resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.respondToUserInput",
+          allowRecovery: true,
+          lifecycleLockHeld: true,
+        });
+        metricProvider = routed.adapter.provider;
+        yield* Effect.annotateCurrentSpan({
+          "provider.operation": "respond-to-user-input",
+          "provider.kind": routed.adapter.provider,
+          "provider.thread_id": input.threadId,
+          "provider.request_id": input.requestId,
+        });
+        yield* routed.adapter
+          .respondToUserInput(routed.threadId, input.requestId, input.answers)
+          .pipe(
+            Effect.catchTag(
+              "ProviderAdapterSessionInvalidatedError",
+              failRoutedSessionInvalidation(routed, input.threadId),
+            ),
+          );
+      }).pipe(
+        withMetrics({
+          counter: providerTurnsTotal,
+          outcomeAttributes: () =>
+            providerMetricAttributes(metricProvider, {
+              operation: "user-input-response",
+            }),
+        }),
+      ),
     );
   });
 
@@ -1356,10 +1431,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": input.threadId,
         "provider.rollback_target_turn_count": input.turnIds.length,
       });
-      const snapshot = yield* routed.adapter.rollbackThread(routed.threadId, {
-        turnIds: input.turnIds,
-        ...(input.anchorTurnId !== undefined ? { anchorTurnId: input.anchorTurnId } : {}),
-      });
+      const snapshot = yield* routed.adapter
+        .rollbackThread(routed.threadId, {
+          turnIds: input.turnIds,
+          ...(input.anchorTurnId !== undefined ? { anchorTurnId: input.anchorTurnId } : {}),
+        })
+        .pipe(
+          Effect.catchTag(
+            "ProviderAdapterSessionInvalidatedError",
+            failRoutedSessionInvalidation(routed, input.threadId),
+          ),
+        );
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         targetTurnCount: input.turnIds.length,

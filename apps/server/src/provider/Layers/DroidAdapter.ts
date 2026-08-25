@@ -20,9 +20,11 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Equal from "effect/Equal";
@@ -43,6 +45,7 @@ import {
   type ProviderAdapterError,
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
+  ProviderAdapterSessionInvalidatedError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import {
@@ -59,6 +62,7 @@ import {
 import {
   DROID_SERVER_REQUEST_CONCURRENCY,
   DROID_SESSION_REQUEST_TIMEOUT_MS,
+  DroidRpcError,
   makeDroidExecRpcClient,
   type DroidRpcClient,
   type DroidServerRequest,
@@ -114,12 +118,19 @@ export interface DroidAdapterLiveOptions {
 type DroidApprovalDecision = Exclude<ProviderApprovalDecision, "cancel">;
 
 type PendingApprovalResolution =
-  | { readonly _tag: "decision"; readonly decision: DroidApprovalDecision }
+  | {
+      readonly _tag: "decision";
+      readonly decision: DroidApprovalDecision;
+      readonly selectedOutcome: string;
+      readonly approvedSpecHandoff: boolean;
+    }
   | { readonly _tag: "cancelled" };
 
 interface PendingApproval {
   readonly resolution: Deferred.Deferred<PendingApprovalResolution>;
-  readonly supportedDecisions: ReadonlyArray<DroidApprovalDecision>;
+  readonly nativeResponse: Deferred.Deferred<void, DroidRpcError>;
+  readonly options: ReadonlyArray<DroidPermissionOption>;
+  readonly isExitSpecMode: boolean;
   readonly turnId: TurnId;
   readonly requestType: CanonicalRequestType;
   retired: boolean;
@@ -131,6 +142,7 @@ type PendingUserInputResolution =
 
 interface PendingUserInput {
   readonly resolution: Deferred.Deferred<PendingUserInputResolution>;
+  readonly nativeResponse: Deferred.Deferred<void, DroidRpcError>;
   readonly turnId: TurnId;
   retired: boolean;
 }
@@ -1215,6 +1227,57 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       ctx.toolUseNames.set(toolUse.id, toolUse.name);
     };
 
+    const acceptsSessionEnvelope = (
+      ctx: DroidSessionContext,
+      sessionId: string | undefined,
+    ): boolean => {
+      if (sessionId === undefined || sessionId === ctx.droidSessionId) {
+        return true;
+      }
+      const mayClaimSpecSuccessor =
+        ctx.session.activeTurnId !== undefined &&
+        ctx.currentInteractionMode === "spec" &&
+        ctx.specHandoffApproved &&
+        (ctx.specSuccessorSessionId === undefined || ctx.specSuccessorSessionId === sessionId);
+      if (!mayClaimSpecSuccessor) {
+        return false;
+      }
+      ctx.specSuccessorSessionId = sessionId;
+      return true;
+    };
+
+    const settleNativeServerResponse = (
+      method: DroidServerRequest["method"],
+      nativeResponse: Deferred.Deferred<void, DroidRpcError>,
+      response: Effect.Effect<void, DroidRpcError>,
+    ) =>
+      response.pipe(
+        Effect.timeoutOption(Duration.millis(DROID_SESSION_REQUEST_TIMEOUT_MS)),
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(
+                new DroidRpcError({
+                  kind: "timeout",
+                  method,
+                  timeoutMs: DROID_SESSION_REQUEST_TIMEOUT_MS,
+                }),
+              ),
+            onSome: () => Effect.void,
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.fail(
+            new DroidRpcError({
+              kind: "write",
+              method,
+              cause: Cause.squash(cause),
+            }),
+          ),
+        ),
+        Effect.onExit((exit) => Deferred.done(nativeResponse, exit)),
+      );
+
     const handlePermissionRequest = (
       ctx: DroidSessionContext,
       request: Extract<DroidServerRequest, { method: "droid.request_permission" }>,
@@ -1227,11 +1290,11 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           yield* request.fail(-32602, "Droid permission request has no supported decisions");
           return;
         }
-        const supportedDecisions = approvalOptions.map((option) => option.decision);
         const primaryToolUse = params.toolUses[0];
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const resolution = yield* Deferred.make<PendingApprovalResolution>();
+        const nativeResponse = yield* Deferred.make<void, DroidRpcError>();
         const requestType = droidCanonicalRequestType(primaryToolUse?.details.type);
         let pending: PendingApproval | undefined;
         const turnId = yield* withThreadLock(
@@ -1241,7 +1304,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             if (
               ctx.stopped ||
               activeTurnId === undefined ||
-              (request.sessionId !== undefined && request.sessionId !== ctx.droidSessionId)
+              !acceptsSessionEnvelope(ctx, request.sessionId)
             ) {
               yield* request.fail(-32800, "Droid permission request is no longer active.");
               return;
@@ -1249,7 +1312,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             if (primaryToolUse) rememberToolUse(ctx, primaryToolUse.toolUse);
             pending = {
               resolution,
-              supportedDecisions,
+              nativeResponse,
+              options: params.options,
+              isExitSpecMode: primaryToolUse?.details.type === "exit_spec_mode",
               turnId: activeTurnId,
               requestType,
               retired: false,
@@ -1281,15 +1346,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           }),
         );
         if (turnId === undefined || pending === undefined) return;
-        const resolved = yield* Deferred.await(resolution).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (ctx.pendingApprovals.get(requestId) === pending) {
-                ctx.pendingApprovals.delete(requestId);
-              }
-            }),
-          ),
-        );
+        const resolved = yield* Deferred.await(resolution);
         if (!pending.retired) {
           yield* offerRuntimeEvent(ctx, {
             type: "request.resolved",
@@ -1305,61 +1362,50 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           });
         }
         if (resolved._tag === "cancelled") {
-          yield* request.fail(
-            -32800,
-            "Droid permission request was cancelled before a supported response.",
+          return yield* settleNativeServerResponse(
+            request.method,
+            nativeResponse,
+            request.fail(
+              -32800,
+              "Droid permission request was cancelled before a supported response.",
+            ),
+          ).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (ctx.pendingApprovals.get(requestId) === pending) {
+                  ctx.pendingApprovals.delete(requestId);
+                }
+              }),
+            ),
           );
-          return;
         }
-        // Approving an exit_spec_mode prefers the outcome that carries the
-        // thread's runtime mode into the implementation; the generic
-        // first-proceed selection would pick `proceed_once`, which droid
-        // implements with no autonomy regardless of the session's settings.
-        const preferredSpecOutcome =
-          primaryToolUse?.details.type === "exit_spec_mode" && resolved.decision === "accept"
-            ? droidExitSpecModeOutcomeForRuntimeMode(ctx.session.runtimeMode)
-            : undefined;
-        const preferredSpecOption =
-          preferredSpecOutcome === undefined
-            ? undefined
-            : params.options.find((option) => option.outcome.trim() === preferredSpecOutcome);
-        const selectedOutcome =
-          preferredSpecOption?.outcome ??
-          selectDroidPermissionOutcome(params.options, resolved.decision);
-        if (selectedOutcome === undefined) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "respondToRequest",
-            issue: `Approval decision '${resolved.decision}' is not supported by request '${requestId}'.`,
-          });
-        }
-        // Arm the claim window under the thread lock and only while the turn
-        // that opened this request is still the active turn: an approval that
-        // resolves after its spec turn settles must not arm the next spec
-        // turn's handoff.
-        const approvedSpecHandoff =
-          primaryToolUse?.details.type === "exit_spec_mode" &&
-          selectedOutcome.trim() !== "cancel" &&
-          (yield* withThreadLock(
-            ctx.threadId,
-            Effect.sync(() => {
-              if (ctx.stopped || ctx.session.activeTurnId !== turnId) {
-                return false;
-              }
-              ctx.specHandoffApproved = true;
-              return true;
-            }),
-          ));
-        yield* request.respond({ selectedOption: selectedOutcome }).pipe(
+        const nativeResponseEffect = settleNativeServerResponse(
+          request.method,
+          nativeResponse,
+          request.respond({
+            selectedOption: resolved.selectedOutcome,
+          }),
+        );
+        yield* nativeResponseEffect.pipe(
           Effect.tapError(() =>
             Effect.sync(() => {
-              if (approvedSpecHandoff) {
+              if (resolved.approvedSpecHandoff) {
                 ctx.specHandoffApproved = false;
               }
             }),
           ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (ctx.pendingApprovals.get(requestId) === pending) {
+                ctx.pendingApprovals.delete(requestId);
+              }
+            }),
+          ),
         );
-        if (approvedSpecHandoff && !selectedOutcome.trim().startsWith("proceed_new_session")) {
+        if (
+          resolved.approvedSpecHandoff &&
+          !resolved.selectedOutcome.trim().startsWith("proceed_new_session")
+        ) {
           // An approved in-session handoff leaves spec mode immediately (the
           // CLI resets interaction to auto before implementing). New-session
           // handoffs flip at successor adoption instead, so the
@@ -1379,6 +1425,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
         const runtimeRequestId = RuntimeRequestId.make(requestId);
         const resolution = yield* Deferred.make<PendingUserInputResolution>();
+        const nativeResponse = yield* Deferred.make<void, DroidRpcError>();
         let pending: PendingUserInput | undefined;
         const turnId = yield* withThreadLock(
           ctx.threadId,
@@ -1387,13 +1434,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             if (
               ctx.stopped ||
               activeTurnId === undefined ||
-              (request.sessionId !== undefined && request.sessionId !== ctx.droidSessionId)
+              !acceptsSessionEnvelope(ctx, request.sessionId)
             ) {
               yield* request.fail(-32800, "Droid user-input request is no longer active.");
               return;
             }
             pending = {
               resolution,
+              nativeResponse,
               turnId: activeTurnId,
               retired: false,
             };
@@ -1427,15 +1475,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
           }),
         );
         if (turnId === undefined || pending === undefined) return;
-        const resolved = yield* Deferred.await(resolution).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (ctx.pendingUserInputs.get(requestId) === pending) {
-                ctx.pendingUserInputs.delete(requestId);
-              }
-            }),
-          ),
-        );
+        const resolved = yield* Deferred.await(resolution);
         const resolvedAnswers = resolved._tag === "answered" ? resolved.answers : {};
         if (!pending.retired) {
           yield* offerRuntimeEvent(ctx, {
@@ -1448,17 +1488,27 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             payload: { answers: resolvedAnswers },
           });
         }
-        if (resolved._tag === "cancelled") {
-          yield* request.respond({ cancelled: true, answers: [] });
-          return;
-        }
-        yield* request.respond({
-          answers: params.questions.map((question) => {
-            const raw = resolved.answers[String(question.index)];
-            const answer = Array.isArray(raw) ? raw.map(String).join(", ") : String(raw ?? "");
-            return { index: question.index, question: question.question, answer };
-          }),
-        });
+        const response =
+          resolved._tag === "cancelled"
+            ? request.respond({ cancelled: true, answers: [] })
+            : request.respond({
+                answers: params.questions.map((question) => {
+                  const raw = resolved.answers[String(question.index)];
+                  const answer = Array.isArray(raw)
+                    ? raw.map(String).join(", ")
+                    : String(raw ?? "");
+                  return { index: question.index, question: question.question, answer };
+                }),
+              });
+        yield* settleNativeServerResponse(request.method, nativeResponse, response).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (ctx.pendingUserInputs.get(requestId) === pending) {
+                ctx.pendingUserInputs.delete(requestId);
+              }
+            }),
+          ),
+        );
       });
 
     const handleServerRequest = (ctx: DroidSessionContext, request: DroidServerRequest) => {
@@ -1573,6 +1623,49 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         });
       });
 
+    const failSessionInvalidated = (
+      ctx: DroidSessionContext,
+      operation: ProviderAdapterSessionInvalidatedError["operation"],
+      cause: unknown,
+    ) =>
+      stopSessionInternal(ctx).pipe(
+        Effect.andThen(
+          Effect.fail(
+            new ProviderAdapterSessionInvalidatedError({
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              operation,
+              cause,
+            }),
+          ),
+        ),
+      );
+
+    const awaitNativeServerResponse = (
+      ctx: DroidSessionContext,
+      operation: ProviderAdapterSessionInvalidatedError["operation"],
+      nativeResponse: Deferred.Deferred<void, DroidRpcError>,
+    ) =>
+      Deferred.await(nativeResponse).pipe(
+        Effect.timeoutOption(Duration.millis(DROID_SESSION_REQUEST_TIMEOUT_MS)),
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(
+                new DroidRpcError({
+                  kind: "timeout",
+                  method: operation,
+                  timeoutMs: DROID_SESSION_REQUEST_TIMEOUT_MS,
+                }),
+              ),
+            onSome: () => Effect.void,
+          }),
+        ),
+        Effect.catch((cause) =>
+          withThreadLock(ctx.threadId, failSessionInvalidated(ctx, operation, cause)),
+        ),
+      );
+
     const startSession: DroidAdapterShape["startSession"] = (input) =>
       Effect.suspend(() => {
         if (closing) {
@@ -1603,6 +1696,13 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       withThreadLock(
         input.threadId,
         Effect.gen(function* () {
+          if (closing) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: "Droid adapter is stopping; cannot start a new session.",
+            });
+          }
           if (input.provider !== undefined && input.provider !== PROVIDER) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
@@ -1819,19 +1919,12 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                       notification,
                     );
                   }
-                  const isSpecSuccessor =
-                    ctx.session.activeTurnId !== undefined &&
-                    ctx.currentInteractionMode === "spec" &&
-                    ctx.specHandoffApproved &&
-                    (ctx.specSuccessorSessionId === undefined ||
-                      ctx.specSuccessorSessionId === envelope.sessionId);
-                  if (!isSpecSuccessor) {
+                  if (!acceptsSessionEnvelope(ctx, envelope.sessionId)) {
                     return yield* Effect.logDebug(
                       "Dropped Droid notification from an abandoned session.",
                       { sessionId: envelope.sessionId, type: notification.type },
                     );
                   }
-                  ctx.specSuccessorSessionId = envelope.sessionId;
                 }
                 if (notification.type === "tool_call") rememberToolUse(ctx, notification.toolUse);
                 yield* handleNotification(ctx, notification);
@@ -1956,7 +2049,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               : {}),
           };
           if (Object.keys(settingsPatch).length > 0) {
-            yield* requestViaRpc(ctx, "droid.update_session_settings", settingsPatch);
+            yield* requestViaRpc(ctx, "droid.update_session_settings", settingsPatch).pipe(
+              Effect.catch((cause) => failSessionInvalidated(ctx, "sendTurn", cause)),
+            );
             if (requestedInteractionMode === "spec") {
               ctx.currentSpecModeModelId = requestedModelId ?? ctx.currentSpecModeModelId;
               ctx.currentSpecModeReasoningEffort =
@@ -2049,7 +2144,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             ...(text ? { text } : { text: "" }),
             ...(images.length > 0 ? { images } : {}),
           }).pipe(
-            Effect.tapError(() =>
+            Effect.catch((cause) =>
               Effect.gen(function* () {
                 ctx.pendingTurnMessageIds.delete(messageId);
                 ctx.persistedPendingTurnMessageIds.delete(messageId);
@@ -2062,11 +2157,14 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                   // it must not count toward rewind anchoring either.
                   ctx.turns = ctx.turns.filter((turn) => turn.id !== turnId);
                   refreshDroidResumeCursor(ctx);
+                }
+                if (ctx.session.activeTurnId === turnId) {
                   yield* settleTurn(ctx, turnId, {
                     state: "failed",
                     errorMessage: "Droid rejected the user message.",
                   });
                 }
+                return yield* failSessionInvalidated(ctx, "sendTurn", cause);
               }),
             ),
           );
@@ -2159,20 +2257,19 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
             };
             ctx.pendingInterrupt = pendingInterrupt;
             yield* requestViaRpc(ctx, "droid.interrupt_session", {}).pipe(
-              Effect.ignore,
-              Effect.ensuring(
+              Effect.catch((cause) =>
                 Effect.sync(() => {
                   pendingInterrupt.rpcSettled = true;
-                  if (pendingInterrupt.terminalSettled) {
-                    if (ctx.pendingInterrupt === pendingInterrupt) {
-                      ctx.pendingInterrupt = undefined;
-                    }
-                    Deferred.doneUnsafe(pendingInterrupt.barrier, Effect.void);
-                  }
-                }),
+                }).pipe(Effect.andThen(failSessionInvalidated(ctx, "interruptTurn", cause))),
               ),
-              Effect.forkIn(ctx.scope),
             );
+            pendingInterrupt.rpcSettled = true;
+            if (pendingInterrupt.terminalSettled) {
+              if (ctx.pendingInterrupt === pendingInterrupt) {
+                ctx.pendingInterrupt = undefined;
+              }
+              yield* Deferred.succeed(pendingInterrupt.barrier, undefined);
+            }
           }),
         );
       });
@@ -2182,51 +2279,97 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       requestId,
       decision,
     ) =>
-      withThreadLock(
-        threadId,
-        Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
-          const pending = ctx.pendingApprovals.get(requestId);
-          if (!pending) {
-            return yield* new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "droid.request_permission",
-              detail: `Unknown pending approval request: ${requestId}`,
+      Effect.gen(function* () {
+        const response = yield* withThreadLock(
+          threadId,
+          Effect.gen(function* () {
+            const ctx = yield* requireSession(threadId);
+            const pending = ctx.pendingApprovals.get(requestId);
+            if (!pending) {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "droid.request_permission",
+                detail: `Unknown pending approval request: ${requestId}`,
+              });
+            }
+            if (decision === "cancel") {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "respondToRequest",
+                issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
+              });
+            }
+            const preferredSpecOutcome =
+              pending.isExitSpecMode && decision === "accept"
+                ? droidExitSpecModeOutcomeForRuntimeMode(ctx.session.runtimeMode)
+                : undefined;
+            const preferredSpecOption =
+              preferredSpecOutcome === undefined
+                ? undefined
+                : pending.options.find((option) => option.outcome.trim() === preferredSpecOutcome);
+            const selectedOutcome =
+              preferredSpecOption?.outcome ??
+              selectDroidPermissionOutcome(pending.options, decision);
+            if (selectedOutcome === undefined) {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "respondToRequest",
+                issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
+              });
+            }
+            const approvedSpecHandoff =
+              pending.isExitSpecMode &&
+              selectedOutcome.trim() !== "cancel" &&
+              ctx.session.activeTurnId === pending.turnId;
+            if (approvedSpecHandoff) {
+              ctx.specHandoffApproved = true;
+            }
+            ctx.pendingApprovals.delete(requestId);
+            yield* Deferred.succeed(pending.resolution, {
+              _tag: "decision",
+              decision,
+              selectedOutcome,
+              approvedSpecHandoff,
             });
-          }
-          if (decision === "cancel" || !pending.supportedDecisions.includes(decision)) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "respondToRequest",
-              issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
-            });
-          }
-          ctx.pendingApprovals.delete(requestId);
-          yield* Deferred.succeed(pending.resolution, { _tag: "decision", decision });
-        }),
-      );
+            return { ctx, pending };
+          }),
+        );
+        yield* awaitNativeServerResponse(
+          response.ctx,
+          "respondToRequest",
+          response.pending.nativeResponse,
+        );
+      });
 
     const respondToUserInput: DroidAdapterShape["respondToUserInput"] = (
       threadId,
       requestId,
       answers,
     ) =>
-      withThreadLock(
-        threadId,
-        Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
-          const pending = ctx.pendingUserInputs.get(requestId);
-          if (!pending) {
-            return yield* new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "droid.ask_user",
-              detail: `Unknown pending user-input request: ${requestId}`,
-            });
-          }
-          ctx.pendingUserInputs.delete(requestId);
-          yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers });
-        }),
-      );
+      Effect.gen(function* () {
+        const response = yield* withThreadLock(
+          threadId,
+          Effect.gen(function* () {
+            const ctx = yield* requireSession(threadId);
+            const pending = ctx.pendingUserInputs.get(requestId);
+            if (!pending) {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "droid.ask_user",
+                detail: `Unknown pending user-input request: ${requestId}`,
+              });
+            }
+            ctx.pendingUserInputs.delete(requestId);
+            yield* Deferred.succeed(pending.resolution, { _tag: "answered", answers });
+            return { ctx, pending };
+          }),
+        );
+        yield* awaitNativeServerResponse(
+          response.ctx,
+          "respondToUserInput",
+          response.pending.nativeResponse,
+        );
+      });
 
     const readThread: DroidAdapterShape["readThread"] = (threadId) =>
       Effect.gen(function* () {
@@ -2320,7 +2463,7 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                 ? { specModeReasoningEffort: ctx.currentSpecModeReasoningEffort }
                 : {}),
             },
-          });
+          }).pipe(Effect.catch((cause) => failSessionInvalidated(ctx, "rollbackThread", cause)));
           ctx.droidSessionId = rewound.newSessionId;
           ctx.turns = target.turnIds.map((id) => ({ id, items: [] }));
           ctx.session = {

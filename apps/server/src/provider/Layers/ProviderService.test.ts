@@ -39,7 +39,9 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   ProviderAdapterRequestError,
+  ProviderAdapterSessionInvalidatedError,
   ProviderAdapterSessionNotFoundError,
+  ProviderSessionDirectoryPersistenceError,
   ProviderUnsupportedError,
   ProviderValidationError,
   type ProviderAdapterError,
@@ -198,18 +200,19 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
       }),
   );
 
-  const sendTurn = vi.fn((input: ProviderSendTurnInput) =>
-    sessions.has(input.threadId)
-      ? Effect.succeed({
-          threadId: input.threadId,
-          turnId: TurnId.make(`turn-${String(input.threadId)}`),
-        })
-      : Effect.fail(
-          new ProviderAdapterSessionNotFoundError({
-            provider,
+  const sendTurn = vi.fn<ProviderAdapterShape<ProviderAdapterError>["sendTurn"]>(
+    (input: ProviderSendTurnInput) =>
+      sessions.has(input.threadId)
+        ? Effect.succeed({
             threadId: input.threadId,
-          }),
-        ),
+            turnId: TurnId.make(`turn-${String(input.threadId)}`),
+          })
+        : Effect.fail(
+            new ProviderAdapterSessionNotFoundError({
+              provider,
+              threadId: input.threadId,
+            }),
+          ),
   );
   const interruptTurn = vi.fn((_threadId: ThreadId, _turnId?: TurnId) => Effect.void);
   const respondToRequest = vi.fn(
@@ -231,7 +234,9 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
       turns: [{ id: asTurnId("turn-1"), items: [] as const }],
     }),
   );
-  const rollbackThread = vi.fn((threadId: ThreadId, target: ProviderThreadRollbackTarget) =>
+  const rollbackThread = vi.fn<
+    NonNullable<ProviderAdapterShape<ProviderAdapterError>["rollbackThread"]>
+  >((threadId: ThreadId, target: ProviderThreadRollbackTarget) =>
     Effect.succeed({
       threadId,
       turns: target.turnIds.map((id) => ({ id, items: [] as const })),
@@ -334,18 +339,31 @@ type TestServerSettings = Parameters<typeof ServerSettings.ServerSettingsService
 function makeProviderLayers({
   registry,
   dbPath,
+  directoryOverride,
   serviceOptions,
   settings,
 }: {
   readonly registry: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"];
   readonly dbPath?: string;
+  readonly directoryOverride?: (
+    directory: ProviderSessionDirectory.ProviderSessionDirectoryShape,
+  ) => ProviderSessionDirectory.ProviderSessionDirectoryShape;
   readonly serviceOptions?: ProviderServiceLiveOptions;
   readonly settings?: TestServerSettings;
 }) {
   const persistenceLayer =
     dbPath === undefined ? SqlitePersistenceMemory : makeSqlitePersistenceLive(dbPath);
   const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(Layer.provide(persistenceLayer));
-  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+  const baseDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+    Layer.provide(runtimeRepositoryLayer),
+  );
+  const directoryLayer =
+    directoryOverride === undefined
+      ? baseDirectoryLayer
+      : Layer.effect(
+          ProviderSessionDirectory.ProviderSessionDirectory,
+          Effect.map(ProviderSessionDirectory.ProviderSessionDirectory, directoryOverride),
+        ).pipe(Layer.provide(baseDirectoryLayer));
   const serviceLayer = makeProviderServiceLive(serviceOptions).pipe(
     Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
     Layer.provide(directoryLayer),
@@ -899,6 +917,131 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("holds the session lifecycle lock until an approval response is committed", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-approval-interrupt-order");
+      yield* startTestSession(provider, threadId);
+      const responseEntered = yield* Deferred.make<void>();
+      const releaseResponse = yield* Deferred.make<void>();
+      routing.codex.respondToRequest.mockImplementationOnce(() =>
+        Deferred.succeed(responseEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseResponse)),
+        ),
+      );
+      routing.codex.interruptTurn.mockClear();
+
+      const response = yield* provider
+        .respondToRequest({
+          threadId,
+          requestId: asRequestId("req-approval-interrupt-order"),
+          decision: "accept",
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(responseEntered);
+      const interrupt = yield* provider
+        .interruptTurn({ threadId })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Effect.yieldNow;
+      assert.equal(routing.codex.interruptTurn.mock.calls.length, 0);
+
+      yield* Deferred.succeed(releaseResponse, undefined);
+      yield* Fiber.join(response);
+      yield* Fiber.join(interrupt);
+      assert.deepEqual(routing.codex.interruptTurn.mock.calls, [[threadId, undefined]]);
+    }),
+  );
+
+  it.effect("persists an invalidated adapter session as non-resumable", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-adapter-session-invalidated");
+      yield* startTestSession(provider, threadId, { driver: DROID_DRIVER });
+      const sessionLease = yield* getPersistedSessionLease(directory, threadId);
+      routing.droid.sendTurn.mockImplementationOnce((input) =>
+        routing.droid.adapter.stopSession(input.threadId).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapterSessionInvalidatedError({
+                provider: DROID_DRIVER,
+                threadId,
+                operation: "sendTurn",
+                cause: new Error("uncertain Droid mutation"),
+              }),
+            ),
+          ),
+        ),
+      );
+
+      const failure = yield* provider
+        .sendTurn({
+          threadId,
+          input: "invalidate this session",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.equal(failure._tag, "ProviderAdapterSessionInvalidatedError");
+
+      const persisted = expectSome(yield* runtimeRepository.getByThreadId({ threadId }));
+      assert.equal(persisted.status, "stopped");
+      assert.equal(persisted.sessionLease, null);
+      assert.equal(persisted.resumeCursor, null);
+      assert.deepInclude(persisted.runtimePayload, {
+        activeTurnId: null,
+        lastRuntimeEvent: "provider.session.invalidated",
+      });
+      assert.isFalse(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: droidInstanceId,
+          sessionLease,
+        }),
+      );
+    }),
+  );
+
+  it.effect("persists rollback session invalidation before returning the adapter error", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = asThreadId("thread-rollback-session-invalidated");
+      yield* startTestSession(provider, threadId, { driver: DROID_DRIVER });
+      routing.droid.rollbackThread.mockImplementationOnce((stoppedThreadId) =>
+        routing.droid.adapter.stopSession(stoppedThreadId).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ProviderAdapterSessionInvalidatedError({
+                provider: DROID_DRIVER,
+                threadId,
+                operation: "rollbackThread",
+                cause: new Error("uncertain Droid rewind load"),
+              }),
+            ),
+          ),
+        ),
+      );
+
+      const failure = yield* provider.withSessionLifecycleLock(
+        threadId,
+        provider
+          .rollbackConversation({
+            threadId,
+            turnIds: [],
+            anchorTurnId: asTurnId("turn-rollback-session-invalidated"),
+          })
+          .pipe(Effect.flip),
+      );
+      assert.equal(failure._tag, "ProviderAdapterSessionInvalidatedError");
+
+      const persisted = expectSome(yield* runtimeRepository.getByThreadId({ threadId }));
+      assert.equal(persisted.status, "stopped");
+      assert.equal(persisted.sessionLease, null);
+      assert.equal(persisted.resumeCursor, null);
+    }),
+  );
+
   it.effect("routes feedback to the Codex adapter and returns its feedback ID", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1262,6 +1405,28 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const persisted = expectSome(yield* directory.getBinding(threadId));
       assert.equal(persisted.providerInstanceId, codexInstanceId);
       assert.equal(persisted.sessionLease, originalLease);
+
+      const received: ProviderRuntimeEvent[] = [];
+      const subscriber = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        Effect.sync(() => received.push(event)),
+      ).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+      routing.codex.emitRaw({
+        type: "content.delta",
+        sessionLease: originalLease,
+        eventId: asEventId("evt-invalidated-durable-fallback"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-invalidated-durable-fallback"),
+        payload: {
+          streamKind: "assistant_text",
+          delta: "must stay dropped",
+        },
+      });
+      yield* advanceTestClock(50);
+      assert.isEmpty(received);
+      yield* Fiber.interrupt(subscriber);
     }),
   );
 
@@ -1789,6 +1954,54 @@ routing.layer("ProviderServiceLive routing", (it) => {
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
+
+it.effect("withholds a terminal event when its resume cursor cannot be persisted", () =>
+  Effect.gen(function* () {
+    const droid = makeFakeCodexAdapter(DROID_DRIVER);
+    const registry = makeAdapterRegistryMock({ [DROID_DRIVER]: droid.adapter });
+    const { fullLayer } = makeProviderLayers({
+      registry,
+      directoryOverride: (directory) => ({
+        ...directory,
+        updateResumeCursorIfOwned: () =>
+          Effect.fail(
+            new ProviderSessionDirectoryPersistenceError({
+              operation: "updateResumeCursorIfOwned",
+              detail: "simulated cursor persistence failure",
+            }),
+          ),
+      }),
+    });
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-cursor-persistence-failure");
+      yield* startTestSession(provider, threadId, { driver: DROID_DRIVER });
+      const received: ProviderRuntimeEvent[] = [];
+      const subscriber = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        Effect.sync(() => received.push(event)),
+      ).pipe(Effect.forkChild);
+      yield* advanceTestClock(50);
+
+      droid.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-persistence-failure"),
+        provider: DROID_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-cursor-persistence-failure"),
+        payload: {
+          state: "completed",
+          resumeCursor: { opaque: "must-not-publish" },
+        },
+      });
+      yield* advanceTestClock(50);
+
+      assert.isEmpty(received);
+      yield* Fiber.interrupt(subscriber);
+    }).pipe(Effect.provide(fullLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 const fanout = makeProviderServiceLayer();
 fanout.layer("ProviderServiceLive fanout", (it) => {

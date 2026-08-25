@@ -8,8 +8,8 @@ import * as NodeTimersPromises from "node:timers/promises";
 
 const scenarioNames = new Set(
   `default rpc-roundtrip permission permission-empty-options permission-unknown-options permission-accept-only park-hitl permission-flood permission-flood-retirement ask-user hang-turn hang-first-turn late-terminal interrupt-late-terminal-order usage-reset
-  exit-hitl interrupt-race fail-init fail-update-settings load-spec-mode-report steering-coalesced steering-separate exit-mid-turn unknown-notification omit-usage start-race spec-autonomy-handoff
-  spec-handoff late-spec-approval foreign-spec-envelope future-terminal-reason compaction child-session hanging-child-session
+  exit-hitl interrupt-race fail-init fail-update-settings hang-update-settings fail-add-user-message fail-interrupt load-spec-mode-report steering-coalesced steering-separate exit-mid-turn unknown-notification omit-usage start-race spec-autonomy-handoff
+  spec-handoff spec-successor-permission late-spec-approval foreign-spec-envelope future-terminal-reason compaction child-session hanging-child-session
   child-session-exit taskless-progress report-selected-model incomplete-items shared-tool-isolation`.split(
     /\s+/,
   ),
@@ -135,6 +135,8 @@ const pendingServerRequests = new Map<
   string,
   { readonly resolve: (result: unknown) => void; readonly reject: (error: Error) => void }
 >();
+let holdNativeServerResponses = false;
+const heldNativeServerResponses: Array<Record<string, unknown>> = [];
 
 if (currentScenario === "shared-tool-isolation") {
   if (!env.coordinationDir) {
@@ -376,6 +378,40 @@ async function runSpecScenario(turnId: string): Promise<boolean> {
     }
     return true;
   }
+  if (currentScenario === "spec-successor-permission") {
+    const handoff = await requestDecision(
+      permissionParams(tool, [
+        { label: "Implement", value: "proceed_new_session_high" },
+        { label: "Cancel", value: "cancel" },
+      ]),
+    );
+    if (handoff.selectedOption === "cancel") {
+      emitTurnCompleted("permission_rejected", turnId);
+      return true;
+    }
+    applyExitSpecModeOutcome(handoff.selectedOption);
+    const successorPermission = await requestDecision({
+      ...permissionParams(
+        execTool(`successor-permission-tool-${turnId}`, "echo successor", true),
+        decisionOptions,
+      ),
+      sessionId: sessions.successor,
+    });
+    if (successorPermission.selectedOption === "cancel") {
+      emitTurnCompleted("permission_rejected", turnId);
+      return true;
+    }
+    textDelta(
+      `assistant-successor-permission-${turnId}`,
+      "approved successor",
+      0,
+      sessions.successor,
+    );
+    textComplete(`assistant-successor-permission-${turnId}`, 0, sessions.successor);
+    emitTerminalForSession(sessions.successor, "completed", `successor-${turnId}`);
+    emitTurnCompleted("spec_handoff", turnId);
+    return true;
+  }
   if (currentScenario === "late-spec-approval" && turnSequence === 1) {
     tool.toolUse.id = `late-exit-spec-tool-${turnId}`;
     void requestDecision(
@@ -508,10 +544,13 @@ async function runPermissionFlow(turnId: string): Promise<boolean> {
       if (!env.coordinationDir) {
         throw new Error("permission-flood-retirement requires T3_DROID_MOCK_COORDINATION_DIR");
       }
-      input.pause();
-      void waitForFile(NodePath.join(env.coordinationDir, "release-native-responses")).then(() =>
-        input.resume(),
-      );
+      holdNativeServerResponses = true;
+      void waitForFile(NodePath.join(env.coordinationDir, "release-native-responses")).then(() => {
+        holdNativeServerResponses = false;
+        for (const response of heldNativeServerResponses.splice(0)) {
+          handleMessage(response);
+        }
+      });
     }
     await Promise.all(requests);
   }
@@ -629,6 +668,7 @@ async function runTurn(turnId: string): Promise<void> {
   if (
     currentScenario === "hang-turn" ||
     currentScenario === "interrupt-race" ||
+    currentScenario === "fail-interrupt" ||
     (currentScenario === "interrupt-late-terminal-order" && turnSequence <= 2) ||
     (currentScenario === "hang-first-turn" && turnSequence === 1)
   ) {
@@ -690,6 +730,10 @@ async function handleAddUserMessage(id: string, params: unknown): Promise<void> 
       NodePath.join(env.interruptOrderDir, "turn-started-before-interrupt"),
       "",
     );
+  }
+  if (currentScenario === "fail-add-user-message") {
+    fail(id, -32603, "Mock add_user_message failure");
+    return;
   }
   respond(id, {});
   if (sharedToolRole === "delayed" && activeTurn && !activeTurn.completed) {
@@ -769,6 +813,10 @@ function loadSession(id: string, params: unknown): void {
   });
 }
 async function interrupt(id: string): Promise<void> {
+  if (currentScenario === "fail-interrupt") {
+    fail(id, -32603, "Mock interrupt failure");
+    return;
+  }
   if (currentScenario === "interrupt-late-terminal-order") {
     if (!env.interruptOrderDir) {
       throw new Error("interrupt-late-terminal-order requires T3_DROID_MOCK_INTERRUPT_ORDER_DIR");
@@ -819,10 +867,17 @@ async function interrupt(id: string): Promise<void> {
   }
   respond(id, {});
 }
-function updateSettings(id: string, params: unknown): void {
+async function updateSettings(id: string, params: unknown): Promise<void> {
   if (currentScenario === "fail-update-settings") {
     fail(id, -32603, "Mock settings update failure");
     return;
+  }
+  if (currentScenario === "hang-update-settings") {
+    if (!env.coordinationDir) {
+      throw new Error("hang-update-settings requires T3_DROID_MOCK_COORDINATION_DIR");
+    }
+    await NodeFSP.writeFile(NodePath.join(env.coordinationDir, "settings-requested"), "");
+    await new Promise<void>(() => {});
   }
   if (env.settingsLogPath)
     NodeFS.appendFileSync(env.settingsLogPath, `${JSON.stringify(params)}\n`);
@@ -856,7 +911,7 @@ async function handleRequest(message: {
       await interrupt(message.id);
       return;
     case "droid.update_session_settings":
-      updateSettings(message.id, message.params);
+      await updateSettings(message.id, message.params);
       return;
     case "droid.list_models":
       respond(message.id, { models });
@@ -909,6 +964,10 @@ function handleMessage(raw: unknown): void {
     throw new Error("Mock peer received an invalid Factory JSON-RPC envelope");
   }
   if (message.type === "response" && typeof message.id === "string") {
+    if (holdNativeServerResponses) {
+      heldNativeServerResponses.push(message);
+      return;
+    }
     const hasResult = "result" in message;
     const hasError = "error" in message;
     if (hasResult === hasError)

@@ -128,7 +128,7 @@ export function reducePendingApprovals(
     }
   }
 
-  return [...openByRequestId.values()].toSorted((left, right) =>
-    left.createdAt.localeCompare(right.createdAt),
+  return [...openByRequestId.values()].toSorted(
+    (left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt),
   );
 }

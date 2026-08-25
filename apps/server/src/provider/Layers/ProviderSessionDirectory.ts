@@ -109,7 +109,7 @@ function toRuntimeBinding(
 
 const makeProviderSessionDirectory = Effect.gen(function* () {
   const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-  const ownershipByThread = yield* Ref.make(new Map<ThreadId, ProviderSessionOwnership>());
+  const ownershipByThread = yield* Ref.make(new Map<ThreadId, ProviderSessionOwnership | null>());
   const writeLocks = yield* makeKeyedLock<ThreadId>();
 
   // upsert reads the row, merges in process, and replaces the full row in a
@@ -127,7 +127,7 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
 
   const setOwnership = (
     threadId: ThreadId,
-    ownership: ProviderSessionOwnership | undefined,
+    ownership: ProviderSessionOwnership | null | undefined,
   ): Effect.Effect<void> =>
     Ref.update(ownershipByThread, (current) => {
       const next = new Map(current);
@@ -162,7 +162,15 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
               ),
             onSome: (value) =>
               toRuntimeBinding(value, "ProviderSessionDirectory.getBinding").pipe(
-                Effect.tap((binding) => setOwnership(threadId, ownershipFromBinding(binding))),
+                Effect.tap((binding) =>
+                  Ref.get(ownershipByThread).pipe(
+                    Effect.flatMap((current) =>
+                      current.has(threadId)
+                        ? Effect.void
+                        : setOwnership(threadId, ownershipFromBinding(binding)),
+                    ),
+                  ),
+                ),
                 Effect.map(Option.some),
               ),
           }),
@@ -275,13 +283,14 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
     );
 
   const invalidateOwnership: ProviderSessionDirectoryShape["invalidateOwnership"] = (threadId) =>
-    withThreadWriteLock(threadId, setOwnership(threadId, undefined));
+    withThreadWriteLock(threadId, setOwnership(threadId, null));
 
   const matchesOwnership: ProviderSessionDirectoryShape["matchesOwnership"] = (input) =>
     Ref.get(ownershipByThread).pipe(
       Effect.map((current) => {
         const ownership = current.get(input.threadId);
         return (
+          ownership !== null &&
           ownership?.providerInstanceId === input.providerInstanceId &&
           ownership.sessionLease === input.sessionLease
         );

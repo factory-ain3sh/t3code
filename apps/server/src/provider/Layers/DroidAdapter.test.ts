@@ -33,6 +33,7 @@ import {
   makeDroidAdapter,
   selectDroidPermissionOutcome,
 } from "./DroidAdapter.ts";
+import { DROID_SESSION_REQUEST_TIMEOUT_MS } from "../droid/DroidRpcClient.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -482,6 +483,42 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       }
       const restarted = yield* startDroidSession(adapter, threadId, "full-access");
       assert.equal(restarted.status, "ready");
+    }),
+  );
+
+  it.effect("rejects a session that reaches its thread lock after stopAll begins", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-start-after-stop-all");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-start-after-stop-all-")),
+      );
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "start-race",
+        T3_DROID_MOCK_START_RACE_DIR: coordinationDir,
+      });
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const heldTurn = yield* sendDroidTurn(adapter, threadId, "hold the thread lock").pipe(
+        Effect.forkChild,
+      );
+      yield* Effect.promise(() => waitForFile(NodePath.join(coordinationDir, "thread-lock-held")));
+      const start = yield* startDroidSession(adapter, threadId, "full-access").pipe(
+        Effect.result,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      const stopAll = yield* adapter.stopAll().pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-thread-lock"), ""),
+      );
+      yield* Fiber.join(heldTurn);
+      const startResult = yield* Fiber.join(start);
+      yield* Fiber.join(stopAll);
+      assert.equal(startResult._tag, "Failure");
+      if (startResult._tag === "Failure") {
+        assert.equal(startResult.failure._tag, "ProviderAdapterValidationError");
+      }
+      assert.isFalse(yield* adapter.hasSession(threadId));
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
 
@@ -1405,6 +1442,32 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("invalidates a session when loading a rewind fork fails", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-rollback-load-invalidation");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "fail-update-settings",
+      });
+      const { waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const turn = yield* sendDroidTurn(adapter, threadId, "turn before failed rewind load");
+      yield* waitForType(threadId, "turn.completed");
+
+      const result = yield* adapter
+        .rollbackThread(threadId, {
+          turnIds: [],
+          anchorTurnId: turn.turnId,
+        })
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "ProviderAdapterSessionInvalidatedError");
+      }
+      yield* waitForType(threadId, "session.exited");
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
   it.effect("drops a pre-rewind session straggler after re-anchoring on the fork", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-rewind-straggler");
@@ -1470,6 +1533,86 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     }),
   );
 
+  it.effect("invalidates a session when updating settings times out", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-settings-timeout-invalidation");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-settings-timeout-")),
+      );
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "hang-update-settings",
+        T3_DROID_MOCK_COORDINATION_DIR: coordinationDir,
+      });
+      const { waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const send = yield* sendDroidTurn(adapter, threadId, "time out the settings update", {
+        interactionMode: "plan",
+      }).pipe(Effect.result, Effect.forkChild);
+      yield* Effect.promise(() =>
+        waitForFile(NodePath.join(coordinationDir, "settings-requested")),
+      );
+      yield* advanceTestClock(DROID_SESSION_REQUEST_TIMEOUT_MS);
+      const result = yield* Fiber.join(send);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "ProviderAdapterSessionInvalidatedError");
+      }
+      yield* waitForType(threadId, "session.exited");
+      assert.isFalse(yield* adapter.hasSession(threadId));
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
+  );
+
+  it.effect("invalidates a session when add_user_message fails after dispatch", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-add-message-invalidation");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "fail-add-user-message",
+      });
+      const { events, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const result = yield* sendDroidTurn(adapter, threadId, "reject this message").pipe(
+        Effect.result,
+      );
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "ProviderAdapterSessionInvalidatedError");
+      }
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      yield* waitForType(threadId, "session.exited");
+      assert.equal(terminal.payload.state, "failed");
+      assert.lengthOf(eventsOfType(eventsForThread(events, threadId), "turn.completed"), 1);
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
+  it.effect("invalidates the session and releases waiters when interrupt RPC fails", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-interrupt-failure-invalidation");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "fail-interrupt",
+      });
+      const { waitFor, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const turn = yield* sendDroidTurn(adapter, threadId, "fail this interrupt");
+      yield* waitFor(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed" &&
+          event.payload.itemType === "assistant_message" &&
+          String(event.threadId) === String(threadId),
+      );
+      const result = yield* adapter.interruptTurn(threadId, turn.turnId).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "ProviderAdapterSessionInvalidatedError");
+      }
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      yield* waitForType(threadId, "session.exited");
+      assert.equal(terminal.payload.state, "cancelled");
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
+
   it.effect("adopts a spec-handoff successor after streaming it into the plan turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-spec-handoff");
@@ -1528,6 +1671,40 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         exitSpecModeSelectedOption: "proceed_new_session_high",
         resultingAutonomyLevel: "high",
       });
+    }),
+  );
+
+  it.effect("accepts a permission request from an approved spec successor", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-spec-successor-permission");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "spec-successor-permission",
+      });
+      const { events, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const turn = yield* sendDroidTurn(adapter, threadId, "approve the spec successor", {
+        interactionMode: "plan",
+      });
+      const planApproval = yield* waitForType(threadId, "request.opened");
+      assert.equal(planApproval.payload.requestType, "plan_approval");
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(planApproval.requestId)),
+        "accept",
+      );
+      const successorApproval = yield* waitForType(threadId, "request.opened", 2);
+      assert.equal(successorApproval.payload.requestType, "exec_command_approval");
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(String(successorApproval.requestId)),
+        "accept",
+      );
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      assert.equal(terminal.payload.state, "completed");
+      assert.include(
+        assistantText(eventsForTurn(events, threadId, turn.turnId)),
+        "approved successor",
+      );
     }),
   );
 

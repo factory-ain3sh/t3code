@@ -122,4 +122,19 @@ describe("reducePendingApprovals", () => {
       },
     ]);
   });
+
+  it("orders pending approvals by instant across timezone offsets", () => {
+    expect(
+      reducePendingApprovals([
+        activity("later", "approval.requested", "2026-01-01T00:30:00.000Z", {
+          requestId: "req-later",
+          requestKind: "command",
+        }),
+        activity("earlier", "approval.requested", "2026-01-01T01:00:00.000+02:00", {
+          requestId: "req-earlier",
+          requestKind: "command",
+        }),
+      ]).map(({ requestId }) => requestId),
+    ).toEqual(["req-earlier", "req-later"]);
+  });
 });

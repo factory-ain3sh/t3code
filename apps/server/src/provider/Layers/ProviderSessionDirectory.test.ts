@@ -633,6 +633,14 @@ it.effect("serializes a full-row upsert with ownership patches on the same threa
         activeTurnId: null,
         checkpointRevertIntent: { turnCount: 1 },
       });
+      assert.isFalse(
+        yield* directory.matchesOwnership({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-a"),
+        }),
+        "reading the persisted binding must not repopulate invalidated volatile ownership",
+      );
     }).pipe(Effect.scoped, Effect.provide(directoryLayer));
   }),
 );
