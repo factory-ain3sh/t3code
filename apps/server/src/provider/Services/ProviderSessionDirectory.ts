@@ -15,6 +15,15 @@ import type {
   ProviderValidationError,
 } from "../Errors.ts";
 
+/**
+ * Runtime-payload key holding the checkpoint reactor's persisted revert
+ * intent. Unlike the rest of the payload, which is scoped to one session
+ * incarnation, the intent is thread-durable recovery state: the directory
+ * carries it (re-stamped to the incoming lease) across owner and incarnation
+ * payload wipes, and only the reactor's explicit null write clears it.
+ */
+export const CHECKPOINT_REVERT_INTENT_KEY = "checkpointRevertIntent";
+
 export interface ProviderRuntimeBinding {
   readonly threadId: ThreadId;
   readonly provider: ProviderDriverKind;

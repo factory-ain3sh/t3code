@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectoryPersistenceError, ProviderValidationError } from "../Errors.ts";
 import {
+  CHECKPOINT_REVERT_INTENT_KEY,
   ProviderSessionDirectory,
   type ProviderRuntimeBinding,
   type ProviderRuntimeBindingWithMetadata,
@@ -55,6 +56,34 @@ function mergeRuntimePayload(
     return { ...existing, ...next };
   }
   return next;
+}
+
+// The checkpoint reactor's persisted revert intent is thread-durable recovery
+// state, not incarnation-scoped runtime state: locked recovery replaces the
+// session incarnation mid-revert, and wiping the intent with the outgoing
+// incarnation's payload would strand a rewound provider with no startup
+// replay. The intent survives the wipe re-stamped to the incoming lease (the
+// new incarnation inherits the revert obligation), and staleness stays with
+// the reactor's provider/instance guard, its turn-identity progress fence,
+// and adapter rollback validation. Only the reactor's explicit null write
+// clears the slot.
+function threadDurableRuntimePayload(
+  existing: unknown | null,
+  incomingLease: string | null | undefined,
+): Record<string, unknown> | null {
+  if (!isRecord(existing)) {
+    return null;
+  }
+  const intent = existing[CHECKPOINT_REVERT_INTENT_KEY];
+  if (!isRecord(intent)) {
+    return null;
+  }
+  return {
+    [CHECKPOINT_REVERT_INTENT_KEY]:
+      incomingLease === null || incomingLease === undefined
+        ? intent
+        : { ...intent, sessionLease: incomingLease },
+  };
 }
 
 function toRuntimeBinding(
@@ -161,7 +190,10 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
               : (existingRuntime?.resumeCursor ?? null),
         runtimePayload: mergeRuntimePayload(
           ownerChanged || sessionIncarnationChanged
-            ? null
+            ? threadDurableRuntimePayload(
+                existingRuntime?.runtimePayload ?? null,
+                binding.sessionLease,
+              )
             : (existingRuntime?.runtimePayload ?? null),
           binding.runtimePayload,
         ),

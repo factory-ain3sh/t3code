@@ -33,7 +33,10 @@ import {
 } from "../../checkpointing/Utils.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
-import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
+import {
+  CHECKPOINT_REVERT_INTENT_KEY,
+  ProviderSessionDirectory,
+} from "../../provider/Services/ProviderSessionDirectory.ts";
 import { CheckpointReactor, type CheckpointReactorShape } from "../Services/CheckpointReactor.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -89,7 +92,7 @@ function checkpointRevertIntentFromRuntimePayload(
     return Option.none();
   }
   return decodeCheckpointRevertIntent(
-    (runtimePayload as Record<string, unknown>).checkpointRevertIntent,
+    (runtimePayload as Record<string, unknown>)[CHECKPOINT_REVERT_INTENT_KEY],
   );
 }
 
@@ -750,7 +753,7 @@ const make = Effect.gen(function* () {
       threadId: intent.threadId,
       providerInstanceId: intent.providerInstanceId,
       sessionLease: intent.sessionLease,
-      runtimePayload: { checkpointRevertIntent: intent },
+      runtimePayload: { [CHECKPOINT_REVERT_INTENT_KEY]: intent },
     });
 
   // Keyed on the binding's CURRENT lease, not the intent's: session recovery
@@ -799,7 +802,7 @@ const make = Effect.gen(function* () {
               threadId: intent.threadId,
               providerInstanceId,
               sessionLease,
-              runtimePayload: { checkpointRevertIntent: null },
+              runtimePayload: { [CHECKPOINT_REVERT_INTENT_KEY]: null },
             }),
           ),
         );
@@ -831,7 +834,7 @@ const make = Effect.gen(function* () {
           ...(binding.providerInstanceId !== undefined
             ? { providerInstanceId: binding.providerInstanceId }
             : {}),
-          runtimePayload: { checkpointRevertIntent: null },
+          runtimePayload: { [CHECKPOINT_REVERT_INTENT_KEY]: null },
         });
       }
       yield* appendRevertFailureActivity({
@@ -857,11 +860,14 @@ const make = Effect.gen(function* () {
     );
     // A null lease is a stopped, unowned session: runStopAll nulls every
     // binding lease on graceful shutdown while the merged runtime payload
-    // keeps this intent, and locked recovery re-owns the session below. Only
-    // a different live lease means the session was replaced. The driver kind
-    // is compared too: an instance rebound to a different driver between
-    // persist and replay must not execute an intent minted against the old
-    // provider's turn history.
+    // keeps this intent, and locked recovery re-owns the session below. The
+    // directory re-stamps the persisted intent to the incoming lease at every
+    // incarnation transition (the same-thread successor inherits the revert
+    // obligation), so a mismatched live lease means the lease and payload
+    // were written out-of-band; discard rather than execute against a session
+    // the stamp never blessed. The driver kind is compared too: an instance
+    // rebound to a different driver between persist and replay must not
+    // execute an intent minted against the old provider's turn history.
     if (
       binding?.provider !== intent.provider ||
       binding.providerInstanceId !== intent.providerInstanceId ||

@@ -297,7 +297,7 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
     }),
   );
 
-  it.effect("does not inherit runtime payload across live session incarnations", () =>
+  it.effect("wipes incarnation payload on lease change but carries the revert intent", () =>
     Effect.gen(function* () {
       const directory = yield* ProviderSessionDirectory;
       const threadId = ThreadId.make("thread-incarnation-payload");
@@ -311,7 +311,8 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
         resumeCursor: { sessionId: "session-a" },
         runtimePayload: {
           cwd: "/tmp/project",
-          checkpointRevertIntent: { turnCount: 1 },
+          activeTurnId: "turn-live",
+          checkpointRevertIntent: { turnCount: 1, sessionLease: "lease-a" },
         },
       });
       yield* directory.upsert({
@@ -327,9 +328,43 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       assert.equal(binding.provider, "droid");
       assert.equal(binding.providerInstanceId, owner);
       assert.equal(binding.sessionLease, "lease-b");
-      // The resume cursor survives a lease change; the runtime payload does
-      // not merge across incarnations.
+      // The resume cursor survives a lease change and incarnation-scoped
+      // payload does not merge across incarnations, but the persisted revert
+      // intent is thread-durable recovery state: it survives the wipe
+      // re-stamped to the incoming lease, so the incarnation minted by locked
+      // recovery mid-revert inherits the revert obligation.
       assert.deepEqual(binding.resumeCursor, { sessionId: "session-a" });
+      assert.deepEqual(binding.runtimePayload, {
+        cwd: "/tmp/project",
+        checkpointRevertIntent: { turnCount: 1, sessionLease: "lease-b" },
+      });
+    }),
+  );
+
+  it.effect("drops a cleared revert intent with the outgoing incarnation's payload", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("thread-incarnation-cleared-intent");
+      const owner = ProviderInstanceId.make("droid-owner");
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: ProviderSessionLease.make("lease-a"),
+        threadId,
+        runtimePayload: { activeTurnId: "turn-live", checkpointRevertIntent: null },
+      });
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("droid"),
+        providerInstanceId: owner,
+        sessionLease: ProviderSessionLease.make("lease-b"),
+        threadId,
+        runtimePayload: { cwd: "/tmp/project" },
+      });
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      // A terminally cleared intent is an empty slot, not durable state; the
+      // incarnation wipe must not resurrect it.
       assert.deepEqual(binding.runtimePayload, { cwd: "/tmp/project" });
     }),
   );
