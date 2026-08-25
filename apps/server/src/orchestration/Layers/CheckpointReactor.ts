@@ -880,7 +880,7 @@ const make = Effect.gen(function* () {
           !staleRefs.has(checkpoint.checkpointRef),
       );
     if (progressed) {
-      yield* clearCheckpointRevertIntent(intent).pipe(Effect.catch(() => Effect.succeed(false)));
+      yield* clearCheckpointRevertIntent(intent).pipe(Effect.orElseSucceed(() => false));
       yield* appendRevertFailureActivity({
         threadId: intent.threadId,
         turnCount: intent.turnCount,
@@ -924,9 +924,7 @@ const make = Effect.gen(function* () {
             return Effect.failCause(cause);
           }
           return Effect.gen(function* () {
-            yield* clearCheckpointRevertIntent(intent).pipe(
-              Effect.catch(() => Effect.succeed(false)),
-            );
+            yield* clearCheckpointRevertIntent(intent).pipe(Effect.orElseSucceed(() => false));
             yield* appendRevertFailureActivity({
               threadId: intent.threadId,
               turnCount: intent.turnCount,
@@ -964,7 +962,7 @@ const make = Effect.gen(function* () {
         // rewound, so persist the rewound cursor with the clear and surface
         // the failure rather than retrying against a ref that will stay gone.
         yield* clearCheckpointRevertIntent(intent, snapshot.resumeCursor).pipe(
-          Effect.catch(() => Effect.succeed(false)),
+          Effect.orElseSucceed(() => false),
         );
         yield* appendRevertFailureActivity({
           threadId: intent.threadId,
