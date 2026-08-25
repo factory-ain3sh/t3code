@@ -8,21 +8,18 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("042_ProviderSessionRuntimeLease", (it) => {
-  it.effect("adds a nullable session lease to provider runtime ownership", () =>
+layer("042_ProjectionThreadLinkedPullRequest", (it) => {
+  it.effect("adds the linked pull request column", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
       yield* runMigrations({ toMigrationInclusive: 41 });
       yield* runMigrations({ toMigrationInclusive: 42 });
 
-      const columns = yield* sql<{ readonly name: string; readonly notnull: number }>`
-        PRAGMA table_info(provider_session_runtime)
+      const columns = yield* sql<{ readonly name: string }>`
+        PRAGMA table_info(projection_threads)
       `;
-      const sessionLease = columns.find((column) => column.name === "session_lease");
-
-      assert.equal(sessionLease?.name, "session_lease");
-      assert.equal(sessionLease?.notnull, 0);
+      assert.ok(columns.some((column) => column.name === "linked_pull_request_json"));
     }),
   );
 });
