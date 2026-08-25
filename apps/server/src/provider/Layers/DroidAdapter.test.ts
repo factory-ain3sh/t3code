@@ -8,6 +8,7 @@ import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -32,8 +33,9 @@ import {
   droidTokenUsageSnapshot,
   makeDroidAdapter,
   selectDroidPermissionOutcome,
+  settleDroidNativeServerResponse,
 } from "./DroidAdapter.ts";
-import { DROID_SESSION_REQUEST_TIMEOUT_MS } from "../droid/DroidRpcClient.ts";
+import { DROID_SESSION_REQUEST_TIMEOUT_MS, DroidRpcError } from "../droid/DroidRpcClient.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -70,6 +72,80 @@ it("derives Droid approval capabilities without escalating one-shot approval", (
   assert.isUndefined(selectDroidPermissionOutcome(options, "accept"));
   assert.equal(selectDroidPermissionOutcome(options, "acceptForSession"), "proceed_always");
 });
+
+it.effect("uses one timeout budget for native Droid server responses", () =>
+  Effect.gen(function* () {
+    const nativeResponse = yield* Deferred.make<void, DroidRpcError>();
+    const awaitResponse = yield* Deferred.await(nativeResponse).pipe(
+      Effect.result,
+      Effect.forkChild,
+    );
+    const settle = yield* settleDroidNativeServerResponse(
+      "droid.request_permission",
+      nativeResponse,
+      (respond) =>
+        Effect.sleep(Duration.millis(DROID_SESSION_REQUEST_TIMEOUT_MS + 1)).pipe(
+          Effect.andThen(
+            respond(Effect.sleep(Duration.millis(DROID_SESSION_REQUEST_TIMEOUT_MS - 1))),
+          ),
+        ),
+    ).pipe(Effect.result, Effect.forkChild);
+
+    yield* advanceTestClock(DROID_SESSION_REQUEST_TIMEOUT_MS + 1);
+    assert.isUndefined(awaitResponse.pollUnsafe());
+    yield* advanceTestClock(DROID_SESSION_REQUEST_TIMEOUT_MS - 1);
+
+    assert.equal((yield* Fiber.join(settle))._tag, "Success");
+    assert.equal((yield* Fiber.join(awaitResponse))._tag, "Success");
+  }),
+);
+
+it.effect("preserves native Droid server response timeouts", () =>
+  Effect.gen(function* () {
+    const nativeResponse = yield* Deferred.make<void, DroidRpcError>();
+    const settle = yield* settleDroidNativeServerResponse(
+      "droid.ask_user",
+      nativeResponse,
+      (respond) => respond(Effect.never),
+    ).pipe(Effect.result, Effect.forkChild);
+
+    yield* advanceTestClock(DROID_SESSION_REQUEST_TIMEOUT_MS);
+
+    const result = yield* Fiber.join(settle);
+    assert.equal(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      assert.equal(result.failure.kind, "timeout");
+      assert.equal(result.failure.method, "droid.ask_user");
+    }
+    const acknowledgement = yield* Deferred.await(nativeResponse).pipe(Effect.result);
+    assert.equal(acknowledgement._tag, "Failure");
+    if (acknowledgement._tag === "Failure") {
+      assert.equal(acknowledgement.failure.kind, "timeout");
+      assert.equal(acknowledgement.failure.method, "droid.ask_user");
+    }
+  }),
+);
+
+it.effect("settles native Droid acknowledgements when response preparation is interrupted", () =>
+  Effect.gen(function* () {
+    const nativeResponse = yield* Deferred.make<void, DroidRpcError>();
+    const settle = yield* settleDroidNativeServerResponse(
+      "droid.request_permission",
+      nativeResponse,
+      () => Effect.never,
+    ).pipe(Effect.forkChild);
+
+    yield* Effect.yieldNow;
+    yield* Fiber.interrupt(settle);
+
+    const acknowledgement = yield* Deferred.await(nativeResponse).pipe(Effect.result);
+    assert.equal(acknowledgement._tag, "Failure");
+    if (acknowledgement._tag === "Failure") {
+      assert.equal(acknowledgement.failure.kind, "write");
+      assert.equal(acknowledgement.failure.method, "droid.request_permission");
+    }
+  }),
+);
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
