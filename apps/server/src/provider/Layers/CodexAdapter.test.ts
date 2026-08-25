@@ -409,7 +409,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }),
   );
 
-  it.effect("rejects an absolute rollback target from a different Codex history", () =>
+  it.effect("rejects an absolute rollback target outside the current Codex history", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
       const threadId = asThreadId("thread-rollback-mismatch");
@@ -420,29 +420,29 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       });
       const runtime = sessionRuntimeFactory.lastRuntime;
       NodeAssert.ok(runtime);
+      const firstTurn = { id: asTurnId("turn-1"), items: [] };
       runtime.readThreadImpl.mockResolvedValue({
         threadId: "provider-thread-1",
-        turns: [
-          { id: asTurnId("turn-1"), items: [] },
-          { id: asTurnId("turn-2"), items: [] },
-        ],
+        turns: [firstTurn, { id: asTurnId("turn-2"), items: [] }],
       });
       runtime.rollbackThreadImpl.mockClear();
       const rollbackThread = adapter.rollbackThread;
       NodeAssert.ok(rollbackThread);
 
-      const result = yield* rollbackThread(threadId, {
-        turnIds: [asTurnId("foreign-turn")],
-      }).pipe(Effect.result);
-
-      NodeAssert.equal(result._tag, "Failure");
-      if (result._tag === "Failure") {
-        NodeAssert.equal(result.failure._tag, "ProviderAdapterValidationError");
-        if (result.failure._tag === "ProviderAdapterValidationError") {
-          NodeAssert.equal(
-            result.failure.issue,
-            "Rollback target does not match the current thread history.",
-          );
+      for (const target of [
+        { turnIds: [asTurnId("foreign-turn")] },
+        { turnIds: [firstTurn.id], anchorTurnId: asTurnId("foreign-anchor") },
+      ]) {
+        const result = yield* rollbackThread(threadId, target).pipe(Effect.result);
+        NodeAssert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          NodeAssert.equal(result.failure._tag, "ProviderAdapterValidationError");
+          if (result.failure._tag === "ProviderAdapterValidationError") {
+            NodeAssert.equal(
+              result.failure.issue,
+              "Rollback target does not match the current thread history.",
+            );
+          }
         }
       }
       NodeAssert.equal(runtime.rollbackThreadImpl.mock.calls.length, 0);

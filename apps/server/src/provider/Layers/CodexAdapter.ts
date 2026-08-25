@@ -59,7 +59,7 @@ import {
   makeRequireActiveProviderSession,
   type ProviderAdapterSession,
   type ProviderThreadRollbackTarget,
-  rollbackTargetMatchesTurnPrefix,
+  rollbackTargetMatchesKnownHistory,
 } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -101,7 +101,7 @@ const validateCodexRollbackSnapshot = Effect.fn("validateCodexRollbackSnapshot")
       issue: `Cannot roll back to ${target.turnIds.length} turns from ${snapshot.turns.length}.`,
     });
   }
-  if (!rollbackTargetMatchesTurnPrefix(snapshot.turns, target)) {
+  if (!rollbackTargetMatchesKnownHistory(snapshot.turns, target)) {
     return yield* new ProviderAdapterValidationError({
       provider: PROVIDER,
       operation: "rollbackThread",

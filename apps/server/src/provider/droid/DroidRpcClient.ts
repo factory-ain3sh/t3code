@@ -251,25 +251,27 @@ export const makeDroidRpcClient = (
     );
 
     const exits = Deferred.await(exitDeferred);
-    const shutdown = protocol.beginShutdown().pipe(
-      Effect.flatMap((transitioned) =>
-        transitioned
-          ? protocol.closeOutgoing.pipe(
-              Effect.andThen(
-                Effect.raceFirst(
-                  exits.pipe(Effect.as(true)),
-                  Effect.sleep(gracefulShutdownTimeout).pipe(Effect.as(false)),
+    const shutdown = Effect.uninterruptible(
+      protocol.beginShutdown().pipe(
+        Effect.flatMap((transitioned) =>
+          transitioned
+            ? protocol.closeOutgoing.pipe(
+                Effect.andThen(
+                  Effect.raceFirst(
+                    exits.pipe(Effect.as(true)),
+                    Effect.sleep(gracefulShutdownTimeout).pipe(Effect.as(false)),
+                  ),
                 ),
-              ),
-              Effect.flatMap((exited) =>
-                exited
-                  ? Effect.void
-                  : child
-                      .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.seconds(2) })
-                      .pipe(Effect.ignore),
-              ),
-            )
-          : Effect.void,
+                Effect.flatMap((exited) =>
+                  exited
+                    ? Effect.void
+                    : child
+                        .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.seconds(2) })
+                        .pipe(Effect.ignore),
+                ),
+              )
+            : Effect.void,
+        ),
       ),
     );
 

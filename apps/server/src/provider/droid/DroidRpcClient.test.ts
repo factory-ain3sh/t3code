@@ -244,6 +244,57 @@ describe("DroidRpcClient", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
   );
 
+  it.effect("finishes process teardown when shutdown is interrupted", () => {
+    let processId: number | undefined;
+    return Effect.gen(function* () {
+      const client = yield* makeDroidRpcClient({
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            'let buffer = "";',
+            'process.stdin.setEncoding("utf8");',
+            'process.stdin.on("data", (chunk) => {',
+            "  buffer += chunk;",
+            '  const newline = buffer.indexOf("\\n");',
+            "  if (newline < 0) return;",
+            "  const request = JSON.parse(buffer.slice(0, newline));",
+            "  process.stdout.write(`${JSON.stringify({",
+            "    jsonrpc: request.jsonrpc,",
+            "    factoryApiVersion: request.factoryApiVersion,",
+            "    factoryProtocolVersion: request.factoryProtocolVersion,",
+            '    type: "response",',
+            "    id: request.id,",
+            "    result: { pid: process.pid },",
+            "  })}\\n`);",
+            "});",
+            "setInterval(() => {}, 1_000);",
+          ].join("\n"),
+        ],
+      });
+      const ready = (yield* client.request("droid.ready", {})) as { readonly pid: number };
+      processId = ready.pid;
+      const shutdownFiber = yield* client.shutdown.pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Effect.yieldNow;
+      yield* within(Fiber.interrupt(shutdownFiber), "interrupted shutdown did not finish teardown");
+      yield* within(client.exits, "interrupted shutdown did not publish process exit");
+      assert.isFalse(isProcessAlive(processId));
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (processId !== undefined && isProcessAlive(processId)) {
+            process.kill(processId, "SIGKILL");
+          }
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      TestClock.withLive,
+    );
+  });
+
   it.effect("bounds stderr diagnostics", () => {
     const logs: string[] = [];
     const logger = Logger.make(({ message }) => {
