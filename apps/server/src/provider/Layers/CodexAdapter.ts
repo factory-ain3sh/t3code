@@ -28,6 +28,7 @@ import {
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as Crypto from "effect/Crypto";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -82,6 +83,12 @@ const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
 const isCodexResumeCursorSchema = Schema.is(CodexResumeCursorSchema);
 
 const PROVIDER = ProviderDriverKind.make("codex");
+
+type UnleasedProviderRuntimeEvent = ProviderRuntimeEvent extends infer Event
+  ? Event extends ProviderRuntimeEvent
+    ? Omit<Event, "sessionLease">
+    : never
+  : never;
 
 const validateCodexRollbackSnapshot = Effect.fn("validateCodexRollbackSnapshot")(function* (
   snapshot: CodexThreadSnapshot,
@@ -476,7 +483,7 @@ function providerRefsFromEvent(
 function runtimeEventBase(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
-): Omit<ProviderRuntimeEvent, "type" | "payload"> {
+): Omit<UnleasedProviderRuntimeEvent, "type" | "payload"> {
   const refs = providerRefsFromEvent(event);
   return {
     eventId: event.id,
@@ -499,7 +506,7 @@ function mapItemLifecycle(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
   lifecycle: "item.started" | "item.updated" | "item.completed",
-): ProviderRuntimeEvent | undefined {
+): UnleasedProviderRuntimeEvent | undefined {
   const payload =
     readPayload(EffectCodexSchema.V2ItemStartedNotification, event.payload) ??
     readPayload(EffectCodexSchema.V2ItemCompletedNotification, event.payload);
@@ -546,7 +553,7 @@ function mapItemLifecycle(
 function mapCollabAgentEvent(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
-): ReadonlyArray<ProviderRuntimeEvent> {
+): ReadonlyArray<UnleasedProviderRuntimeEvent> {
   const payload =
     typeof event.payload === "object" && event.payload !== null
       ? (event.payload as Record<string, unknown>)
@@ -796,7 +803,7 @@ function mapCollabAgentEvent(
 function mapToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
-): ReadonlyArray<ProviderRuntimeEvent> {
+): ReadonlyArray<UnleasedProviderRuntimeEvent> {
   if (event.kind === "notification" && event.method.startsWith("collabAgent/")) {
     return mapCollabAgentEvent(event, canonicalThreadId);
   }
@@ -1868,7 +1875,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
     return {
       type: "image" as const,
-      url: `data:${attachment.mimeType};base64,${Buffer.from(bytes).toString("base64")}`,
+      url: `data:${attachment.mimeType};base64,${Encoding.encodeBase64(bytes)}`,
     };
   });
 
@@ -2067,6 +2074,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      conversationRollback: "supported",
     },
     startSession,
     sendTurn,

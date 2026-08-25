@@ -110,6 +110,7 @@ describe("ProcessDiagnostics", () => {
       expect(diagnostics.processes[0]?.startTimeMs).toBe(2_000);
       expect(diagnostics.processes[0]?.cpuPercent).toBe(1.5);
       expect(diagnostics.processes[0]?.rssBytes).toBe(2_048);
+      expect(diagnostics.processes[0]?.category).toBe("server-child");
     }),
   );
 

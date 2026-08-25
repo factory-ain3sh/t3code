@@ -51,6 +51,7 @@ import {
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "../providerMaintenance.ts";
 import {
+  haveProviderSnapshotEnrichmentSettingsChanged,
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
@@ -157,6 +158,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
+        haveEnrichmentSettingsChanged: haveProviderSnapshotEnrichmentSettingsChanged,
         initialSnapshot: (settings) =>
           makePendingCodexProvider(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,

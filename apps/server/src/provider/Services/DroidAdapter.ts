@@ -13,4 +13,8 @@ import type { ProviderAdapterShape } from "./ProviderAdapter.ts";
 /**
  * DroidAdapterShape — per-instance Droid adapter contract.
  */
-export interface DroidAdapterShape extends ProviderAdapterShape<ProviderAdapterError> {}
+export interface DroidAdapterShape extends ProviderAdapterShape<ProviderAdapterError> {
+  readonly rollbackThread: NonNullable<
+    ProviderAdapterShape<ProviderAdapterError>["rollbackThread"]
+  >;
+}

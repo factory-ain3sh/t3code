@@ -1,14 +1,13 @@
 import {
   approvalRequestKindFromPayload,
-  approvalOptionsFromPayload,
+  reducePendingApprovals,
+  type PendingProviderApproval,
 } from "@t3tools/client-runtime/approvalRequests";
 import { ApprovalRequestId, isToolLifecycleItemType } from "@t3tools/contracts";
 import type {
   OrchestrationLatestTurn,
   OrchestrationThread,
   OrchestrationThreadActivity,
-  ProviderApprovalOption,
-  ProviderRequestKind,
   ToolLifecycleItemType,
   TurnId,
   UserInputQuestion,
@@ -18,14 +17,7 @@ import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 import * as Arr from "effect/Array";
 import * as Order from "effect/Order";
 
-export interface PendingApproval {
-  readonly requestId: ApprovalRequestId;
-  readonly requestKind: ProviderRequestKind;
-  readonly createdAt: string;
-  readonly detail?: string;
-  readonly appName?: string;
-  readonly options?: ReadonlyArray<ProviderApprovalOption>;
-}
+export type PendingApproval = PendingProviderApproval;
 
 export interface PendingUserInput {
   readonly requestId: ApprovalRequestId;
@@ -1353,46 +1345,7 @@ export function sortThreadActivities(
 export function derivePendingApprovals(
   sortedActivities: ReadonlyArray<OrchestrationThreadActivity>,
 ): PendingApproval[] {
-  const openByRequestId = new Map<ApprovalRequestId, PendingApproval>();
-
-  for (const activity of sortedActivities) {
-    const payload =
-      activity.payload && typeof activity.payload === "object"
-        ? (activity.payload as Record<string, unknown>)
-        : null;
-    const requestId = parseApprovalRequestId(payload?.requestId);
-    const requestKind = approvalRequestKindFromPayload(payload);
-    const detail = typeof payload?.detail === "string" ? payload.detail : undefined;
-    const appName = typeof payload?.appName === "string" ? payload.appName : undefined;
-    const options = approvalOptionsFromPayload(payload);
-
-    if (activity.kind === "approval.requested" && requestId && requestKind) {
-      openByRequestId.set(requestId, {
-        requestId,
-        requestKind,
-        createdAt: activity.createdAt,
-        ...(detail ? { detail } : {}),
-        ...(appName ? { appName } : {}),
-        ...(options ? { options } : {}),
-      });
-      continue;
-    }
-
-    if (activity.kind === "approval.resolved" && requestId) {
-      openByRequestId.delete(requestId);
-      continue;
-    }
-
-    if (
-      activity.kind === "provider.approval.respond.failed" &&
-      requestId &&
-      isStalePendingRequestFailureDetail(detail)
-    ) {
-      openByRequestId.delete(requestId);
-    }
-  }
-
-  return Arr.sortWith([...openByRequestId.values()], (s) => new Date(s.createdAt), Order.Date);
+  return reducePendingApprovals(sortedActivities);
 }
 
 export function derivePendingUserInputs(

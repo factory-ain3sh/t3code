@@ -35,6 +35,7 @@ import {
 } from "./DroidAdapter.ts";
 
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
+const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeDroidPermissionResponse = Schema.decodeSync(
   Schema.fromJsonString(
     Schema.Struct({
@@ -43,6 +44,14 @@ const decodeDroidPermissionResponse = Schema.decodeSync(
     }),
   ),
 );
+const permissionResponseCases = [
+  { label: "accept", decision: "accept" },
+  { label: "decline", decision: "decline" },
+] as const;
+const userInputResponseCases = [
+  { label: "workspace", answers: { "1": "workspace" } },
+  { label: "session", answers: { "1": "session" } },
+] as const;
 
 it("derives Droid approval capabilities without escalating one-shot approval", () => {
   const options = [
@@ -63,8 +72,6 @@ it("derives Droid approval capabilities without escalating one-shot approval", (
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/droid-mock-agent.ts");
-const mockAgentCommand = process.execPath;
-const mockAgentExec = `exec ${JSON.stringify(mockAgentCommand)} ${JSON.stringify(mockAgentPath)} "$@"`;
 
 const droidAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-droid-adapter-test-",
@@ -72,59 +79,124 @@ const droidAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
 
 type DroidTestAdapter = Effect.Success<ReturnType<typeof makeDroidAdapter>>;
 type DroidAdapterOptions = NonNullable<Parameters<typeof makeDroidAdapter>[1]>;
-type DroidDebugStateReader = Parameters<
-  NonNullable<DroidAdapterOptions["registerDebugStateReader"]>
->[0];
 type DroidStartSessionInput = Parameters<DroidTestAdapter["startSession"]>[0];
+type DroidSendTurnInput = Parameters<DroidTestAdapter["sendTurn"]>[0];
 
 const makeDroidScenario = (
-  mockEnv?: Record<string, string>,
-  adapterOptions?: Omit<DroidAdapterOptions, "registerDebugStateReader">,
+  mockEnv: Record<string, string> = {},
+  adapterOptions?: DroidAdapterOptions,
 ) =>
   Effect.gen(function* () {
-    const dir = yield* Effect.promise(() =>
-      NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-jsonrpc-mock-")),
-    );
-    const wrapperPath = NodePath.join(dir, "fake-droid.sh");
-    const envExports = Object.entries(mockEnv ?? {})
-      .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
-      .join("\n");
-    const script = `#!/bin/sh
-${envExports}
-${mockAgentExec}
-`;
-    yield* Effect.promise(() => NodeFSP.writeFile(wrapperPath, script, "utf8"));
-    yield* Effect.promise(() => NodeFSP.chmod(wrapperPath, 0o755));
-
-    let debugStateReader: DroidDebugStateReader = () =>
-      Effect.die("Droid debug state reader was not registered");
-    const adapter = yield* makeDroidAdapter(decodeDroidSettings({ binaryPath: wrapperPath }), {
+    const adapter = yield* makeDroidAdapter(decodeDroidSettings({ binaryPath: mockAgentPath }), {
       ...adapterOptions,
-      registerDebugStateReader: (read) => {
-        debugStateReader = read;
+      environment: {
+        ...adapterOptions?.environment,
+        ...mockEnv,
+        T3_DROID_MOCK_SCENARIO: mockEnv.T3_DROID_MOCK_SCENARIO ?? "default",
       },
     }).pipe(Effect.orDie);
 
-    return {
-      adapter,
-      readDebugState: (threadId: ThreadId) => debugStateReader(threadId),
-    };
+    return { adapter };
   });
 
 const startDroidSession = (
   adapter: DroidTestAdapter,
   threadId: ThreadId,
   runtimeMode: DroidStartSessionInput["runtimeMode"],
+  options: Omit<DroidStartSessionInput, "threadId" | "provider" | "cwd" | "runtimeMode"> = {},
 ) =>
   adapter.startSession({
     threadId,
     provider: ProviderDriverKind.make("droid"),
     cwd: process.cwd(),
     runtimeMode,
+    ...options,
   });
+
+const sendDroidTurn = (
+  adapter: DroidTestAdapter,
+  threadId: ThreadId,
+  input: string,
+  options: Omit<DroidSendTurnInput, "threadId" | "input" | "attachments"> = {},
+) => adapter.sendTurn({ threadId, input, attachments: [], ...options });
 
 const eventsForThread = (events: ReadonlyArray<ProviderRuntimeEvent>, threadId: ThreadId) =>
   events.filter((event) => String(event.threadId) === String(threadId));
+
+const eventsForTurn = (
+  events: ReadonlyArray<ProviderRuntimeEvent>,
+  threadId: ThreadId,
+  turnId: TurnId,
+) =>
+  eventsForThread(events, threadId).filter(
+    (event) => event.turnId !== undefined && String(event.turnId) === String(turnId),
+  );
+
+const eventsOfType = <Type extends ProviderRuntimeEvent["type"]>(
+  events: ReadonlyArray<ProviderRuntimeEvent>,
+  type: Type,
+) =>
+  events.filter(
+    (event): event is Extract<ProviderRuntimeEvent, { type: Type }> => event.type === type,
+  );
+
+const assistantText = (events: ReadonlyArray<ProviderRuntimeEvent>) =>
+  eventsOfType(events, "content.delta")
+    .filter((event) => event.payload.streamKind === "assistant_text")
+    .map((event) => event.payload.delta)
+    .join("");
+
+const assertSingleTerminal = (
+  events: ReadonlyArray<ProviderRuntimeEvent>,
+  threadId: ThreadId,
+  turnId: TurnId,
+) => assert.lengthOf(eventsOfType(eventsForTurn(events, threadId, turnId), "turn.completed"), 1);
+
+const collectDroidEvents = (adapter: DroidTestAdapter) =>
+  Effect.gen(function* () {
+    const events: ProviderRuntimeEvent[] = [];
+    const waiters: Array<{
+      readonly predicate: (event: ProviderRuntimeEvent) => boolean;
+      readonly occurrence: number;
+      readonly deferred: Deferred.Deferred<ProviderRuntimeEvent>;
+    }> = [];
+    yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      Effect.sync(() => {
+        events.push(event);
+        for (const waiter of waiters) {
+          const matches = events.filter(waiter.predicate);
+          if (matches.length >= waiter.occurrence) {
+            Deferred.doneUnsafe(waiter.deferred, Effect.succeed(matches[waiter.occurrence - 1]!));
+          }
+        }
+      }),
+    ).pipe(Effect.forkScoped);
+
+    const waitFor = <Event extends ProviderRuntimeEvent>(
+      predicate: (event: ProviderRuntimeEvent) => event is Event,
+      occurrence = 1,
+    ): Effect.Effect<Event> =>
+      Effect.suspend(() => {
+        const existing = events.filter(predicate)[occurrence - 1];
+        if (existing !== undefined) return Effect.succeed(existing);
+        const deferred = Deferred.makeUnsafe<ProviderRuntimeEvent>();
+        waiters.push({ predicate, occurrence, deferred });
+        return Deferred.await(deferred) as Effect.Effect<Event>;
+      });
+
+    const waitForType = <Type extends ProviderRuntimeEvent["type"]>(
+      threadId: ThreadId,
+      type: Type,
+      occurrence = 1,
+    ) =>
+      waitFor(
+        (event): event is Extract<ProviderRuntimeEvent, { type: Type }> =>
+          event.type === type && String(event.threadId) === String(threadId),
+        occurrence,
+      );
+
+    return { events, waitFor, waitForType };
+  });
 
 const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
@@ -194,52 +266,27 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-turn-lifecycle");
       const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      const session = yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      const session = yield* startDroidSession(adapter, threadId, "full-access", {
         modelSelection: {
           instanceId: ProviderInstanceId.make("droid"),
           model: "mock-deep",
           options: [{ id: "reasoningEffort", value: "high" }],
         },
       });
-
       assert.equal(session.provider, "droid");
       assert.equal(session.model, "mock-deep");
       assert.deepStrictEqual(session.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-1",
         turnIds: [],
       });
-
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "hello droid",
-        attachments: [],
-      });
-      const terminal = yield* Deferred.await(turnCompleted);
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "hello droid");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const threadEvents = eventsForThread(runtimeEvents, threadId);
       const turnEvents = threadEvents.filter(
         (event) => event.turnId !== undefined && String(event.turnId) === String(sentTurn.turnId),
       );
-
       assert.deepEqual(
         turnEvents.map((event) => event.type),
         [
@@ -278,12 +325,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "completed");
       assert.equal(terminal.sessionLease, session.sessionLease);
-      assert.isTrue(
-        turnEvents
-          .filter((event) => event.type !== "turn.started" && event.type !== "turn.completed")
-          .every((event) => event.sessionLease === undefined),
-      );
-
+      assert.isTrue(turnEvents.every((event) => event.sessionLease === session.sessionLease));
       const usage = threadEvents.find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
           event.type === "thread.token-usage.updated",
@@ -309,61 +351,34 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         threadEvents.findIndex((event) => event === usage) <
           threadEvents.findIndex((event) => event === terminal),
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("emits terminal usage when no usage notification arrived", () =>
     Effect.gen(function* () {
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION: "1" });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "omit-usage" });
       const threadId = ThreadId.make("droid-usage-terminal-fallback");
-      const turnCompleted = yield* Deferred.make<void>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({ threadId, input: "fallback usage", attachments: [] });
-      yield* Deferred.await(turnCompleted);
-
+      yield* sendDroidTurn(adapter, threadId, "fallback usage");
+      yield* waitForType(threadId, "turn.completed");
       assert.lengthOf(
         eventsForThread(runtimeEvents, threadId).filter(
           (event) => event.type === "thread.token-usage.updated",
         ),
         1,
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
-  it.effect("reaps thread locks after session teardown and failed startup", () =>
+  it.effect("restarts the same Droid thread after session teardown", () =>
     Effect.gen(function* () {
-      const { adapter, readDebugState } = yield* makeDroidScenario();
-      const { adapter: failingAdapter, readDebugState: readFailingDebugState } =
-        yield* makeDroidScenario({ T3_DROID_MOCK_FAIL_INIT: "1" });
+      const { adapter } = yield* makeDroidScenario();
       const threadId = ThreadId.make("droid-thread-lock-reaped");
-      const failedThreadId = ThreadId.make("droid-failed-thread-lock-reaped");
-
       yield* startDroidSession(adapter, threadId, "full-access");
-      assert.equal((yield* readDebugState(threadId)).threadLockCount, 1);
       yield* adapter.stopSession(threadId);
-      assert.equal((yield* readDebugState(threadId)).threadLockCount, 0);
-
-      yield* Effect.flip(startDroidSession(failingAdapter, failedThreadId, "full-access"));
-      assert.equal((yield* readFailingDebugState(failedThreadId)).threadLockCount, 0);
+      const replacement = yield* startDroidSession(adapter, threadId, "full-access");
+      assert.equal(replacement.status, "ready");
     }),
   );
 
@@ -373,27 +388,16 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const coordinationDir = yield* Effect.promise(() =>
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-start-race-")),
       );
-      const { adapter, readDebugState } = yield* makeDroidScenario({
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "start-race",
         T3_DROID_MOCK_START_RACE_DIR: coordinationDir,
       });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-
-      const heldTurn = yield* adapter
-        .sendTurn({
-          threadId,
-          input: "mock hold thread lock",
-          attachments: [],
-        })
-        .pipe(Effect.forkChild);
+      const heldTurn = yield* sendDroidTurn(adapter, threadId, "mock hold thread lock").pipe(
+        Effect.forkChild,
+      );
       yield* Effect.promise(() => waitForFile(NodePath.join(coordinationDir, "thread-lock-held")));
-
       const invalidStart = yield* adapter
         .startSession({
           threadId,
@@ -405,9 +409,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const replacementStart = yield* startDroidSession(adapter, threadId, "full-access").pipe(
         Effect.forkChild,
       );
-
-      yield* Effect.yieldNow;
-      assert.equal((yield* readDebugState(threadId)).threadLockReferenceCount, 3);
       yield* Effect.promise(() =>
         NodeFSP.writeFile(NodePath.join(coordinationDir, "release-thread-lock"), ""),
       );
@@ -416,10 +417,14 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       yield* Effect.promise(() =>
         waitForFile(NodePath.join(coordinationDir, "replacement-init-started")),
       );
-
       const stopAllCompleted = yield* Deferred.make<void>();
-      const stopAllFiber = yield* adapter.stopAll().pipe(
+      const firstStopAllFiber = yield* adapter.stopAll().pipe(
         Effect.tap(() => Deferred.succeed(stopAllCompleted, undefined)),
+        Effect.forkChild,
+      );
+      const overlappingStopAllCompleted = yield* Deferred.make<void>();
+      const overlappingStopAllFiber = yield* adapter.stopAll().pipe(
+        Effect.tap(() => Deferred.succeed(overlappingStopAllCompleted, undefined)),
         Effect.forkChild,
       );
       yield* Effect.yieldNow;
@@ -427,14 +432,17 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         yield* Deferred.isDone(stopAllCompleted),
         "stopAll returned while a same-thread start was still initializing",
       );
-
+      assert.isFalse(
+        yield* Deferred.isDone(overlappingStopAllCompleted),
+        "an overlapping stopAll must share the active sweep instead of reopening the start gate",
+      );
       yield* Effect.promise(() =>
         NodeFSP.writeFile(NodePath.join(coordinationDir, "release-replacement-init"), ""),
       );
       yield* Fiber.join(replacementStart);
-      yield* Fiber.join(stopAllFiber);
+      yield* Fiber.join(firstStopAllFiber);
+      yield* Fiber.join(overlappingStopAllFiber);
       const sentTurn = yield* Fiber.join(heldTurn);
-
       assert.isFalse(yield* adapter.hasSession(threadId));
       const threadEvents = eventsForThread(runtimeEvents, threadId);
       assert.lengthOf(
@@ -456,7 +464,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           ),
         "the queued start/stop race must not settle a replacement turn",
       );
-
       const processFiles = yield* Effect.promise(() => NodeFSP.readdir(coordinationDir));
       const processIds = processFiles
         .filter((file) => file.startsWith("pid-"))
@@ -473,37 +480,21 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           `Droid process ${processId} is still running after stopAll`,
         );
       }
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
+      const restarted = yield* startDroidSession(adapter, threadId, "full-access");
+      assert.equal(restarted.status, "ready");
     }),
   );
 
   it.effect("closes incomplete streamed and tool items before terminal settlement", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-incomplete-items");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock incomplete items",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "incomplete-items",
       });
-      const terminal = yield* Deferred.await(turnCompleted);
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock incomplete items");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const turnEvents = eventsForThread(runtimeEvents, threadId).filter(
         (event) => event.turnId !== undefined && String(event.turnId) === String(sentTurn.turnId),
       );
@@ -516,7 +507,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
           event.type === "item.completed",
       );
-
       assert.deepEqual(
         started.map((event) => [String(event.itemId), event.payload.itemType]),
         [
@@ -534,9 +524,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           (event) => turnEvents.findIndex((candidate) => candidate === event) < terminalIndex,
         ),
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -544,100 +531,44 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const firstThreadId = ThreadId.make("droid-shared-tool-first");
       const secondThreadId = ThreadId.make("droid-shared-tool-second");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const firstToolStarted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
-      const firstTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const secondTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "item.started" &&
-              String(event.threadId) === String(firstThreadId) &&
-              String(event.itemId) === "shared-tool-use"
-              ? Deferred.succeed(firstToolStarted, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(firstThreadId)
-                ? Deferred.succeed(firstTurnCompleted, event).pipe(Effect.asVoid)
-                : event.type === "turn.completed" &&
-                    String(event.threadId) === String(secondThreadId)
-                  ? Deferred.succeed(secondTurnCompleted, event).pipe(Effect.asVoid)
-                  : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-shared-tool-")),
+      );
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "shared-tool-isolation",
+        T3_DROID_MOCK_COORDINATION_DIR: coordinationDir,
+      });
+      const { events: runtimeEvents, waitFor, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, firstThreadId, "full-access");
       yield* startDroidSession(adapter, secondThreadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId: firstThreadId,
-        input: "mock delayed shared tool",
-        attachments: [],
-      });
-      yield* Deferred.await(firstToolStarted);
-
-      yield* adapter.sendTurn({
-        threadId: secondThreadId,
-        input: "mock shared tool execute",
-        attachments: [],
-      });
-      yield* Deferred.await(secondTurnCompleted);
-
-      yield* adapter.sendTurn({
-        threadId: firstThreadId,
-        input: "mock release shared tool",
-        attachments: [],
-      });
-      yield* Deferred.await(firstTurnCompleted);
-
+      yield* sendDroidTurn(adapter, firstThreadId, "mock delayed shared tool");
+      yield* waitFor(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.started" }> =>
+          event.type === "item.started" &&
+          String(event.threadId) === String(firstThreadId) &&
+          String(event.itemId) === "shared-tool-use",
+      );
+      yield* sendDroidTurn(adapter, secondThreadId, "mock shared tool execute");
+      yield* waitForType(secondThreadId, "turn.completed");
+      yield* sendDroidTurn(adapter, firstThreadId, "mock release shared tool");
+      yield* waitForType(firstThreadId, "turn.completed");
       const firstToolCompleted = eventsForThread(runtimeEvents, firstThreadId).find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
           event.type === "item.completed" && String(event.itemId) === "shared-tool-use",
       );
       assert.equal(firstToolCompleted?.payload.itemType, "dynamic_tool_call");
       assert.equal(firstToolCompleted?.payload.title, "Read");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(firstThreadId);
-      yield* adapter.stopSession(secondThreadId);
     }),
   );
 
   it.effect("round-trips an approved Droid permission and completes the turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-approved");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "request.opened" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "permission" });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "approval-required");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "run the approved command",
-        attachments: [],
-      });
-
-      const opened = yield* Deferred.await(requestOpened);
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "run the approved command");
+      const opened = yield* waitForType(threadId, "request.opened");
       assert.equal(String(opened.turnId), String(sentTurn.turnId));
       assert.equal(opened.payload.requestType, "exec_command_approval");
       assert.deepEqual(opened.payload.options, [
@@ -670,25 +601,20 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ],
       });
       assert.equal(opened.raw?.method, "droid.request_permission");
-
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),
         "accept",
       );
-      const terminal = yield* Deferred.await(turnCompleted);
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const resolved = eventsForThread(runtimeEvents, threadId).find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "request.resolved" }> =>
           event.type === "request.resolved" && String(event.requestId) === String(opened.requestId),
       );
-
       assert.equal(resolved?.payload.requestType, "exec_command_approval");
       assert.equal(resolved?.payload.decision, "accept");
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "completed");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -696,40 +622,30 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.forEach(["empty", "unknown"] as const, (permissionOptionsMode) =>
       Effect.gen(function* () {
         const threadId = ThreadId.make(`droid-permission-${permissionOptionsMode}`);
-        const { adapter, readDebugState } = yield* makeDroidScenario({
-          T3_DROID_MOCK_REQUEST_PERMISSION: "1",
-          T3_DROID_MOCK_PERMISSION_OPTIONS: permissionOptionsMode,
+        const { adapter } = yield* makeDroidScenario({
+          T3_DROID_MOCK_SCENARIO: `permission-${permissionOptionsMode}-options`,
         });
-        const firstApprovalOutcome =
-          yield* Deferred.make<
-            Extract<ProviderRuntimeEvent, { type: "request.opened" | "turn.completed" }>
-          >();
-        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
-          if (
-            String(event.threadId) !== String(threadId) ||
-            (event.type !== "request.opened" && event.type !== "turn.completed")
-          ) {
-            return Effect.void;
-          }
-          return Deferred.succeed(firstApprovalOutcome, event).pipe(Effect.ignore);
-        }).pipe(Effect.forkChild);
-
+        const { waitFor } = yield* collectDroidEvents(adapter);
         yield* startDroidSession(adapter, threadId, "approval-required");
-        yield* adapter.sendTurn({
+        yield* sendDroidTurn(
+          adapter,
           threadId,
-          input: `reject ${permissionOptionsMode} permission options`,
-          attachments: [],
-        });
-
-        const outcome = yield* Deferred.await(firstApprovalOutcome);
+          `reject ${permissionOptionsMode} permission options`,
+        );
+        const outcome = yield* waitFor(
+          (
+            event,
+          ): event is Extract<
+            ProviderRuntimeEvent,
+            { type: "request.opened" | "turn.completed" }
+          > =>
+            String(event.threadId) === String(threadId) &&
+            (event.type === "request.opened" || event.type === "turn.completed"),
+        );
         assert.equal(outcome.type, "turn.completed");
         if (outcome.type === "turn.completed") {
           assert.equal(outcome.payload.state, "failed");
         }
-        const debugState = yield* readDebugState(threadId);
-        assert.equal(debugState.pendingApprovalCount, 0);
-
-        yield* Fiber.interrupt(runtimeEventsFiber);
       }),
     ).pipe(Effect.asVoid),
   );
@@ -742,55 +658,57 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       const permissionResponseFile = NodePath.join(coordinationDir, "permission-response.json");
       const { adapter } = yield* makeDroidScenario({
-        T3_DROID_MOCK_REQUEST_PERMISSION: "1",
-        T3_DROID_MOCK_PERMISSION_OPTIONS: "accept-only",
+        T3_DROID_MOCK_SCENARIO: "permission-accept-only",
         T3_DROID_MOCK_PERMISSION_RESPONSE_FILE: permissionResponseFile,
       });
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const requestResolved =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.resolved" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        if (String(event.threadId) !== String(threadId)) return Effect.void;
-        if (event.type === "request.opened") {
-          return Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
-        }
-        if (event.type === "request.resolved") {
-          return Deferred.succeed(requestResolved, event).pipe(Effect.ignore);
-        }
-        if (event.type === "turn.completed") {
-          return Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
-        }
-        return Effect.void;
-      }).pipe(Effect.forkChild);
-
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "approval-required");
-      const sentTurn = yield* adapter.sendTurn({
+      const sentTurn = yield* sendDroidTurn(
+        adapter,
         threadId,
-        input: "interrupt the accept-only permission",
-        attachments: [],
-      });
-
-      const opened = yield* Deferred.await(requestOpened);
+        "interrupt the accept-only permission",
+      );
+      const opened = yield* waitForType(threadId, "request.opened");
       assert.deepEqual(opened.payload.options, [{ decision: "accept", label: "Allow once" }]);
       yield* adapter.interruptTurn(threadId, sentTurn.turnId);
-      const terminal = yield* Deferred.await(turnCompleted);
-      const resolved = yield* Deferred.await(requestResolved);
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      const resolved = yield* waitForType(threadId, "request.resolved");
       yield* Effect.promise(() => waitForFile(permissionResponseFile));
       const permissionResponse = decodeDroidPermissionResponse(
         yield* Effect.promise(() => NodeFSP.readFile(permissionResponseFile, "utf8")),
       );
-
+      const lateResponse = yield* adapter
+        .respondToRequest(threadId, ApprovalRequestId.make(String(opened.requestId)), "accept")
+        .pipe(Effect.flip);
       assert.equal(terminal.payload.state, "cancelled");
       assert.isUndefined(resolved.payload.decision);
       assert.isString(permissionResponse.error);
       assert.notEqual(permissionResponse.selectedOption, "cancel");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+      assert.equal(lateResponse._tag, "ProviderAdapterRequestError");
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
+    }),
+  );
+
+  it.effect("drains a parked Droid permission before stopping its session scope", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-permission-stop-drain");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "park-hitl",
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      yield* sendDroidTurn(adapter, threadId, "park permission for stop");
+      const opened = yield* waitForType(threadId, "request.opened");
+      yield* adapter.stopSession(threadId);
+      const exited = yield* waitForType(threadId, "session.exited");
+      const threadEvents = eventsForThread(runtimeEvents, threadId);
+      const resolved = threadEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "request.resolved" }> =>
+          event.type === "request.resolved" && String(event.requestId) === String(opened.requestId),
+      );
+      assert.isDefined(resolved);
+      assert.isUndefined(resolved?.payload.decision);
+      assert.isBelow(threadEvents.indexOf(resolved!), threadEvents.indexOf(exited));
     }),
   );
 
@@ -811,53 +729,33 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           ),
         close: () => Effect.void,
       } satisfies NonNullable<DroidAdapterOptions["nativeEventLogger"]>;
-      const { adapter, readDebugState } = yield* makeDroidScenario(
+      const { adapter } = yield* makeDroidScenario(
         {
-          T3_DROID_MOCK_REQUEST_PERMISSION: "1",
+          T3_DROID_MOCK_SCENARIO: "permission",
           T3_DROID_MOCK_PERMISSION_RESPONSE_FILE: permissionResponseFile,
         },
         { nativeEventLogger },
       );
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "approval-required");
-      const sentTurn = yield* adapter.sendTurn({
+      const sentTurn = yield* sendDroidTurn(
+        adapter,
         threadId,
-        input: "interrupt before permission registration",
-        attachments: [],
-      });
+        "interrupt before permission registration",
+      );
       yield* Deferred.await(requestRegistrationEntered);
       yield* adapter.interruptTurn(threadId, sentTurn.turnId);
       yield* Deferred.succeed(allowRequestRegistration, undefined);
-      yield* Deferred.await(turnCompleted);
+      yield* waitForType(threadId, "turn.completed");
       yield* Effect.promise(() => waitForFile(permissionResponseFile));
       const permissionResponse = decodeDroidPermissionResponse(
         yield* Effect.promise(() => NodeFSP.readFile(permissionResponseFile, "utf8")),
       );
-      const debugState = yield* readDebugState(threadId);
-
-      assert.equal(debugState.pendingApprovalCount, 0);
       assert.lengthOf(
         eventsForThread(runtimeEvents, threadId).filter((event) => event.type === "request.opened"),
         0,
       );
       assert.isString(permissionResponse.error);
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
@@ -865,36 +763,14 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("rejects a concurrent duplicate Droid permission response", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-response-race");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" });
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const requestResolved =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.resolved" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        if (String(event.threadId) !== String(threadId)) return Effect.void;
-        if (event.type === "request.opened") {
-          return Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
-        }
-        if (event.type === "request.resolved") {
-          return Deferred.succeed(requestResolved, event).pipe(Effect.ignore);
-        }
-        return Effect.void;
-      }).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "permission" });
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "approval-required");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "race permission responses",
-        attachments: [],
-      });
-
-      const opened = yield* Deferred.await(requestOpened);
+      yield* sendDroidTurn(adapter, threadId, "race permission responses");
+      const opened = yield* waitForType(threadId, "request.opened");
       const requestId = ApprovalRequestId.make(String(opened.requestId));
       const outcomes = yield* Effect.all(
-        [
-          { label: "accept", decision: "accept" as const },
-          { label: "decline", decision: "decline" as const },
-        ].map(({ label, decision }) =>
+        permissionResponseCases.map(({ label, decision }) =>
           adapter.respondToRequest(threadId, requestId, decision).pipe(
             Effect.match({
               onFailure: (error) => ({ _tag: "Failure" as const, label, error }),
@@ -906,7 +782,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       const successes = outcomes.filter((outcome) => outcome._tag === "Success");
       const failures = outcomes.filter((outcome) => outcome._tag === "Failure");
-
       assert.lengthOf(successes, 1, "exactly one concurrent approval response should succeed");
       assert.lengthOf(failures, 1, "the duplicate approval response should fail");
       const duplicateFailure = failures[0];
@@ -914,14 +789,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       if (duplicateFailure?.error._tag === "ProviderAdapterRequestError") {
         assert.include(duplicateFailure.error.detail, "Unknown pending approval request");
       }
-
-      const resolved = yield* Deferred.await(requestResolved);
+      const resolved = yield* waitForType(threadId, "request.resolved");
       const appliedDecision = successes[0]?.decision;
       assert.isDefined(appliedDecision);
       assert.equal(resolved.payload.decision, appliedDecision);
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -932,38 +803,17 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-permission-handler-bound-")),
       );
       const floodReadyFile = NodePath.join(coordinationDir, "flood-ready");
-      const { adapter, readDebugState } = yield* makeDroidScenario({
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "permission-flood",
         T3_DROID_MOCK_PERMISSION_FLOOD_COUNT: "24",
         T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE: floodReadyFile,
       });
-      const streamReady = yield* Deferred.make<void>();
-      const requestOpened = yield* Deferred.make<void>();
-      const runtimeEventsFiber = yield* Stream.unwrap(
-        Deferred.succeed(streamReady, undefined).pipe(Effect.as(adapter.streamEvents)),
-      ).pipe(
-        Stream.runForEach((event) =>
-          event.type === "request.opened" && String(event.threadId) === String(threadId)
-            ? Deferred.succeed(requestOpened, undefined).pipe(Effect.ignore)
-            : Effect.void,
-        ),
-        Effect.forkChild,
-      );
-      yield* Deferred.await(streamReady);
-
+      const { events, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "approval-required");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "flood permission requests",
-        attachments: [],
-      });
+      yield* sendDroidTurn(adapter, threadId, "flood permission requests");
       yield* Effect.promise(() => waitForFile(floodReadyFile));
-      yield* Deferred.await(requestOpened);
-
-      const debugState = yield* readDebugState(threadId);
-      assert.isAtMost(debugState.pendingApprovalCount, 16);
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+      yield* waitForType(threadId, "request.opened");
+      assert.isAtMost(eventsOfType(eventsForThread(events, threadId), "request.opened").length, 16);
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
@@ -971,85 +821,33 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("round-trips a denied Droid permission as a cancelled turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-permission-denied");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_REQUEST_PERMISSION: "1" });
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const requestResolved =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.resolved" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        if (String(event.threadId) !== String(threadId)) return Effect.void;
-        if (event.type === "request.opened") {
-          return Deferred.succeed(requestOpened, event).pipe(Effect.ignore);
-        }
-        if (event.type === "request.resolved") {
-          return Deferred.succeed(requestResolved, event).pipe(Effect.ignore);
-        }
-        if (event.type === "turn.completed") {
-          return Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
-        }
-        return Effect.void;
-      }).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "permission" });
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "approval-required");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "deny the command",
-        attachments: [],
-      });
-
-      const opened = yield* Deferred.await(requestOpened);
+      yield* sendDroidTurn(adapter, threadId, "deny the command");
+      const opened = yield* waitForType(threadId, "request.opened");
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),
         "decline",
       );
-      const resolved = yield* Deferred.await(requestResolved);
-      const terminal = yield* Deferred.await(turnCompleted);
-
+      const resolved = yield* waitForType(threadId, "request.resolved");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       assert.equal(String(resolved.requestId), String(opened.requestId));
       assert.equal(resolved.payload.decision, "decline");
       assert.equal(terminal.payload.state, "cancelled");
       assert.equal(terminal.payload.stopReason, "permission_rejected");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("round-trips Droid ask_user answers and completes the turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-ask-user");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_ASK_USER: "1" });
-      const requested =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
-      const resolved =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        if (String(event.threadId) !== String(threadId)) return Effect.void;
-        if (event.type === "user-input.requested") {
-          return Deferred.succeed(requested, event).pipe(Effect.ignore);
-        }
-        if (event.type === "user-input.resolved") {
-          return Deferred.succeed(resolved, event).pipe(Effect.ignore);
-        }
-        if (event.type === "turn.completed") {
-          return Deferred.succeed(turnCompleted, event).pipe(Effect.ignore);
-        }
-        return Effect.void;
-      }).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "ask-user" });
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "ask for scope",
-        attachments: [],
-      });
-
-      const requestedEvent = yield* Deferred.await(requested);
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "ask for scope");
+      const requestedEvent = yield* waitForType(threadId, "user-input.requested");
       assert.equal(String(requestedEvent.turnId), String(sentTurn.turnId));
       assert.deepEqual(requestedEvent.payload.questions, [
         {
@@ -1064,57 +862,30 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         },
       ]);
       assert.equal(requestedEvent.raw?.method, "droid.ask_user");
-
       yield* adapter.respondToUserInput(
         threadId,
         ApprovalRequestId.make(String(requestedEvent.requestId)),
         { "1": "workspace" },
       );
-      const resolvedEvent = yield* Deferred.await(resolved);
-      const terminal = yield* Deferred.await(turnCompleted);
-
+      const resolvedEvent = yield* waitForType(threadId, "user-input.resolved");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       assert.equal(String(resolvedEvent.requestId), String(requestedEvent.requestId));
       assert.deepEqual(resolvedEvent.payload.answers, { "1": "workspace" });
       assert.equal(terminal.payload.state, "completed");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("rejects a concurrent duplicate Droid user-input response", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-user-input-response-race");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_ASK_USER: "1" });
-      const requested =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.requested" }>>();
-      const resolved =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        if (String(event.threadId) !== String(threadId)) return Effect.void;
-        if (event.type === "user-input.requested") {
-          return Deferred.succeed(requested, event).pipe(Effect.ignore);
-        }
-        if (event.type === "user-input.resolved") {
-          return Deferred.succeed(resolved, event).pipe(Effect.ignore);
-        }
-        return Effect.void;
-      }).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "ask-user" });
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "race user input responses",
-        attachments: [],
-      });
-
-      const requestedEvent = yield* Deferred.await(requested);
+      yield* sendDroidTurn(adapter, threadId, "race user input responses");
+      const requestedEvent = yield* waitForType(threadId, "user-input.requested");
       const requestId = ApprovalRequestId.make(String(requestedEvent.requestId));
       const outcomes = yield* Effect.all(
-        [
-          { label: "workspace", answers: { "1": "workspace" } },
-          { label: "session", answers: { "1": "session" } },
-        ].map(({ label, answers }) =>
+        userInputResponseCases.map(({ label, answers }) =>
           adapter.respondToUserInput(threadId, requestId, answers).pipe(
             Effect.match({
               onFailure: (error) => ({ _tag: "Failure" as const, label, error }),
@@ -1126,7 +897,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       const successes = outcomes.filter((outcome) => outcome._tag === "Success");
       const failures = outcomes.filter((outcome) => outcome._tag === "Failure");
-
       assert.lengthOf(successes, 1, "exactly one concurrent user-input response should succeed");
       assert.lengthOf(failures, 1, "the duplicate user-input response should fail");
       const duplicateFailure = failures[0];
@@ -1134,59 +904,34 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       if (duplicateFailure?.error._tag === "ProviderAdapterRequestError") {
         assert.include(duplicateFailure.error.detail, "Unknown pending user-input request");
       }
-
-      const resolvedEvent = yield* Deferred.await(resolved);
+      const resolvedEvent = yield* waitForType(threadId, "user-input.resolved");
       const appliedAnswers = successes[0]?.answers;
       assert.isDefined(appliedAnswers);
       assert.deepEqual(resolvedEvent.payload.answers, appliedAnswers);
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("interrupts a hanging Droid turn once and drops its late terminal notification", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-interrupt");
-      const { adapter, readDebugState } = yield* makeDroidScenario({
-        T3_DROID_MOCK_HANG_TURN: "1",
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "hang-turn",
       });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const assistantCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "item.completed" &&
-              event.payload.itemType === "assistant_message" &&
-              String(event.threadId) === String(threadId)
-              ? Deferred.succeed(assistantCompleted, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitFor, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "hang until interrupted",
-        attachments: [],
-      });
-      yield* Deferred.await(assistantCompleted);
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "hang until interrupted");
+      yield* waitFor(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed" &&
+          event.payload.itemType === "assistant_message" &&
+          String(event.threadId) === String(threadId),
+      );
       yield* adapter.interruptTurn(threadId, sentTurn.turnId);
-      const terminal = yield* Deferred.await(turnCompleted);
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const threadEvents = eventsForThread(runtimeEvents, threadId);
-
       assert.equal(String(terminal.turnId), String(sentTurn.turnId));
       assert.equal(terminal.payload.state, "cancelled");
       assert.equal(terminal.payload.stopReason, "cancelled");
-      assert.equal((yield* readDebugState(threadId)).interruptedTurnCount, 0);
       assert.lengthOf(
         threadEvents.filter(
           (event) =>
@@ -1196,7 +941,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
         1,
       );
-
       const terminalIndex = threadEvents.findIndex((event) => event === terminal);
       const turnOutputTypes = new Set(["content.delta", "item.started", "item.completed"]);
       assert.deepEqual(
@@ -1210,54 +954,22 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           ),
         [],
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("starts and completes a retry after interrupting a hung Droid turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-interrupt-retry");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const firstTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const secondTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(firstTurnCompleted, event).pipe(
-                  Effect.flatMap((wasFirst) =>
-                    wasFirst ? Effect.void : Deferred.succeed(secondTurnCompleted, event),
-                  ),
-                  Effect.asVoid,
-                )
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "hang-first-turn",
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const interruptedTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock hang this turn",
-        attachments: [],
-      });
+      const interruptedTurn = yield* sendDroidTurn(adapter, threadId, "mock hang this turn");
       yield* adapter.interruptTurn(threadId, interruptedTurn.turnId);
-      const interruptedTerminal = yield* Deferred.await(firstTurnCompleted);
-
-      const retryTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "retry after interrupt",
-        attachments: [],
-      });
-      const retryTerminal = yield* Deferred.await(secondTurnCompleted);
-
+      const interruptedTerminal = yield* waitForType(threadId, "turn.completed");
+      const retryTurn = yield* sendDroidTurn(adapter, threadId, "retry after interrupt");
+      const retryTerminal = yield* waitForType(threadId, "turn.completed", 2);
       assert.equal(String(interruptedTerminal.turnId), String(interruptedTurn.turnId));
       assert.equal(interruptedTerminal.payload.state, "cancelled");
       assert.equal(String(retryTerminal.turnId), String(retryTurn.turnId));
@@ -1266,9 +978,73 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         eventsForThread(runtimeEvents, threadId).filter((event) => event.type === "turn.completed"),
         2,
       );
+    }),
+  );
 
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+  it.effect("drops a late physical terminal without mutating its replacement turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-late-physical-terminal");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "late-terminal",
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const firstTurn = yield* sendDroidTurn(adapter, threadId, "first physical run");
+      yield* adapter.interruptTurn(threadId, firstTurn.turnId);
+      const firstTerminal = yield* waitForType(threadId, "turn.completed");
+      const replacementTurn = yield* sendDroidTurn(adapter, threadId, "replacement physical run");
+      const replacementTerminal = yield* waitForType(threadId, "turn.completed", 2);
+      const replacementEvents = eventsForThread(runtimeEvents, threadId).filter(
+        (event) =>
+          event.turnId !== undefined && String(event.turnId) === String(replacementTurn.turnId),
+      );
+      const replacementText = replacementEvents
+        .filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+        )
+        .map((event) => event.payload.delta)
+        .join("");
+      const usageEvents = eventsForThread(runtimeEvents, threadId).filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
+          event.type === "thread.token-usage.updated",
+      );
+      assert.equal(firstTerminal.payload.state, "cancelled");
+      assert.equal(String(replacementTerminal.turnId), String(replacementTurn.turnId));
+      assert.equal(replacementTerminal.payload.state, "completed");
+      assert.equal(replacementText, "replacement output");
+      assert.lengthOf(
+        replacementEvents.filter((event) => event.type === "turn.completed"),
+        1,
+      );
+      assert.isFalse(
+        usageEvents.some((event) => event.payload.usage.inputTokens === 900),
+        "late run A usage must not be published as replacement run B usage",
+      );
+    }),
+  );
+
+  it.effect("does not reuse a prior turn's last-call usage fallback", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-last-call-usage-reset");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "usage-reset",
+      });
+      const { events, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      yield* sendDroidTurn(adapter, threadId, "usage turn one");
+      yield* waitForType(threadId, "turn.completed");
+      yield* sendDroidTurn(adapter, threadId, "usage turn two");
+      yield* waitForType(threadId, "turn.completed", 2);
+      const usageEvents = eventsForThread(events, threadId).filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
+          event.type === "thread.token-usage.updated",
+      );
+      assert.deepEqual(
+        usageEvents.map((event) => event.payload.usage.usedTokens),
+        [99, 32],
+      );
+      assert.isUndefined(usageEvents.at(-1)?.payload.usage.lastUsedTokens);
     }),
   );
 
@@ -1282,65 +1058,40 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const releaseInterrupt = NodePath.join(coordinationDir, "release-interrupt");
       const overlapReceipt = NodePath.join(coordinationDir, "turn-started-before-interrupt");
       const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "hang-first-turn",
         T3_DROID_MOCK_INTERRUPT_ORDER_DIR: coordinationDir,
       });
-      const firstTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const secondTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "turn.completed" && String(event.threadId) === String(threadId)
-          ? Deferred.succeed(firstTurnCompleted, event).pipe(
-              Effect.flatMap((wasFirst) =>
-                wasFirst ? Effect.void : Deferred.succeed(secondTurnCompleted, event),
-              ),
-              Effect.asVoid,
-            )
-          : Effect.void,
-      ).pipe(Effect.forkChild);
-
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const interruptedTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock hang this turn",
-        attachments: [],
-      });
+      const interruptedTurn = yield* sendDroidTurn(adapter, threadId, "mock hang this turn");
       yield* adapter.interruptTurn(threadId, interruptedTurn.turnId);
-      const interruptedTerminal = yield* Deferred.await(firstTurnCompleted);
+      const interruptedTerminal = yield* waitForType(threadId, "turn.completed");
       yield* Effect.promise(() => waitForFile(interruptReceived));
-
-      const replacementFiber = yield* adapter
-        .sendTurn({
-          threadId,
-          input: "replacement after interrupt",
-          attachments: [],
-        })
-        .pipe(Effect.forkChild);
+      const replacementFiber = yield* sendDroidTurn(
+        adapter,
+        threadId,
+        "replacement after interrupt",
+      ).pipe(Effect.forkChild);
       const replacementBeforeInterruptFiber = yield* Fiber.join(replacementFiber).pipe(
         Effect.timeoutOption("1 second"),
         Effect.forkChild,
       );
       yield* advanceTestClock(1_000);
       const replacementBeforeInterrupt = yield* Fiber.join(replacementBeforeInterruptFiber);
-
       yield* Effect.promise(() => NodeFSP.writeFile(releaseInterrupt, ""));
       const replacementTurn = yield* Fiber.join(replacementFiber);
-      const replacementTerminal = yield* Deferred.await(secondTurnCompleted);
+      const replacementTerminal = yield* waitForType(threadId, "turn.completed", 2);
       const overlap = yield* Effect.promise(() =>
         NodeFSP.access(overlapReceipt).then(
           () => true,
           () => false,
         ),
       );
-
       assert.equal(interruptedTerminal.payload.state, "cancelled");
       assert.equal(Option.isNone(replacementBeforeInterrupt), true);
       assert.equal(overlap, false);
       assert.equal(String(replacementTerminal.turnId), String(replacementTurn.turnId));
       assert.equal(replacementTerminal.payload.state, "completed");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
       yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
@@ -1349,69 +1100,33 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-known");
       const { adapter } = yield* makeDroidScenario();
-      const sessionStarted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.started" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "session.started" && String(event.threadId) === String(threadId)
-          ? Deferred.succeed(sessionStarted, event).pipe(Effect.ignore)
-          : Effect.void,
-      ).pipe(Effect.forkChild);
-
-      const session = yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
+      const { waitForType } = yield* collectDroidEvents(adapter);
+      const session = yield* startDroidSession(adapter, threadId, "full-access", {
+        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known", turnIds: [] },
       });
-      const started = yield* Deferred.await(sessionStarted);
-
+      const started = yield* waitForType(threadId, "session.started");
       assert.equal(session.status, "ready");
       assert.deepStrictEqual(session.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-known",
         turnIds: [],
       });
       assert.equal(started.payload.resume, true);
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("resets a resumed spec session before sending a normal turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-spec-reset");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_LOAD_IN_SPEC_MODE: "1" });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-        resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "load-spec-mode-report",
       });
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock report interaction mode",
-        attachments: [],
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access", {
+        resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known", turnIds: [] },
       });
-      yield* Deferred.await(turnCompleted);
-
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock report interaction mode");
+      yield* waitForType(threadId, "turn.completed");
       const assistantText = eventsForThread(runtimeEvents, threadId)
         .filter(
           (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
@@ -1423,9 +1138,65 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         .map((event) => event.payload.delta)
         .join("");
       assert.equal(assistantText, "auto");
+    }),
+  );
 
-      yield* Fiber.interrupt(runtimeEventsFiber);
+  it.effect("uses one bounded Droid load path for resume and rollback", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-canonical-load-path");
+      const requestLogDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-load-path-")),
+      );
+      const requestLogPath = NodePath.join(requestLogDir, "requests.ndjson");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_REQUEST_LOG: requestLogPath,
+      });
+      yield* startDroidSession(adapter, threadId, "full-access", {
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "mock-session-known",
+          turnIds: [],
+        },
+      });
       yield* adapter.stopSession(threadId);
+      const { waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const turn = yield* sendDroidTurn(adapter, threadId, "turn before canonical rollback load");
+      yield* waitForType(threadId, "turn.completed");
+      yield* adapter.rollbackThread(threadId, {
+        turnIds: [],
+        anchorTurnId: turn.turnId,
+      });
+      const requests = (yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8")))
+        .split("\n")
+        .filter(Boolean)
+        .map(
+          (line) =>
+            decodeUnknownJsonString(line) as {
+              readonly method: string;
+              readonly params: Record<string, unknown>;
+            },
+        );
+      const loads = requests.filter((request) => request.method === "droid.load_session");
+      const settingsUpdates = requests.filter(
+        (request) => request.method === "droid.update_session_settings",
+      );
+      assert.deepEqual(
+        loads.map((request) => request.params.messageLimit),
+        [1, 1],
+      );
+      assert.deepEqual(
+        loads.map((request) => request.params.sessionId),
+        ["mock-session-known", "mock-session-rewound"],
+      );
+      assert.lengthOf(settingsUpdates, 2);
+      assert.isTrue(
+        settingsUpdates.every(
+          (request) =>
+            request.params.autonomyLevel === "high" && request.params.interactionMode === "auto",
+        ),
+      );
+      yield* Effect.promise(() => NodeFSP.rm(requestLogDir, { recursive: true, force: true }));
     }),
   );
 
@@ -1433,17 +1204,11 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-unknown");
       const { adapter } = yield* makeDroidScenario();
-
       const error = yield* Effect.flip(
-        adapter.startSession({
-          threadId,
-          provider: ProviderDriverKind.make("droid"),
-          cwd: process.cwd(),
-          runtimeMode: "full-access",
-          resumeCursor: { schemaVersion: 2, sessionId: "mock-session-missing", turnIds: [] },
+        startDroidSession(adapter, threadId, "full-access", {
+          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-missing", turnIds: [] },
         }),
       );
-
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
         assert.include(error.detail, "Mock session not found");
@@ -1455,18 +1220,14 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("fails resume when approval-required settings cannot be reasserted", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resume-settings-failure");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_FAIL_UPDATE_SETTINGS: "1" });
-
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "fail-update-settings",
+      });
       const error = yield* Effect.flip(
-        adapter.startSession({
-          threadId,
-          provider: ProviderDriverKind.make("droid"),
-          cwd: process.cwd(),
-          runtimeMode: "approval-required",
-          resumeCursor: { schemaVersion: 2, sessionId: "mock-session-known", turnIds: [] },
+        startDroidSession(adapter, threadId, "approval-required", {
+          resumeCursor: { schemaVersion: 1, sessionId: "mock-session-known", turnIds: [] },
         }),
       );
-
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
         assert.include(error.detail, "Mock settings update failure");
@@ -1478,10 +1239,8 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("surfaces Droid initialization failure as a typed process error", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-init-failure");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_FAIL_INIT: "1" });
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "fail-init" });
       const error = yield* Effect.flip(startDroidSession(adapter, threadId, "full-access"));
-
       assert.equal(error._tag, "ProviderAdapterProcessError");
       if (error._tag === "ProviderAdapterProcessError") {
         assert.include(error.detail, "Mock initialization failure");
@@ -1493,42 +1252,52 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
   it.effect("fails the active turn and emits session.exited when Droid dies", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-process-death");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_EXIT_MID_TURN: "1" });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const sessionExited =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "session.exited" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(sessionExited, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_SCENARIO: "exit-mid-turn" });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "exit during this turn",
-        attachments: [],
-      });
-      const exited = yield* Deferred.await(sessionExited);
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "exit during this turn");
+      const exited = yield* waitForType(threadId, "session.exited");
       const failedTurn = eventsForThread(runtimeEvents, threadId).find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
           event.type === "turn.completed" &&
           event.turnId !== undefined &&
           String(event.turnId) === String(sentTurn.turnId),
       );
-
       assert.equal(failedTurn?.payload.state, "failed");
       assert.include(failedTurn?.payload.errorMessage ?? "", "Droid exited unexpectedly");
       assert.equal(exited.payload.exitKind, "error");
       assert.isFalse(yield* adapter.hasSession(threadId));
+    }),
+  );
 
-      yield* Fiber.interrupt(runtimeEventsFiber);
+  it.effect("publishes a parked Droid request resolution before process-exit teardown", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-process-exit-hitl-drain");
+      const coordinationDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "droid-process-hitl-")),
+      );
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "exit-hitl",
+        T3_DROID_MOCK_COORDINATION_DIR: coordinationDir,
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "approval-required");
+      yield* sendDroidTurn(adapter, threadId, "park permission before exit");
+      const opened = yield* waitForType(threadId, "request.opened");
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(NodePath.join(coordinationDir, "release-exit"), ""),
+      );
+      const exited = yield* waitForType(threadId, "session.exited");
+      const threadEvents = eventsForThread(runtimeEvents, threadId);
+      const resolved = threadEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "request.resolved" }> =>
+          event.type === "request.resolved" && String(event.requestId) === String(opened.requestId),
+      );
+      assert.isDefined(resolved);
+      assert.isUndefined(resolved?.payload.decision);
+      assert.equal(exited.payload.exitKind, "error");
+      assert.isBelow(threadEvents.indexOf(resolved!), threadEvents.indexOf(exited));
+      yield* Effect.promise(() => NodeFSP.rm(coordinationDir, { recursive: true, force: true }));
     }),
   );
 
@@ -1536,29 +1305,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-rollback");
       const { adapter } = yield* makeDroidScenario();
-      const firstTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const secondTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "turn.completed" && String(event.threadId) === String(threadId)
-          ? Deferred.succeed(firstTurnCompleted, event).pipe(
-              Effect.flatMap((wasFirst) =>
-                wasFirst ? Effect.void : Deferred.succeed(secondTurnCompleted, event),
-              ),
-              Effect.asVoid,
-            )
-          : Effect.void,
-      ).pipe(Effect.forkChild);
-
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const firstTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "first turn to roll back",
-        attachments: [],
-      });
-      yield* Deferred.await(firstTurnCompleted);
-
+      const firstTurn = yield* sendDroidTurn(adapter, threadId, "first turn to roll back");
+      yield* waitForType(threadId, "turn.completed");
       const snapshot = yield* adapter.rollbackThread(threadId, {
         turnIds: [],
         anchorTurnId: firstTurn.turnId,
@@ -1569,21 +1319,15 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         anchorTurnId: firstTurn.turnId,
       });
       assert.deepEqual(replayed.turns, []);
-
       // The live process re-anchored on the fork: the resume cursor points at
       // the rewound session and the session still takes turns.
-      const nextTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "turn after the rewind",
-        attachments: [],
-      });
+      const nextTurn = yield* sendDroidTurn(adapter, threadId, "turn after the rewind");
       assert.deepStrictEqual(nextTurn.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-rewound",
         turnIds: [nextTurn.turnId],
       });
-      yield* Deferred.await(secondTurnCompleted);
-
+      yield* waitForType(threadId, "turn.completed", 2);
       const staleAnchor = yield* adapter
         .rollbackThread(threadId, {
           turnIds: [],
@@ -1594,7 +1338,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       if (staleAnchor._tag === "Failure") {
         assert.equal(staleAnchor.failure._tag, "ProviderAdapterValidationError");
       }
-
       // Rolling back past the turns tracked in this process is refused
       // rather than mis-anchored (rollback of the post-rewind turn is fine,
       // two turns is not).
@@ -1607,9 +1350,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       if (tooDeep._tag === "ProviderAdapterValidationError") {
         assert.equal(tooDeep.issue, "Rollback target does not match the current thread history.");
       }
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -1617,50 +1357,19 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-rewind-straggler");
       const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const firstTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const secondTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(firstTurnCompleted, event).pipe(
-                  Effect.flatMap((wasFirst) =>
-                    wasFirst ? Effect.void : Deferred.succeed(secondTurnCompleted, event),
-                  ),
-                  Effect.asVoid,
-                )
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const firstTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "turn before straggler rewind",
-        attachments: [],
-      });
-      yield* Deferred.await(firstTurnCompleted);
+      const firstTurn = yield* sendDroidTurn(adapter, threadId, "turn before straggler rewind");
+      yield* waitForType(threadId, "turn.completed");
       yield* adapter.rollbackThread(threadId, {
         turnIds: [],
         anchorTurnId: firstTurn.turnId,
       });
-
-      const nextTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "turn after straggler rewind",
-        attachments: [],
-      });
-      const terminal = yield* Deferred.await(secondTurnCompleted);
+      const nextTurn = yield* sendDroidTurn(adapter, threadId, "turn after straggler rewind");
+      const terminal = yield* waitForType(threadId, "turn.completed", 2);
       const nextTurnEvents = eventsForThread(runtimeEvents, threadId).filter(
         (event) => event.turnId !== undefined && String(event.turnId) === String(nextTurn.turnId),
       );
-
       assert.equal(terminal.payload.state, "completed");
       assert.notInclude(
         nextTurnEvents
@@ -1676,9 +1385,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         nextTurnEvents.filter((event) => event.type === "turn.completed"),
         1,
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -1686,40 +1392,19 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-interrupt-completion-race");
       const { adapter } = yield* makeDroidScenario({
-        T3_DROID_MOCK_HANG_TURN: "1",
-        T3_DROID_MOCK_INTERRUPT_RACE: "1",
+        T3_DROID_MOCK_SCENARIO: "interrupt-race",
       });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const assistantCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "item.completed" &&
-              event.payload.itemType === "assistant_message" &&
-              String(event.threadId) === String(threadId)
-              ? Deferred.succeed(assistantCompleted, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitFor, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "race completion against interrupt",
-        attachments: [],
-      });
-      yield* Deferred.await(assistantCompleted);
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "race completion against interrupt");
+      yield* waitFor(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.completed" }> =>
+          event.type === "item.completed" &&
+          event.payload.itemType === "assistant_message" &&
+          String(event.threadId) === String(threadId),
+      );
       yield* adapter.interruptTurn(threadId, sentTurn.turnId);
-      const terminal = yield* Deferred.await(turnCompleted);
-
+      const terminal = yield* waitForType(threadId, "turn.completed");
       assert.equal(terminal.payload.state, "cancelled");
       assert.lengthOf(
         eventsForThread(runtimeEvents, threadId).filter(
@@ -1730,9 +1415,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ),
         1,
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -1744,35 +1426,15 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       const settingsLogPath = NodePath.join(settingsLogDir, "settings.ndjson");
       const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "spec-handoff",
         T3_DROID_MOCK_SETTINGS_LOG: settingsLogPath,
       });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "request.opened" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock spec handoff",
-        attachments: [],
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock spec handoff", {
         interactionMode: "plan",
       });
-      const opened = yield* Deferred.await(requestOpened);
+      const opened = yield* waitForType(threadId, "request.opened");
       assert.equal(opened.payload.requestType, "plan_approval");
       assert.deepEqual(opened.payload.options, [
         { decision: "accept", label: "Implement" },
@@ -1783,7 +1445,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         ApprovalRequestId.make(String(opened.requestId)),
         "accept",
       );
-      const terminal = yield* Deferred.await(turnCompleted);
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const sessions = yield* adapter.listSessions();
       const successorText = eventsForThread(runtimeEvents, threadId)
         .filter(
@@ -1795,16 +1457,14 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         )
         .map((event) => event.payload.delta)
         .join("");
-
       assert.include(successorText, "implementation successor");
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "spec_handoff");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-spec-successor",
         turnIds: [sentTurn.turnId],
       });
-
       // Droid offered only the new-session variant here, so the adapter's
       // generic first-proceed selection picks it and the successor machinery
       // engages.
@@ -1816,9 +1476,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         exitSpecModeSelectedOption: "proceed_new_session_high",
         resultingAutonomyLevel: "high",
       });
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -1830,37 +1487,23 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       const settingsLogPath = NodePath.join(settingsLogDir, "settings.ndjson");
       const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "spec-autonomy-handoff",
         T3_DROID_MOCK_SETTINGS_LOG: settingsLogPath,
       });
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "request.opened" && String(event.threadId) === String(threadId)
-          ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
-          : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-            ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-            : Effect.void,
-      ).pipe(Effect.forkChild);
-
+      const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "mock spec autonomy handoff",
-        attachments: [],
+      yield* sendDroidTurn(adapter, threadId, "mock spec autonomy handoff", {
         interactionMode: "plan",
       });
-      const opened = yield* Deferred.await(requestOpened);
+      const opened = yield* waitForType(threadId, "request.opened");
       assert.equal(opened.payload.requestType, "plan_approval");
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),
         "accept",
       );
-      const terminal = yield* Deferred.await(turnCompleted);
+      const terminal = yield* waitForType(threadId, "turn.completed");
       assert.equal(terminal.payload.state, "completed");
-
       // Droid derives the implementation autonomy from the selected
       // exit_spec_mode outcome. A full-access thread must answer with the
       // high-autonomy variant, or the implementation prompts for every edit
@@ -1873,9 +1516,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         exitSpecModeSelectedOption: "proceed_auto_run_high",
         resultingAutonomyLevel: "high",
       });
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -1887,65 +1527,30 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       const settleFile = NodePath.join(settleDir, "settle");
       const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "late-spec-approval",
         T3_DROID_MOCK_LATE_SPEC_SETTLE_FILE: settleFile,
       });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const requestOpened =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "request.opened" }>>();
-      const firstTurnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "request.opened" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(requestOpened, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(firstTurnCompleted, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const specTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock late spec approval",
-        attachments: [],
+      const specTurn = yield* sendDroidTurn(adapter, threadId, "mock late spec approval", {
         interactionMode: "plan",
       });
-      const opened = yield* Deferred.await(requestOpened);
+      const opened = yield* waitForType(threadId, "request.opened");
       // Release the mock's settle: the spec turn completes while the approval
       // is still pending.
       yield* Effect.promise(() => NodeFSP.writeFile(settleFile, ""));
-      yield* Deferred.await(firstTurnCompleted);
+      yield* waitForType(threadId, "turn.completed");
       yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(String(opened.requestId)),
         "accept",
       );
-
       // A stale arm from the late approval would let the NEXT plan turn adopt
       // a foreign successor envelope without any approval of its own.
-      const foreignCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const foreignFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "turn.completed" &&
-        String(event.threadId) === String(threadId) &&
-        event.turnId !== undefined &&
-        String(event.turnId) !== String(specTurn.turnId)
-          ? Deferred.succeed(foreignCompleted, event).pipe(Effect.asVoid)
-          : Effect.void,
-      ).pipe(Effect.forkChild);
-      const foreignTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock foreign spec envelope",
-        attachments: [],
+      const foreignTurn = yield* sendDroidTurn(adapter, threadId, "mock foreign spec envelope", {
         interactionMode: "plan",
       });
-      yield* Deferred.await(foreignCompleted);
-
+      yield* waitForType(threadId, "turn.completed", 2);
       const sessions = yield* adapter.listSessions();
       const threadText = eventsForThread(runtimeEvents, threadId)
         .filter(
@@ -1954,143 +1559,69 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         )
         .map((event) => event.payload.delta)
         .join("");
-
       assert.notInclude(threadText, "late implementation successor");
       assert.notInclude(threadText, "unapproved implementation successor");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-1",
         turnIds: [specTurn.turnId, foreignTurn.turnId],
       });
-
-      yield* Fiber.interrupt(foreignFiber);
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("rejects a foreign spec envelope without an approved handoff", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-unapproved-spec-envelope");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "foreign-spec-envelope",
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock foreign spec envelope",
-        attachments: [],
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock foreign spec envelope", {
         interactionMode: "plan",
       });
-      const terminal = yield* Deferred.await(turnCompleted);
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const sessions = yield* adapter.listSessions();
-      const assistantText = eventsForThread(runtimeEvents, threadId)
-        .filter(
-          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
-            event.type === "content.delta" &&
-            event.turnId !== undefined &&
-            String(event.turnId) === String(sentTurn.turnId) &&
-            event.payload.streamKind === "assistant_text",
-        )
-        .map((event) => event.payload.delta)
-        .join("");
-
-      assert.notInclude(assistantText, "unapproved implementation successor");
-      assert.include(assistantText, "hello from droid mock");
+      const text = assistantText(eventsForTurn(runtimeEvents, threadId, sentTurn.turnId));
+      assert.notInclude(text, "unapproved implementation successor");
+      assert.include(text, "hello from droid mock");
       assert.equal(terminal.payload.state, "completed");
       assert.deepStrictEqual(sessions[0]?.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-1",
         turnIds: [sentTurn.turnId],
       });
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("settles an unknown Droid terminal reason exactly once", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-future-terminal-reason");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock future terminal reason",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "future-terminal-reason",
       });
-      const terminal = yield* Deferred.await(turnCompleted);
-      const turnTerminals = eventsForThread(runtimeEvents, threadId).filter(
-        (event) =>
-          event.type === "turn.completed" &&
-          event.turnId !== undefined &&
-          String(event.turnId) === String(sentTurn.turnId),
-      );
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock future terminal reason");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       assert.equal(terminal.payload.state, "failed");
       assert.equal(
         terminal.payload.state === "failed" ? terminal.payload.errorMessage : undefined,
         "Droid turn ended with reason 'future_terminal_reason'.",
       );
-      assert.lengthOf(turnTerminals, 1);
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+      assertSingleTerminal(runtimeEvents, threadId, sentTurn.turnId);
     }),
   );
 
   it.effect("applies the selected model to Droid's separate spec-mode slots", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-spec-model");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "report-selected-model",
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock report selected model",
-        attachments: [],
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock report selected model", {
         interactionMode: "plan",
         modelSelection: {
           instanceId: ProviderInstanceId.make("droid"),
@@ -2098,75 +1629,33 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           options: [{ id: "reasoningEffort", value: "high" }],
         },
       });
-      yield* Deferred.await(turnCompleted);
-
-      const turnEvents = eventsForThread(runtimeEvents, threadId).filter(
-        (event) => event.turnId !== undefined && String(event.turnId) === String(sentTurn.turnId),
-      );
+      yield* waitForType(threadId, "turn.completed");
+      const turnEvents = eventsForTurn(runtimeEvents, threadId, sentTurn.turnId);
       const started = turnEvents.find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "turn.started" }> =>
           event.type === "turn.started",
       );
-      const modelReport = turnEvents
-        .filter(
-          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
-            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
-        )
-        .map((event) => event.payload.delta)
-        .join("");
-
       assert.deepEqual(started?.payload, { model: "mock-deep", effort: "high" });
-      assert.equal(modelReport, "mock-deep:high");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+      assert.equal(assistantText(turnEvents), "mock-deep:high");
     }),
   );
 
   it.effect("treats compaction as a no-op and reports the last-call context meter", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-compaction");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock compaction",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "compaction",
       });
-      const terminal = yield* Deferred.await(turnCompleted);
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock compaction");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       const threadEvents = eventsForThread(runtimeEvents, threadId);
-      const compactedUsage = threadEvents
-        .filter(
-          (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
-            event.type === "thread.token-usage.updated",
-        )
-        .find((event) => event.payload.usage.lastUsedTokens === 8);
-
-      assert.equal(terminal.payload.state, "completed");
-      assert.lengthOf(
-        threadEvents.filter(
-          (event) =>
-            event.type === "turn.completed" &&
-            event.turnId !== undefined &&
-            String(event.turnId) === String(sentTurn.turnId),
-        ),
-        1,
+      const compactedUsage = eventsOfType(threadEvents, "thread.token-usage.updated").find(
+        (event) => event.payload.usage.lastUsedTokens === 8,
       );
+      assert.equal(terminal.payload.state, "completed");
+      assertSingleTerminal(runtimeEvents, threadId, sentTurn.turnId);
       assert.deepInclude(compactedUsage?.payload.usage, {
         usedTokens: 8,
         totalProcessedTokens: 33,
@@ -2176,158 +1665,103 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         lastOutputTokens: 2,
         compactsAutomatically: true,
       });
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("maps child sessions to tasks without leaking child deltas into the main turn", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-child-session");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      const sentTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock child session",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "child-session",
       });
-      yield* Deferred.await(turnCompleted);
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const sentTurn = yield* sendDroidTurn(adapter, threadId, "mock child session");
+      yield* waitForType(threadId, "turn.completed");
       const threadEvents = eventsForThread(runtimeEvents, threadId);
-
-      assert.lengthOf(
-        threadEvents.filter((event) => event.type === "task.started"),
-        1,
-      );
-      assert.lengthOf(
-        threadEvents.filter((event) => event.type === "task.completed"),
-        1,
-      );
-      const progress = threadEvents.filter(
-        (event): event is Extract<ProviderRuntimeEvent, { type: "tool.progress" }> =>
-          event.type === "tool.progress",
-      );
+      assert.lengthOf(eventsOfType(threadEvents, "task.started"), 1);
+      assert.lengthOf(eventsOfType(threadEvents, "task.completed"), 1);
+      const progress = eventsOfType(threadEvents, "tool.progress");
       assert.lengthOf(progress, 1);
       assert.equal(String(progress[0]?.payload.taskId), "mock-session-child");
       assert.equal(progress[0]?.payload.toolUseId, `child-task-${String(sentTurn.turnId)}`);
       assert.equal(progress[0]?.payload.toolName, "Task");
       assert.equal(progress[0]?.payload.summary, "Inspecting delegated files");
       assert.notInclude(
-        threadEvents
-          .filter(
-            (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
-              event.type === "content.delta",
-          )
+        eventsOfType(threadEvents, "content.delta")
           .map((event) => event.payload.delta)
           .join(""),
         "child-only output",
       );
+    }),
+  );
 
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+  it.effect("settles an uncorrelated Droid child with its owning logical turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("droid-uncorrelated-child-turn");
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "hanging-child-session",
+      });
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      const turn = yield* sendDroidTurn(adapter, threadId, "start uncorrelated child");
+      const started = yield* waitForType(threadId, "task.started");
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      const threadEvents = eventsForThread(runtimeEvents, threadId);
+      const completed = threadEvents.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "task.completed" }> =>
+          event.type === "task.completed" &&
+          String(event.payload.taskId) === String(started.payload.taskId),
+      );
+      assert.isDefined(completed);
+      assert.equal(String(completed?.turnId), String(turn.turnId));
+      assert.equal(completed?.payload.status, "stopped");
+      assert.isBelow(threadEvents.indexOf(completed!), threadEvents.indexOf(terminal));
     }),
   );
 
   it.effect("stops open Droid child tasks before an explicit session exit", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-child-session-stop");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const taskStarted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "task.started" }>>();
-      const sessionExited =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "task.started" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(taskStarted, event).pipe(Effect.asVoid)
-              : event.type === "session.exited" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(sessionExited, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "mock hanging child session",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "hanging-child-session",
       });
-      const started = yield* Deferred.await(taskStarted);
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      yield* sendDroidTurn(adapter, threadId, "mock hanging child session");
+      const started = yield* waitForType(threadId, "task.started");
       yield* adapter.stopSession(threadId);
-      const exited = yield* Deferred.await(sessionExited);
+      const exited = yield* waitForType(threadId, "session.exited");
       const threadEvents = eventsForThread(runtimeEvents, threadId);
       const taskCompleted = threadEvents.filter(
         (event): event is Extract<ProviderRuntimeEvent, { type: "task.completed" }> =>
           event.type === "task.completed" &&
           String(event.payload.taskId) === String(started.payload.taskId),
       );
-
       assert.lengthOf(taskCompleted, 1, "stopping the session should settle its open child task");
       assert.equal(taskCompleted[0]?.payload.status, "stopped");
       assert.isBelow(threadEvents.indexOf(taskCompleted[0]!), threadEvents.indexOf(exited));
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
     }),
   );
 
   it.effect("stops open Droid child tasks before an unexpected process exit", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-child-session-process-exit");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const taskStarted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "task.started" }>>();
-      const sessionExited =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "session.exited" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "task.started" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(taskStarted, event).pipe(Effect.asVoid)
-              : event.type === "session.exited" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(sessionExited, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "mock child session then exit",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "child-session-exit",
       });
-      const started = yield* Deferred.await(taskStarted);
-      const exited = yield* Deferred.await(sessionExited);
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      yield* sendDroidTurn(adapter, threadId, "mock child session then exit");
+      const started = yield* waitForType(threadId, "task.started");
+      const exited = yield* waitForType(threadId, "session.exited");
       const threadEvents = eventsForThread(runtimeEvents, threadId);
       const taskCompleted = threadEvents.filter(
         (event): event is Extract<ProviderRuntimeEvent, { type: "task.completed" }> =>
           event.type === "task.completed" &&
           String(event.payload.taskId) === String(started.payload.taskId),
       );
-
       assert.lengthOf(
         taskCompleted,
         1,
@@ -2335,87 +1769,56 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       assert.equal(taskCompleted[0]?.payload.status, "stopped");
       assert.isBelow(threadEvents.indexOf(taskCompleted[0]!), threadEvents.indexOf(exited));
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
     }),
   );
 
   it.effect("drops Droid tool progress without an owning subagent session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-taskless-tool-progress");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
-      yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "mock taskless progress",
-        attachments: [],
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "taskless-progress",
       });
-      yield* Deferred.await(turnCompleted);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access");
+      yield* sendDroidTurn(adapter, threadId, "mock taskless progress");
+      yield* waitForType(threadId, "turn.completed");
       assert.lengthOf(
         eventsForThread(runtimeEvents, threadId).filter((event) => event.type === "tool.progress"),
         0,
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("restores durable Droid history before rollback after resume", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-rollback");
-      const { adapter } = yield* makeDroidScenario({ T3_DROID_MOCK_LOAD_STEERING_MESSAGES: "1" });
+      const { adapter } = yield* makeDroidScenario();
       const persistedTurnIds = [
         TurnId.make("persisted-turn-1"),
         TurnId.make("persisted-turn-2"),
         TurnId.make("persisted-turn-3"),
       ];
       const persistedAnchor = TurnId.make("persisted-anchor");
-
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
+      yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 2,
+          schemaVersion: 1,
           sessionId: "mock-session-known",
           turnIds: [...persistedTurnIds, persistedAnchor],
         },
       });
-
       const snapshot = yield* adapter.rollbackThread(threadId, {
         turnIds: persistedTurnIds,
         anchorTurnId: persistedAnchor,
       });
-
       assert.deepEqual(
         snapshot.turns.map((turn) => turn.id),
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });
-
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -2423,31 +1826,23 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-resumed-rollback-mismatch");
       const { adapter } = yield* makeDroidScenario();
-
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
+      yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 2,
+          schemaVersion: 1,
           sessionId: "mock-session-known",
           turnIds: [TurnId.make("persisted-turn-1"), TurnId.make("persisted-anchor")],
         },
       });
-
       const error = yield* adapter
         .rollbackThread(threadId, {
           turnIds: [TurnId.make("bogus-turn")],
           anchorTurnId: TurnId.make("persisted-anchor"),
         })
         .pipe(Effect.flip);
-
       assert.equal(error._tag, "ProviderAdapterValidationError");
       if (error._tag === "ProviderAdapterValidationError") {
         assert.equal(error.issue, "Rollback target does not match the current thread history.");
       }
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -2460,47 +1855,29 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         TurnId.make("persisted-turn-2"),
         TurnId.make("persisted-turn-3"),
       ];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "turn.completed" && String(event.threadId) === String(threadId)
-          ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-          : Effect.void,
-      ).pipe(Effect.forkChild);
-
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("droid"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
+      const { waitForType } = yield* collectDroidEvents(adapter);
+      yield* startDroidSession(adapter, threadId, "full-access", {
         resumeCursor: {
-          schemaVersion: 2,
+          schemaVersion: 1,
           sessionId: "mock-session-known",
           turnIds: persistedTurnIds,
         },
       });
-      const resumedTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "turn after restart",
-        attachments: [],
-      });
-      yield* Deferred.await(turnCompleted);
-
+      const resumedTurn = yield* sendDroidTurn(adapter, threadId, "turn after restart");
+      yield* waitForType(threadId, "turn.completed");
       const snapshot = yield* adapter.rollbackThread(threadId, {
         turnIds: persistedTurnIds,
         anchorTurnId: resumedTurn.turnId,
       });
-
       assert.deepEqual(
         snapshot.turns.map((turn) => turn.id),
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });
-
       const repeated = yield* adapter.rollbackThread(threadId, {
         turnIds: persistedTurnIds,
       });
@@ -2509,132 +1886,64 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         persistedTurnIds,
       );
       assert.deepStrictEqual(repeated.resumeCursor, {
-        schemaVersion: 2,
+        schemaVersion: 1,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
   it.effect("settles a coalesced steering turn exactly once", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-steering-coalesced");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const steeringReady =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "item.started" &&
-              event.payload.itemType === "command_execution" &&
-              String(event.threadId) === String(threadId)
-              ? Deferred.succeed(steeringReady, event).pipe(Effect.asVoid)
-              : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "steering-coalesced",
+      });
+      const { events: runtimeEvents, waitFor, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const openingTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock steering original",
-        attachments: [],
-      });
-      yield* Deferred.await(steeringReady);
-      const steeredTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock steering coalesced",
-        attachments: [],
-      });
-      const terminal = yield* Deferred.await(turnCompleted);
-
+      const openingTurn = yield* sendDroidTurn(adapter, threadId, "mock steering original");
+      yield* waitFor(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "item.started" }> =>
+          event.type === "item.started" &&
+          event.payload.itemType === "command_execution" &&
+          String(event.threadId) === String(threadId),
+      );
+      const steeredTurn = yield* sendDroidTurn(adapter, threadId, "mock steering coalesced");
+      const terminal = yield* waitForType(threadId, "turn.completed");
       assert.equal(String(steeredTurn.turnId), String(openingTurn.turnId));
       assert.equal(terminal.payload.state, "completed");
-      assert.lengthOf(
-        eventsForThread(runtimeEvents, threadId).filter(
-          (event) =>
-            event.type === "turn.completed" &&
-            event.turnId !== undefined &&
-            String(event.turnId) === String(openingTurn.turnId),
-        ),
-        1,
-      );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+      assertSingleTerminal(runtimeEvents, threadId, openingTurn.turnId);
     }),
   );
 
   it.effect("keeps a steered turn open when the queued message runs separately", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-steering-separate");
-      const { adapter } = yield* makeDroidScenario();
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const steeringReady =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.started" }>>();
-      const separateAssistantCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "item.completed" }>>();
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "item.started" &&
-              event.payload.itemType === "command_execution" &&
-              String(event.threadId) === String(threadId)
-              ? Deferred.succeed(steeringReady, event).pipe(Effect.asVoid)
-              : event.type === "item.completed" &&
-                  event.payload.itemType === "assistant_message" &&
-                  String(event.threadId) === String(threadId)
-                ? Deferred.succeed(separateAssistantCompleted, event).pipe(Effect.asVoid)
-                : event.type === "turn.completed" && String(event.threadId) === String(threadId)
-                  ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-                  : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { adapter } = yield* makeDroidScenario({
+        T3_DROID_MOCK_SCENARIO: "steering-separate",
+      });
+      const { events: runtimeEvents, waitFor, waitForType } = yield* collectDroidEvents(adapter);
+      const commandStarted = (
+        event: ProviderRuntimeEvent,
+      ): event is Extract<ProviderRuntimeEvent, { type: "item.started" }> =>
+        event.type === "item.started" &&
+        event.payload.itemType === "command_execution" &&
+        String(event.threadId) === String(threadId);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const openingTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock steering original",
-        attachments: [],
-      });
-      yield* Deferred.await(steeringReady);
-      const steeredTurn = yield* adapter.sendTurn({
-        threadId,
-        input: "mock steering separate",
-        attachments: [],
-      });
-      yield* Deferred.await(separateAssistantCompleted);
-      const terminal = yield* Deferred.await(turnCompleted);
-
-      assert.equal(String(steeredTurn.turnId), String(openingTurn.turnId));
-      assert.equal(terminal.payload.state, "completed");
+      const openingTurn = yield* sendDroidTurn(adapter, threadId, "mock steering original");
+      yield* waitFor(commandStarted);
+      const steeredTurn = yield* sendDroidTurn(adapter, threadId, "mock steering separate");
+      yield* waitFor(commandStarted, 2);
       assert.lengthOf(
-        eventsForThread(runtimeEvents, threadId).filter(
-          (event) =>
-            event.type === "turn.completed" &&
-            event.turnId !== undefined &&
-            String(event.turnId) === String(openingTurn.turnId),
-        ),
-        1,
+        eventsOfType(eventsForThread(runtimeEvents, threadId), "turn.completed"),
+        0,
+        "the first physical terminal must not settle while the queued run is still active",
       );
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
+      yield* adapter.interruptTurn(threadId, openingTurn.turnId);
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      assert.equal(String(steeredTurn.turnId), String(openingTurn.turnId));
+      assert.equal(terminal.payload.state, "cancelled");
+      assertSingleTerminal(runtimeEvents, threadId, openingTurn.turnId);
     }),
   );
 
@@ -2642,43 +1951,17 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("droid-unknown-notification");
       const { adapter } = yield* makeDroidScenario({
-        T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION: "1",
+        T3_DROID_MOCK_SCENARIO: "unknown-notification",
       });
-      const runtimeEvents: ProviderRuntimeEvent[] = [];
-      const turnCompleted =
-        yield* Deferred.make<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>>();
-      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          runtimeEvents.push(event);
-        }).pipe(
-          Effect.andThen(
-            event.type === "turn.completed" && String(event.threadId) === String(threadId)
-              ? Deferred.succeed(turnCompleted, event).pipe(Effect.asVoid)
-              : Effect.void,
-          ),
-        ),
-      ).pipe(Effect.forkChild);
-
+      const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      yield* adapter.sendTurn({
-        threadId,
-        input: "tolerate future notifications",
-        attachments: [],
-      });
-      const terminal = yield* Deferred.await(turnCompleted);
-      const assistantText = eventsForThread(runtimeEvents, threadId)
-        .filter(
-          (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
-            event.type === "content.delta" && event.payload.streamKind === "assistant_text",
-        )
-        .map((event) => event.payload.delta)
-        .join("");
-
-      assert.equal(assistantText, "hello from droid mock");
+      yield* sendDroidTurn(adapter, threadId, "tolerate future notifications");
+      const terminal = yield* waitForType(threadId, "turn.completed");
+      assert.equal(
+        assistantText(eventsForThread(runtimeEvents, threadId)),
+        "hello from droid mock",
+      );
       assert.equal(terminal.payload.state, "completed");
-
-      yield* Fiber.interrupt(runtimeEventsFiber);
-      yield* adapter.stopSession(threadId);
     }),
   );
 });

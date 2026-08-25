@@ -46,6 +46,7 @@ import {
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "../providerMaintenance.ts";
 import {
+  haveProviderSnapshotEnrichmentSettingsChanged,
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
@@ -130,6 +131,7 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
+        haveEnrichmentSettingsChanged: haveProviderSnapshotEnrichmentSettingsChanged,
         initialSnapshot: (settings) =>
           buildInitialCursorProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,

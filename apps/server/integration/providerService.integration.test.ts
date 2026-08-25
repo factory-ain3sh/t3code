@@ -239,12 +239,15 @@ it.live("runs multi-turn tool/approval flow", () =>
       });
       assert.equal((session.threadId ?? "").length > 0, true);
 
-      const unprovableAnchor = yield* fixture.harness.adapter
-        .rollbackThread(session.threadId, {
-          turnIds: [],
-          anchorTurnId: TurnId.make("unreconstructed-turn"),
-        })
-        .pipe(Effect.result);
+      const rollbackThread = fixture.harness.adapter.rollbackThread;
+      assert.isDefined(rollbackThread);
+      if (rollbackThread === undefined) {
+        return;
+      }
+      const unprovableAnchor = yield* rollbackThread(session.threadId, {
+        turnIds: [],
+        anchorTurnId: TurnId.make("unreconstructed-turn"),
+      }).pipe(Effect.result);
       assert.equal(unprovableAnchor._tag, "Failure");
       if (unprovableAnchor._tag === "Failure") {
         assert.equal(unprovableAnchor.failure._tag, "ProviderAdapterValidationError");
@@ -330,10 +333,13 @@ it.live("rolls back provider conversation state only", () =>
         },
       });
 
-      yield* provider.rollbackConversation({
-        threadId: session.threadId,
-        turnIds: [TurnId.make(String(firstTurnStartedId))],
-      });
+      yield* provider.withSessionLifecycleLock(
+        session.threadId,
+        provider.rollbackConversation({
+          threadId: session.threadId,
+          turnIds: [TurnId.make(String(firstTurnStartedId))],
+        }),
+      );
 
       const rollbackCalls = fixture.harness.getRollbackCalls(session.threadId);
       assert.deepEqual(rollbackCalls, [1]);

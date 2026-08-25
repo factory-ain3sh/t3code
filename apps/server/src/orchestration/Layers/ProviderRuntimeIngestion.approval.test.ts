@@ -1,6 +1,7 @@
 import {
   EventId,
   ProviderDriverKind,
+  ProviderSessionLease,
   RuntimeRequestId,
   ThreadId,
   type ProviderRuntimeEvent,
@@ -8,6 +9,13 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import { runtimeEventToActivities } from "./ProviderRuntimeIngestion.ts";
+
+const base = {
+  provider: ProviderDriverKind.make("codex"),
+  sessionLease: ProviderSessionLease.make("lease-runtime-approval"),
+  createdAt: "2026-07-18T00:00:00.000Z",
+  threadId: ThreadId.make("thread-1"),
+};
 
 describe("runtimeEventToActivities approval details", () => {
   it("preserves approval details and approval options", () => {
@@ -18,11 +26,9 @@ describe("runtimeEventToActivities approval details", () => {
       { decision: "cancel", label: "Cancel" },
     ] as const;
     const event = {
+      ...base,
       type: "request.opened",
       eventId: EventId.make("evt-request-opened"),
-      provider: ProviderDriverKind.make("codex"),
-      createdAt: "2026-07-18T00:00:00.000Z",
-      threadId: ThreadId.make("thread-1"),
       requestId: RuntimeRequestId.make("approval-1"),
       payload: {
         requestType: "command_execution_approval",
@@ -45,11 +51,9 @@ describe("runtimeEventToActivities approval details", () => {
       { decision: "accept", label: "Approve" },
     ] as const;
     const event = {
+      ...base,
       type: "request.opened",
       eventId: EventId.make("evt-mcp-elicitation"),
-      provider: ProviderDriverKind.make("codex"),
-      createdAt: "2026-08-24T00:00:00.000Z",
-      threadId: ThreadId.make("thread-1"),
       requestId: RuntimeRequestId.make("approval-safari"),
       payload: {
         requestType: "mcp_elicitation_approval",

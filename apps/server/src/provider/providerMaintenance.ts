@@ -3,6 +3,7 @@ import {
   type ServerProvider,
   type ServerProviderVersionAdvisory,
 } from "@t3tools/contracts";
+import { causeErrorTag } from "@t3tools/shared/observability";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import { resolveCommandPath } from "@t3tools/shared/shell";
 import * as Config from "effect/Config";
@@ -506,4 +507,27 @@ export const enrichProviderSnapshotWithVersionAdvisory = Effect.fn(
       maintenanceCapabilities: capabilities,
     }),
   };
+});
+
+export const enrichAndPublishProviderVersionAdvisory = Effect.fn(
+  "enrichAndPublishProviderVersionAdvisory",
+)(function* (input: {
+  readonly providerLabel: string;
+  readonly snapshot: ServerProvider;
+  readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
+  readonly enableProviderUpdateChecks?: boolean;
+  readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
+  readonly httpClient: HttpClient.HttpClient;
+}) {
+  yield* enrichProviderSnapshotWithVersionAdvisory(input.snapshot, input.maintenanceCapabilities, {
+    enableProviderUpdateChecks: input.enableProviderUpdateChecks,
+  }).pipe(
+    Effect.provideService(HttpClient.HttpClient, input.httpClient),
+    Effect.flatMap(input.publishSnapshot),
+    Effect.catchCause((cause) =>
+      Effect.logWarning(`${input.providerLabel} version advisory enrichment failed`, {
+        errorTag: causeErrorTag(cause),
+      }),
+    ),
+  );
 });

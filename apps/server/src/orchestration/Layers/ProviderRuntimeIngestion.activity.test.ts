@@ -1,6 +1,7 @@
 import {
   EventId,
   ProviderDriverKind,
+  ProviderSessionLease,
   RuntimeTaskId,
   ThreadId,
   type ProviderRuntimeEvent,
@@ -11,6 +12,7 @@ import { runtimeEventToActivities } from "./ProviderRuntimeIngestion.ts";
 
 const base = {
   provider: ProviderDriverKind.make("codex"),
+  sessionLease: ProviderSessionLease.make("lease-runtime-activity"),
   createdAt: "2026-08-06T00:00:00.000Z",
   threadId: ThreadId.make("thread-1"),
 };

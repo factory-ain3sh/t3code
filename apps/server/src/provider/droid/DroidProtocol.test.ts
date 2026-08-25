@@ -14,132 +14,38 @@ import {
 
 const decodeNotification = Schema.decodeUnknownSync(DroidSessionNotification);
 const decodePermissionRequest = Schema.decodeUnknownSync(DroidPermissionRequest);
-const decodeInitializeSessionResult = Schema.decodeUnknownSync(DroidInitializeSessionResult);
-const decodeLoadSessionResult = Schema.decodeUnknownSync(DroidLoadSessionResult);
-const decodeExecuteRewindResult = Schema.decodeUnknownSync(DroidExecuteRewindResult);
-const decodeModelInfo = Schema.decodeUnknownSync(DroidModelInfo);
-const decodeSkillInfo = Schema.decodeUnknownSync(DroidSkillInfo);
-
-const usage = {
-  inputTokens: 10,
-  outputTokens: 5,
-  cacheCreationTokens: 1,
-  cacheReadTokens: 2,
-  thinkingTokens: 3,
-};
-
-const fixtures: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
-  [
-    "assistant_text_delta",
-    { type: "assistant_text_delta", messageId: "m1", blockIndex: 0, textDelta: "hello" },
-  ],
-  ["assistant_text_complete", { type: "assistant_text_complete", messageId: "m1", blockIndex: 0 }],
-  [
-    "thinking_text_delta",
-    { type: "thinking_text_delta", messageId: "m1", blockIndex: 0, textDelta: "hmm" },
-  ],
-  [
-    "thinking_text_complete",
-    { type: "thinking_text_complete", messageId: "m1", blockIndex: 0, durationMs: 12 },
-  ],
-  [
-    "tool_call",
-    {
-      type: "tool_call",
-      toolUse: { type: "tool_use", id: "tool-1", input: { path: "README.md" }, name: "Read" },
-    },
-  ],
-  [
-    "tool_result",
-    {
-      type: "tool_result",
-      messageId: "m1",
-      toolUseId: "tool-1",
-      content: [{ type: "text", text: "contents" }],
-    },
-  ],
-  [
-    "tool_execution_phase_changed",
-    {
-      type: "tool_execution_phase_changed",
-      toolUseId: "tool-1",
-      toolName: "Read",
-      phase: "executing",
-    },
-  ],
-  ["create_message", { type: "create_message", message: { id: "m1", role: "assistant" } }],
-  ["droid_working_state_changed", { type: "droid_working_state_changed", newState: "thinking" }],
-  [
-    "agent_turn_completed",
-    { type: "agent_turn_completed", reason: "completed", turnId: "turn-1", tokenUsage: usage },
-  ],
-  [
-    "session_token_usage_changed",
-    {
-      type: "session_token_usage_changed",
-      sessionId: "s1",
-      tokenUsage: usage,
-      lastCallTokenUsage: {
-        inputTokens: 8,
-        cacheReadTokens: 2,
-        outputTokens: 4,
-      },
-    },
-  ],
-  [
-    "session_compacted",
-    {
-      type: "session_compacted",
-      summaryId: "summary-1",
-      removedCount: 12,
-      visibleBoundaryMessageId: "message-4",
-    },
-  ],
-  [
-    "error",
-    {
-      type: "error",
-      message: "bad",
-      errorType: "SessionError",
-      timestamp: "2026-08-23T00:00:00.000Z",
-    },
-  ],
-  ["llm_retry", { type: "llm_retry", attempt: 2, reason: "rate_limited" }],
-  [
-    "session_title_updated",
-    { type: "session_title_updated", title: "A useful title", updateType: "llm_generated" },
-  ],
-  [
-    "child_session_available",
-    { type: "child_session_available", childSessionId: "child-1", timestamp: 123 },
-  ],
-  [
-    "permission_resolved",
-    {
-      type: "permission_resolved",
-      requestId: "permission-1",
-      toolUseIds: ["tool-1"],
-      selectedOption: "proceed_once",
-    },
-  ],
-  [
-    "queued_messages_discarded",
-    { type: "queued_messages_discarded", text: "discarded", requestId: "queued-1" },
-  ],
-  ["mcp_status_changed", { type: "mcp_status_changed", servers: [], summary: { status: "ready" } }],
-  [
-    "settings_updated",
-    {
-      type: "settings_updated",
-      requestId: "settings-1",
-      settings: { modelId: "mock-fast", reasoningEffort: "high", autonomyLevel: "medium" },
-    },
-  ],
-  [
-    "structured_output",
-    { type: "structured_output", messageId: "m1", structuredOutput: { answer: 42 } },
-  ],
-];
+const decodeInitialize = Schema.decodeUnknownSync(DroidInitializeSessionResult);
+const decodeLoad = Schema.decodeUnknownSync(DroidLoadSessionResult);
+const decodeRewind = Schema.decodeUnknownSync(DroidExecuteRewindResult);
+const usage = JSON.parse(
+  `{"inputTokens":10,"outputTokens":5,"cacheCreationTokens":1,"cacheReadTokens":2,"thinkingTokens":3}`,
+) as Record<string, number>;
+const fixtureJson = [
+  `{"type":"assistant_text_delta","messageId":"m1","blockIndex":0,"textDelta":"hello"}`,
+  `{"type":"assistant_text_complete","messageId":"m1","blockIndex":0}`,
+  `{"type":"thinking_text_delta","messageId":"m1","blockIndex":0,"textDelta":"hmm"}`,
+  `{"type":"thinking_text_complete","messageId":"m1","blockIndex":0,"durationMs":12}`,
+  `{"type":"tool_call","toolUse":{"type":"tool_use","id":"tool-1","input":{"path":"README.md"},"name":"Read"}}`,
+  `{"type":"tool_result","messageId":"m1","toolUseId":"tool-1","content":[{"type":"text","text":"contents"}]}`,
+  `{"type":"create_message","message":{"id":"m1","role":"assistant"}}`,
+  `{"type":"agent_turn_completed","reason":"completed","turnId":"turn-1"}`,
+  `{"type":"session_token_usage_changed","sessionId":"s1","lastCallTokenUsage":{"inputTokens":8,"cacheReadTokens":2,"outputTokens":4}}`,
+  `{"type":"session_compacted","summaryId":"summary-1","removedCount":12,"visibleBoundaryMessageId":"message-4"}`,
+  `{"type":"error","message":"bad","errorType":"SessionError","timestamp":"2026-08-23T00:00:00.000Z"}`,
+  `{"type":"llm_retry","attempt":2,"reason":"rate_limited"}`,
+  `{"type":"session_title_updated","title":"A useful title","updateType":"llm_generated"}`,
+  `{"type":"child_session_available","childSessionId":"child-1","timestamp":123}`,
+  `{"type":"structured_output","messageId":"m1","structuredOutput":{"answer":42}}`,
+] as const;
+const fixtures: ReadonlyArray<readonly [string, Record<string, unknown>]> = fixtureJson.map(
+  (json) => {
+    const fixture = JSON.parse(json) as Record<string, unknown>;
+    if (fixture.type === "agent_turn_completed" || fixture.type === "session_token_usage_changed") {
+      fixture.tokenUsage = usage;
+    }
+    return [String(fixture.type), fixture];
+  },
+);
 
 describe("DroidSessionNotification", () => {
   it("keeps the known-type guard in parity with every schema member", () => {
@@ -150,47 +56,23 @@ describe("DroidSessionNotification", () => {
   });
 
   for (const [type, fixture] of fixtures) {
-    it(`decodes ${type}`, () => {
-      const decoded = decodeNotification(fixture);
-      assert.equal(decoded.type, type);
+    it(`decodes ${type}`, () => assert.equal(decodeNotification(fixture).type, type));
+  }
+
+  for (const reason of ["future_terminal_reason", "spec_handoff"]) {
+    it(`preserves terminal reason ${reason}`, () => {
+      const decoded = decodeNotification({
+        type: "agent_turn_completed",
+        reason,
+        turnId: "turn-1",
+        tokenUsage: usage,
+      });
+      assert.equal(decoded.type, "agent_turn_completed");
+      if (decoded.type === "agent_turn_completed") assert.equal(decoded.reason, reason);
     });
   }
 
-  it("decodes unknown notification types into the forward-compatible fallback", () => {
-    const decoded = decodeNotification({
-      type: "future_notification",
-      newField: { nested: true },
-    });
-
-    assert.equal(decoded.type, "__unknown__");
-    assert.deepStrictEqual(decoded, { type: "__unknown__" });
-  });
-
-  it("preserves future terminal reasons for adapter-level failure projection", () => {
-    const decoded = decodeNotification({
-      type: "agent_turn_completed",
-      reason: "future_terminal_reason",
-      turnId: "turn-future",
-      tokenUsage: usage,
-    });
-
-    assert.equal(decoded.type, "agent_turn_completed");
-    if (decoded.type === "agent_turn_completed") {
-      assert.equal(decoded.reason, "future_terminal_reason");
-    }
-  });
-
-  it("decodes ignored notifications from their discriminator alone", () => {
-    assert.deepStrictEqual(
-      decodeNotification({
-        type: "settings_updated",
-        settings: "reshaped-by-a-newer-cli",
-      }),
-      { type: "settings_updated" },
-    );
-  });
-
-  it("tolerates and strips extra fields from known notifications", () => {
+  it("strips extra fields from known notifications", () => {
     const decoded = decodeNotification({
       type: "assistant_text_delta",
       messageId: "m1",
@@ -198,70 +80,38 @@ describe("DroidSessionNotification", () => {
       textDelta: "hello",
       addedByNewerCli: true,
     });
-
     assert.equal(decoded.type, "assistant_text_delta");
     assert.notProperty(decoded, "addedByNewerCli");
   });
 
-  it("decodes attributed tool progress and strips unknown update fields", () => {
-    const decoded = decodeNotification({
-      type: "tool_progress_update",
-      toolUseId: "tool-1",
-      toolName: "Task",
-      update: {
-        type: "status",
-        status: "running",
-        text: "Inspecting the repository",
-        subagentSessionId: "child-1",
-        addedByNewerCli: true,
-      },
+  for (const [name, inputJson, expectedJson, absent] of [
+    [
+      "attributed",
+      `{"type":"tool_progress_update","toolUseId":"tool-1","toolName":"Task","update":{"type":"status","status":"running","text":"Inspecting the repository","subagentSessionId":"child-1","addedByNewerCli":true}}`,
+      `{"status":"running","text":"Inspecting the repository","subagentSessionId":"child-1"}`,
+      "addedByNewerCli",
+    ],
+    [
+      "unattributed",
+      `{"type":"tool_progress_update","toolUseId":"tool-2","toolName":"Execute","update":{"type":"message","details":"Still running","valueSnippet":"line 42"}}`,
+      `{"details":"Still running","valueSnippet":"line 42"}`,
+      "subagentSessionId",
+    ],
+  ] as const) {
+    it(`decodes ${name} tool progress`, () => {
+      const decoded = decodeNotification(JSON.parse(inputJson));
+      assert.equal(decoded.type, "tool_progress_update");
+      if (decoded.type === "tool_progress_update") {
+        assert.deepStrictEqual(decoded.update, JSON.parse(expectedJson));
+        assert.notProperty(decoded.update, absent);
+      }
     });
+  }
 
-    assert.equal(decoded.type, "tool_progress_update");
-    if (decoded.type === "tool_progress_update") {
-      assert.deepStrictEqual(decoded.update, {
-        status: "running",
-        text: "Inspecting the repository",
-        subagentSessionId: "child-1",
-      });
-      assert.notProperty(decoded.update, "addedByNewerCli");
-    }
-  });
-
-  it("decodes tool progress without a subagent session id", () => {
-    const decoded = decodeNotification({
-      type: "tool_progress_update",
-      toolUseId: "tool-2",
-      toolName: "Execute",
-      update: {
-        type: "message",
-        details: "Still running",
-        valueSnippet: "line 42",
-      },
-    });
-
-    assert.equal(decoded.type, "tool_progress_update");
-    if (decoded.type === "tool_progress_update") {
-      assert.deepStrictEqual(decoded.update, {
-        details: "Still running",
-        valueSnippet: "line 42",
-      });
-      assert.notProperty(decoded.update, "subagentSessionId");
-    }
-  });
-
-  it("decodes lastCallTokenUsage for context-window accounting", () => {
-    const decoded = decodeNotification({
-      type: "session_token_usage_changed",
-      sessionId: "s1",
-      tokenUsage: usage,
-      lastCallTokenUsage: {
-        inputTokens: 8,
-        cacheReadTokens: 2,
-        outputTokens: 4,
-      },
-    });
-
+  it("decodes valid last-call usage and rejects malformed usage", () => {
+    const decoded = decodeNotification(
+      fixtures.find(([type]) => type === "session_token_usage_changed")?.[1],
+    );
     assert.equal(decoded.type, "session_token_usage_changed");
     if (decoded.type === "session_token_usage_changed") {
       assert.deepStrictEqual(decoded.lastCallTokenUsage, {
@@ -270,84 +120,45 @@ describe("DroidSessionNotification", () => {
         outputTokens: 4,
       });
     }
-  });
-
-  it("rejects malformed lastCallTokenUsage instead of treating it as unknown", () => {
     assert.throws(() =>
       decodeNotification({
         type: "session_token_usage_changed",
         sessionId: "s1",
         tokenUsage: usage,
-        lastCallTokenUsage: {
-          inputTokens: "invalid",
-          cacheReadTokens: 2,
-        },
+        lastCallTokenUsage: { inputTokens: "invalid", cacheReadTokens: 2 },
       }),
-    );
-  });
-
-  it("decodes spec_handoff as a successful terminal reason", () => {
-    const decoded = decodeNotification({
-      type: "agent_turn_completed",
-      reason: "spec_handoff",
-      turnId: "spec-turn",
-      tokenUsage: usage,
-    });
-
-    assert.equal(decoded.type, "agent_turn_completed");
-    if (decoded.type === "agent_turn_completed") {
-      assert.equal(decoded.reason, "spec_handoff");
-    }
-  });
-});
-
-describe("DroidInitializeSessionResult", () => {
-  it("decodes only the session id consumed by the adapter", () => {
-    assert.deepStrictEqual(
-      decodeInitializeSessionResult({
-        sessionId: "session-1",
-        session: "reshaped-by-a-newer-cli",
-        settings: null,
-      }),
-      { sessionId: "session-1" },
     );
   });
 });
 
-describe("DroidLoadSessionResult", () => {
-  it("decodes only resumed-session usage consumed by the adapter", () => {
-    const decoded = decodeLoadSessionResult({
-      session: "reshaped-by-a-newer-cli",
+it("keeps only adapter-consumed result fields", () => {
+  assert.deepStrictEqual(
+    decodeInitialize({
+      sessionId: "session-1",
+      session: "reshaped",
       settings: null,
-      lastCallTokenUsage: {
-        inputTokens: 21,
-        cacheReadTokens: 5,
-        outputTokens: 3,
-      },
-    });
-
-    assert.deepStrictEqual(decoded.lastCallTokenUsage, {
-      inputTokens: 21,
-      cacheReadTokens: 5,
-      outputTokens: 3,
-    });
-  });
-});
-
-describe("DroidExecuteRewindResult", () => {
-  it("decodes only the successor session id consumed by the adapter", () => {
-    assert.deepStrictEqual(
-      decodeExecuteRewindResult({
-        newSessionId: "session-rewound",
-        restoredCount: "reshaped-by-a-newer-cli",
-      }),
-      { newSessionId: "session-rewound" },
-    );
-  });
+    }),
+    { sessionId: "session-1" },
+  );
+  assert.deepStrictEqual(
+    decodeLoad({
+      session: "reshaped",
+      settings: null,
+      lastCallTokenUsage: { inputTokens: 21, cacheReadTokens: 5, outputTokens: 3 },
+    }).lastCallTokenUsage,
+    { inputTokens: 21, cacheReadTokens: 5, outputTokens: 3 },
+  );
+  assert.deepStrictEqual(
+    decodeRewind({
+      newSessionId: "session-rewound",
+      restoredCount: "reshaped",
+    }),
+    { newSessionId: "session-rewound" },
+  );
 });
 
 describe("DroidPermissionRequest", () => {
-  it("rejects permission requests with no tool to classify or render", () => {
+  it("rejects requests with no tool to classify or render", () => {
     assert.throws(() =>
       decodePermissionRequest({
         toolUses: [],
@@ -356,7 +167,7 @@ describe("DroidPermissionRequest", () => {
     );
   });
 
-  it("decodes the canonical option and only permission detail fields the adapter consumes", () => {
+  it("decodes canonical options and only consumed permission details", () => {
     const decoded = decodePermissionRequest({
       toolUses: [
         {
@@ -371,33 +182,21 @@ describe("DroidPermissionRequest", () => {
             type: "exec",
             fullCommand: "echo hello",
             command: "echo",
-            extractedCommands: "reshaped-by-a-newer-cli",
+            extractedCommands: "reshaped",
             impactLevel: { future: true },
           },
         },
       ],
       options: [{ label: "Allow once", value: "proceed_once" }],
-      associatedSessionIds: "reshaped-by-a-newer-cli",
+      associatedSessionIds: "reshaped",
     });
-
     assert.deepStrictEqual(
-      {
-        toolUses: decoded.toolUses,
-        options: decoded.options,
-      },
+      { toolUses: decoded.toolUses, options: decoded.options },
       {
         toolUses: [
           {
-            toolUse: {
-              id: "tool-exec",
-              input: { command: "echo hello" },
-              name: "Execute",
-            },
-            details: {
-              type: "exec",
-              fullCommand: "echo hello",
-              command: "echo",
-            },
+            toolUse: { id: "tool-exec", input: { command: "echo hello" }, name: "Execute" },
+            details: { type: "exec", fullCommand: "echo hello", command: "echo" },
           },
         ],
         options: [{ label: "Allow once", outcome: "proceed_once" }],
@@ -406,22 +205,11 @@ describe("DroidPermissionRequest", () => {
   });
 });
 
-describe("Droid inventory entries", () => {
-  it("requires the model metadata guaranteed by list_models", () => {
-    assert.throws(() =>
-      decodeModelInfo({
-        id: "mock-fast",
-        displayName: "Mock Fast",
-      }),
-    );
+for (const [name, schema, fixture] of [
+  ["model metadata", DroidModelInfo, { id: "mock-fast", displayName: "Mock Fast" }],
+  ["skill location", DroidSkillInfo, { name: "verify", filePath: "/skills/verify/SKILL.md" }],
+] as const) {
+  it(`requires ${name}`, () => {
+    assert.throws(() => Schema.decodeUnknownSync(schema)(fixture));
   });
-
-  it("requires the skill location guaranteed by list_skills", () => {
-    assert.throws(() =>
-      decodeSkillInfo({
-        name: "verify",
-        filePath: "/skills/verify/SKILL.md",
-      }),
-    );
-  });
-});
+}

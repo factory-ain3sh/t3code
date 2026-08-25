@@ -7,6 +7,7 @@ import {
   type EventId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
+  type ProviderSessionLease,
   type RuntimeRequestId,
   type ThreadId,
   type ToolLifecycleItemType,
@@ -80,6 +81,7 @@ function runtimeItemStatusFromAcpToolStatus(
 export function makeAcpRequestOpenedEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
+  readonly sessionLease: ProviderSessionLease;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly requestId: RuntimeRequestId;
@@ -95,6 +97,7 @@ export function makeAcpRequestOpenedEvent(input: {
     type: "request.opened",
     ...input.stamp,
     provider: input.provider,
+    sessionLease: input.sessionLease,
     threadId: input.threadId,
     turnId: input.turnId,
     requestId: input.requestId,
@@ -115,6 +118,7 @@ export function makeAcpRequestOpenedEvent(input: {
 export function makeAcpRequestResolvedEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
+  readonly sessionLease: ProviderSessionLease;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly requestId: RuntimeRequestId;
@@ -125,6 +129,7 @@ export function makeAcpRequestResolvedEvent(input: {
     type: "request.resolved",
     ...input.stamp,
     provider: input.provider,
+    sessionLease: input.sessionLease,
     threadId: input.threadId,
     turnId: input.turnId,
     requestId: input.requestId,
@@ -138,6 +143,7 @@ export function makeAcpRequestResolvedEvent(input: {
 export function makeAcpPlanUpdatedEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
+  readonly sessionLease: ProviderSessionLease;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly payload: AcpPlanUpdate;
@@ -149,6 +155,7 @@ export function makeAcpPlanUpdatedEvent(input: {
     type: "turn.plan.updated",
     ...input.stamp,
     provider: input.provider,
+    sessionLease: input.sessionLease,
     threadId: input.threadId,
     turnId: input.turnId,
     payload: input.payload,
@@ -163,6 +170,7 @@ export function makeAcpPlanUpdatedEvent(input: {
 export function makeAcpToolCallEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
+  readonly sessionLease: ProviderSessionLease;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly toolCall: AcpToolCallState;
@@ -176,6 +184,7 @@ export function makeAcpToolCallEvent(input: {
         : "item.updated",
     ...input.stamp,
     provider: input.provider,
+    sessionLease: input.sessionLease,
     threadId: input.threadId,
     turnId: input.turnId,
     itemId: RuntimeItemId.make(input.toolCall.toolCallId),
@@ -197,6 +206,7 @@ export function makeAcpToolCallEvent(input: {
 export function makeAcpAssistantItemEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
+  readonly sessionLease: ProviderSessionLease;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly itemId: string;
@@ -206,6 +216,7 @@ export function makeAcpAssistantItemEvent(input: {
     type: input.lifecycle,
     ...input.stamp,
     provider: input.provider,
+    sessionLease: input.sessionLease,
     threadId: input.threadId,
     turnId: input.turnId,
     itemId: RuntimeItemId.make(input.itemId),
@@ -219,6 +230,7 @@ export function makeAcpAssistantItemEvent(input: {
 export function makeAcpContentDeltaEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
+  readonly sessionLease: ProviderSessionLease;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly itemId?: string;
@@ -229,6 +241,7 @@ export function makeAcpContentDeltaEvent(input: {
     type: "content.delta",
     ...input.stamp,
     provider: input.provider,
+    sessionLease: input.sessionLease,
     threadId: input.threadId,
     turnId: input.turnId,
     ...(input.itemId ? { itemId: RuntimeItemId.make(input.itemId) } : {}),

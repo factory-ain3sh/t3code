@@ -224,6 +224,7 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
   upsert: () => Effect.void,
   updateResumeCursorIfOwned: () => Effect.succeed(false),
   updateRuntimePayloadIfOwned: () => Effect.succeed(false),
+  matchesOwnership: () => Effect.succeed(true),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
   getBinding: () => Effect.succeed(Option.none()),
@@ -426,12 +427,12 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         ],
       });
       runtime.rollbackThreadImpl.mockClear();
+      const rollbackThread = adapter.rollbackThread;
+      NodeAssert.ok(rollbackThread);
 
-      const result = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [asTurnId("foreign-turn")],
-        })
-        .pipe(Effect.result);
+      const result = yield* rollbackThread(threadId, {
+        turnIds: [asTurnId("foreign-turn")],
+      }).pipe(Effect.result);
 
       NodeAssert.equal(result._tag, "Failure");
       if (result._tag === "Failure") {
@@ -490,12 +491,12 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
           turnId: asTurnId("turn-concurrent"),
         });
       });
+      const rollbackThread = adapter.rollbackThread;
+      NodeAssert.ok(rollbackThread);
 
-      const rollbackFiber = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [firstTurn.id],
-        })
-        .pipe(Effect.forkChild);
+      const rollbackFiber = yield* rollbackThread(threadId, {
+        turnIds: [firstTurn.id],
+      }).pipe(Effect.forkChild);
       yield* Effect.promise(() => readStarted.wait);
       const sendFiber = yield* adapter
         .sendTurn({
@@ -661,21 +662,21 @@ const lifecycleLayer = it.layer(
 function startLifecycleRuntime() {
   return Effect.gen(function* () {
     const adapter = yield* CodexAdapter;
-    yield* adapter.startSession({
+    const session = yield* adapter.startSession({
       provider: ProviderDriverKind.make("codex"),
       threadId: asThreadId("thread-1"),
       runtimeMode: "full-access",
     });
     const runtime = lifecycleRuntimeFactory.lastRuntime;
     NodeAssert.ok(runtime);
-    return { adapter, runtime };
+    return { adapter, runtime, session };
   });
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
   it.effect("does not reactivate an idle child after a parent interaction", () =>
     Effect.gen(function* () {
-      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const { adapter, runtime, session } = yield* startLifecycleRuntime();
       const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 3)).pipe(
         Effect.forkChild,
       );
@@ -719,6 +720,10 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       );
 
       const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.equal(
+        events.every((event) => event.sessionLease === session.sessionLease),
+        true,
+      );
       NodeAssert.deepStrictEqual(
         events.map((event) =>
           event.type === "task.updated"

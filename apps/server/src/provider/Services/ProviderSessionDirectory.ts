@@ -46,6 +46,11 @@ export interface ProviderRuntimeBindingWithMetadata extends ProviderRuntimeBindi
   readonly lastSeenAt: string;
 }
 
+export interface ProviderSessionOwnership {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly sessionLease: ProviderSessionLease | null;
+}
+
 export type ProviderSessionDirectoryReadError = ProviderSessionDirectoryPersistenceError;
 
 export type ProviderSessionDirectoryWriteError =
@@ -64,6 +69,12 @@ export interface ProviderSessionDirectoryShape {
   readonly getBinding: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<ProviderRuntimeBinding>, ProviderSessionDirectoryReadError>;
+
+  readonly matchesOwnership: (input: {
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly sessionLease: ProviderSessionLease;
+  }) => Effect.Effect<boolean>;
 
   /**
    * Persist a cursor only when both the configured provider instance and its

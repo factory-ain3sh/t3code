@@ -104,6 +104,21 @@ describe("resolveProviderSkillSourceKind", () => {
     ).toBe("system");
   });
 
+  it("maps Factory skill provenance to T3 source kinds", () => {
+    expect(
+      resolveProviderSkillSourceKind({
+        path: "builtin://code-review",
+        scope: "builtin",
+      }),
+    ).toBe("system");
+    expect(
+      resolveProviderSkillSourceKind({
+        path: "automation://browser",
+        scope: "automation",
+      }),
+    ).toBe("app");
+  });
+
   it("keeps unknown and missing scopes usable", () => {
     expect(
       resolveProviderSkillSourceKind({

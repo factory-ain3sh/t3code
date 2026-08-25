@@ -93,15 +93,16 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
             expectedSessionLease: binding.sessionLease ?? null,
           })
           .pipe(
-            Effect.tap(() =>
-              Effect.logInfo("provider.session.reaped", {
-                threadId: binding.threadId,
-                provider: binding.provider,
-                idleDurationMs,
-                reason: "inactivity_threshold",
-              }),
+            Effect.flatMap((outcome) =>
+              outcome === "stopped"
+                ? Effect.logInfo("provider.session.reaped", {
+                    threadId: binding.threadId,
+                    provider: binding.provider,
+                    idleDurationMs,
+                    reason: "inactivity_threshold",
+                  }).pipe(Effect.as(true))
+                : Effect.succeed(false),
             ),
-            Effect.as(true),
             Effect.catchCause((cause) =>
               Effect.logWarning("provider.session.reaper.stop-failed", {
                 threadId: binding.threadId,

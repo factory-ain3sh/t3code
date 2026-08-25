@@ -35,6 +35,8 @@ import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities, ProviderThreadSnapshot } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
+export type ProviderStopSessionOutcome = "stopped" | "ownership-mismatch";
+
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
@@ -80,7 +82,7 @@ export interface ProviderServiceShape {
    */
   readonly stopSession: (
     input: ProviderStopSessionInput,
-  ) => Effect.Effect<void, ProviderServiceError>;
+  ) => Effect.Effect<ProviderStopSessionOutcome, ProviderServiceError>;
 
   /**
    * List active provider sessions.

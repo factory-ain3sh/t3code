@@ -1,6 +1,12 @@
 import * as Schema from "effect/Schema";
 
-import { ProviderApprovalOption, ProviderRequestKind } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  type OrchestrationThreadActivity,
+  ProviderApprovalOption,
+  ProviderRequestKind,
+  providerRequestKindFromRequestType,
+} from "@t3tools/contracts";
 
 const isProviderRequestKind = Schema.is(ProviderRequestKind);
 const isProviderApprovalOption = Schema.is(ProviderApprovalOption);
@@ -20,23 +26,9 @@ export function approvalRequestKindFromPayload(
     return requestKind;
   }
 
-  switch (payload?.requestType) {
-    case "command_execution_approval":
-    case "exec_command_approval":
-    case "dynamic_tool_call":
-      return "command";
-    case "file_read_approval":
-      return "file-read";
-    case "file_change_approval":
-    case "apply_patch_approval":
-      return "file-change";
-    case "plan_approval":
-      return "plan";
-    case "mcp_elicitation_approval":
-      return "mcp-elicitation";
-    default:
-      return null;
-  }
+  return typeof payload?.requestType === "string"
+    ? (providerRequestKindFromRequestType(payload.requestType) ?? null)
+    : null;
 }
 
 /**
@@ -54,4 +46,89 @@ export function approvalOptionsFromPayload(
   }
   const valid = options.filter(isProviderApprovalOption);
   return valid.length > 0 ? valid : undefined;
+}
+
+export interface PendingProviderApproval {
+  readonly requestId: ApprovalRequestId;
+  readonly requestKind: ProviderRequestKind;
+  readonly createdAt: string;
+  readonly detail?: string;
+  readonly appName?: string;
+  readonly options?: ReadonlyArray<ProviderApprovalOption>;
+}
+
+function approvalPayload(
+  activity: OrchestrationThreadActivity,
+): Readonly<Record<string, unknown>> | null {
+  return activity.payload && typeof activity.payload === "object"
+    ? (activity.payload as Record<string, unknown>)
+    : null;
+}
+
+export function isStalePendingRequestFailureDetail(detail: string | undefined): boolean {
+  const normalized = detail?.toLowerCase();
+  return (
+    normalized?.includes("stale pending approval request") === true ||
+    normalized?.includes("stale pending user-input request") === true ||
+    normalized?.includes("unknown pending approval request") === true ||
+    normalized?.includes("unknown pending permission request") === true ||
+    normalized?.includes("unknown pending user-input request") === true ||
+    normalized?.includes("unknown pending user input request") === true ||
+    normalized?.includes("unknown pending codex user input request") === true
+  );
+}
+
+/**
+ * Reduces approval lifecycle activities in caller-provided lifecycle order.
+ * Callers own ordering because web and mobile already share their ordered
+ * activity lists with other presentation reducers.
+ */
+export function reducePendingApprovals(
+  orderedActivities: ReadonlyArray<OrchestrationThreadActivity>,
+): PendingProviderApproval[] {
+  const openByRequestId = new Map<ApprovalRequestId, PendingProviderApproval>();
+
+  for (const activity of orderedActivities) {
+    const payload = approvalPayload(activity);
+    const requestId =
+      typeof payload?.requestId === "string" ? ApprovalRequestId.make(payload.requestId) : null;
+
+    if (activity.kind === "approval.requested" && requestId) {
+      const requestKind = approvalRequestKindFromPayload(payload);
+      if (!requestKind) {
+        continue;
+      }
+      const detail = typeof payload?.detail === "string" ? payload.detail : undefined;
+      const appName = typeof payload?.appName === "string" ? payload.appName : undefined;
+      const options = approvalOptionsFromPayload(payload);
+      openByRequestId.set(requestId, {
+        requestId,
+        requestKind,
+        createdAt: activity.createdAt,
+        ...(detail ? { detail } : {}),
+        ...(appName ? { appName } : {}),
+        ...(options ? { options } : {}),
+      });
+      continue;
+    }
+
+    if (activity.kind === "approval.resolved" && requestId) {
+      openByRequestId.delete(requestId);
+      continue;
+    }
+
+    if (
+      activity.kind === "provider.approval.respond.failed" &&
+      requestId &&
+      isStalePendingRequestFailureDetail(
+        typeof payload?.detail === "string" ? payload.detail : undefined,
+      )
+    ) {
+      openByRequestId.delete(requestId);
+    }
+  }
+
+  return [...openByRequestId.values()].toSorted((left, right) =>
+    left.createdAt.localeCompare(right.createdAt),
+  );
 }

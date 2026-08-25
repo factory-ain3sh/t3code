@@ -20,14 +20,15 @@ import {
   type RuntimeMode,
   ThreadId,
   ProviderInstanceId,
-  TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as PlatformError from "effect/PlatformError";
 import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -914,6 +915,7 @@ describe("ClaudeAdapterLive", () => {
       } as unknown as SDKMessage);
 
       const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      assert.isTrue(runtimeEvents.every((event) => event.sessionLease === session.sessionLease));
       assert.deepEqual(
         runtimeEvents.map((event) => event.type),
         [
@@ -966,7 +968,19 @@ describe("ClaudeAdapterLive", () => {
       if (turnCompleted?.type === "turn.completed") {
         assert.equal(String(turnCompleted.turnId), String(turn.turnId));
         assert.equal(turnCompleted.payload.state, "completed");
+        assert.deepEqual(turnCompleted.payload.resumeCursor, {
+          threadId: THREAD_ID,
+          resume: "sdk-session-1",
+          resumeSessionAt: "assistant-1",
+          turnCount: 1,
+        });
       }
+      assert.deepEqual((yield* adapter.listSessions())[0]?.resumeCursor, {
+        threadId: THREAD_ID,
+        resume: "sdk-session-1",
+        resumeSessionAt: "assistant-1",
+        turnCount: 1,
+      });
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -3944,179 +3958,54 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect(
-    "supports rollbackThread by rejecting mismatched absolute histories before trimming in-memory turns and preserving every retained turn",
-    () => {
-      const harness = makeHarness();
-      return Effect.gen(function* () {
-        const adapter = yield* ClaudeAdapter;
+  it.effect("mints the Claude lease before creating the query runtime", () => {
+    const uuidError = PlatformError.systemError({
+      _tag: "Unknown",
+      module: "Crypto",
+      method: "randomUUIDv4",
+      description: "UUID generation unavailable",
+    });
+    let createQueryCalls = 0;
+    const layer = Layer.effect(
+      ClaudeAdapter,
+      Effect.gen(function* () {
+        const crypto = yield* Crypto.Crypto;
+        return yield* makeClaudeAdapter(decodeClaudeSettings({}), {
+          createQuery: () => {
+            createQueryCalls += 1;
+            return new FakeClaudeQuery();
+          },
+        }).pipe(
+          Effect.provideService(Crypto.Crypto, {
+            ...crypto,
+            randomUUIDv4: Effect.fail(uuidError),
+          }),
+        );
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-lease-test", "/tmp")),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(NodeServices.layer),
+    );
 
-        const session = yield* adapter.startSession({
-          threadId: THREAD_ID,
-          provider: ProviderDriverKind.make("claudeAgent"),
-          runtimeMode: "full-access",
-        });
-
-        const firstTurn = yield* adapter.sendTurn({
-          threadId: session.threadId,
-          input: "first",
-          attachments: [],
-        });
-
-        const firstCompletedFiber = yield* Stream.filter(
-          adapter.streamEvents,
-          (event) => event.type === "turn.completed",
-        ).pipe(Stream.runHead, Effect.forkChild);
-
-        harness.query.emit({
-          type: "result",
-          subtype: "success",
-          is_error: false,
-          errors: [],
-          session_id: "sdk-session-rollback",
-          uuid: "result-first",
-        } as unknown as SDKMessage);
-
-        const firstCompleted = yield* Fiber.join(firstCompletedFiber);
-        assert.equal(firstCompleted._tag, "Some");
-        if (firstCompleted._tag === "Some" && firstCompleted.value.type === "turn.completed") {
-          assert.equal(String(firstCompleted.value.turnId), String(firstTurn.turnId));
-        }
-
-        const secondTurn = yield* adapter.sendTurn({
-          threadId: session.threadId,
-          input: "second",
-          attachments: [],
-        });
-
-        const secondCompletedFiber = yield* Stream.filter(
-          adapter.streamEvents,
-          (event) => event.type === "turn.completed",
-        ).pipe(Stream.runHead, Effect.forkChild);
-
-        harness.query.emit({
-          type: "result",
-          subtype: "success",
-          is_error: false,
-          errors: [],
-          session_id: "sdk-session-rollback",
-          uuid: "result-second",
-        } as unknown as SDKMessage);
-
-        const secondCompleted = yield* Fiber.join(secondCompletedFiber);
-        assert.equal(secondCompleted._tag, "Some");
-        if (secondCompleted._tag === "Some" && secondCompleted.value.type === "turn.completed") {
-          assert.equal(String(secondCompleted.value.turnId), String(secondTurn.turnId));
-        }
-
-        const threadBeforeRollback = yield* adapter.readThread(session.threadId);
-        assert.equal(threadBeforeRollback.turns.length, 2);
-
-        const mismatchedRollback = yield* adapter
-          .rollbackThread(session.threadId, {
-            turnIds: [TurnId.make("foreign-turn")],
-          })
-          .pipe(Effect.result);
-        assert.equal(mismatchedRollback._tag, "Failure");
-        if (mismatchedRollback._tag === "Failure") {
-          assert.instanceOf(mismatchedRollback.failure, ProviderAdapterValidationError);
-          assert.equal(
-            mismatchedRollback.failure.issue,
-            "Rollback target does not match the current thread history.",
-          );
-        }
-
-        const threadAfterRejectedRollback = yield* adapter.readThread(session.threadId);
-        assert.equal(threadAfterRejectedRollback.turns.length, 2);
-
-        const rollbackTarget = {
-          turnIds: [firstTurn.turnId],
-          anchorTurnId: secondTurn.turnId,
-        } as const;
-        const rolledBack = yield* adapter.rollbackThread(session.threadId, rollbackTarget);
-        assert.equal(rolledBack.turns.length, 1);
-        assert.equal(rolledBack.turns[0]?.id, firstTurn.turnId);
-
-        const replayed = yield* adapter.rollbackThread(session.threadId, rollbackTarget);
-        assert.equal(replayed.turns.length, 1);
-        assert.equal(replayed.turns[0]?.id, firstTurn.turnId);
-
-        const thirdTurn = yield* adapter.sendTurn({
-          threadId: session.threadId,
-          input: "third",
-          attachments: [],
-        });
-        const thirdCompletedFiber = yield* Stream.filter(
-          adapter.streamEvents,
-          (event) => event.type === "turn.completed",
-        ).pipe(Stream.runHead, Effect.forkChild);
-        harness.query.emit({
-          type: "result",
-          subtype: "success",
-          is_error: false,
-          errors: [],
-          session_id: "sdk-session-rollback",
-          uuid: "result-third",
-        } as unknown as SDKMessage);
-        yield* Fiber.join(thirdCompletedFiber);
-
-        const staleAnchor = yield* adapter
-          .rollbackThread(session.threadId, rollbackTarget)
-          .pipe(Effect.result);
-        assert.equal(staleAnchor._tag, "Failure");
-        if (staleAnchor._tag === "Failure") {
-          assert.instanceOf(staleAnchor.failure, ProviderAdapterValidationError);
-          assert.equal(
-            staleAnchor.failure.issue,
-            "Rollback target does not match the current thread history.",
-          );
-        }
-
-        const threadAfterRollback = yield* adapter.readThread(session.threadId);
-        assert.equal(threadAfterRollback.turns.length, 2);
-        assert.equal(threadAfterRollback.turns[0]?.id, firstTurn.turnId);
-        assert.equal(threadAfterRollback.turns[1]?.id, thirdTurn.turnId);
-      }).pipe(
-        Effect.provideService(Random.Random, makeDeterministicRandomService()),
-        Effect.provide(harness.layer),
-      );
-    },
-  );
-
-  it.effect("rejects an unprovable anchored empty rollback after resume", () => {
-    const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
-      const session = yield* adapter.startSession({
-        threadId: THREAD_ID,
-        provider: ProviderDriverKind.make("claudeAgent"),
-        runtimeMode: "full-access",
-        resumeCursor: {
-          threadId: THREAD_ID,
-          resume: "sdk-session-resumed",
-          turnCount: 1,
-        },
-      });
-
       const result = yield* adapter
-        .rollbackThread(session.threadId, {
-          turnIds: [],
-          anchorTurnId: TurnId.make("unreconstructed-turn"),
+        .startSession({
+          threadId: RESUME_THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          resumeCursor: {
+            threadId: RESUME_THREAD_ID,
+            resume: "550e8400-e29b-41d4-a716-446655440000",
+            turnCount: 0,
+          },
+          runtimeMode: "full-access",
         })
         .pipe(Effect.result);
 
       assert.equal(result._tag, "Failure");
-      if (result._tag === "Failure") {
-        assert.instanceOf(result.failure, ProviderAdapterValidationError);
-        assert.equal(
-          result.failure.issue,
-          "Rollback target does not match the current thread history.",
-        );
-      }
-    }).pipe(
-      Effect.provideService(Random.Random, makeDeterministicRandomService()),
-      Effect.provide(harness.layer),
-    );
+      assert.equal(createQueryCalls, 0);
+    }).pipe(Effect.provide(layer));
   });
 
   it.effect("updates model on sendTurn when model override is provided", () => {

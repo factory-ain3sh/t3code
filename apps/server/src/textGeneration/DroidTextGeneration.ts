@@ -9,9 +9,11 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { type DroidSettings, type ModelSelection, TextGenerationError } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
-import { extractJsonObject } from "@t3tools/shared/schemaJson";
 
-import { makeDroidExecRpcClient } from "../provider/droid/DroidRpcClient.ts";
+import {
+  DROID_SESSION_REQUEST_TIMEOUT_MS,
+  makeDroidExecRpcClient,
+} from "../provider/droid/DroidRpcClient.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
@@ -23,13 +25,14 @@ import {
   sanitizeCommitSubject,
   sanitizePrTitle,
   sanitizeThreadTitle,
+  toJsonSchemaObject,
 } from "./TextGenerationUtils.ts";
 
 const DROID_TIMEOUT_MS = 180_000;
-const SESSION_INIT_TIMEOUT_MS = 75_000;
-const MAX_OUTPUT_CHARS = 256 * 1024;
+const MAX_OUTPUT_BYTES = 256 * 1024;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
+const encodeJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(function* (
   droidSettings: DroidSettings,
@@ -42,17 +45,13 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
     operation,
     cwd,
     prompt,
-    outputSchemaJson,
+    outputSchema,
     modelSelection,
   }: {
-    operation:
-      | "generateCommitMessage"
-      | "generatePrContent"
-      | "generateBranchName"
-      | "generateThreadTitle";
+    operation: TextGeneration.TextGenerationOperation;
     cwd: string;
     prompt: string;
-    outputSchemaJson: S;
+    outputSchema: S;
     modelSelection: ModelSelection;
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
@@ -62,42 +61,37 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
           detail,
           ...(cause !== undefined ? { cause } : {}),
         });
+      const mapRpcError =
+        (detail: string) =>
+        <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          effect.pipe(Effect.mapError((cause) => failWith(detail, cause)));
       const rpc = yield* makeDroidExecRpcClient({
         binaryPath: droidSettings.binaryPath,
         cwd,
         env: environment,
       }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, commandSpawner),
-        Effect.mapError((cause) => failWith("Failed to start the Droid CLI.", cause)),
+        mapRpcError("Failed to start the Droid CLI."),
       );
 
-      const outputChunks: string[] = [];
-      let outputLength = 0;
+      let structuredOutput: Record<string, unknown> | null | undefined;
       const turnDone = yield* Deferred.make<string | undefined, TextGenerationError>();
+      const failTurn = (detail: string, cause?: unknown) =>
+        Deferred.fail(turnDone, failWith(detail, cause)).pipe(Effect.asVoid);
 
-      // Collect assistant text and resolve on turn completion. The session is
-      // private to this request and carries exactly one user message, so the
-      // first completed turn is ours.
       yield* Stream.runDrain(
         Stream.mapEffect(rpc.notifications, ({ notification }) => {
           switch (notification.type) {
-            case "assistant_text_delta":
-              return Effect.sync(() => {
-                const nextLength = outputLength + notification.textDelta.length;
-                if (nextLength > MAX_OUTPUT_CHARS) {
-                  return false;
-                }
-                outputChunks.push(notification.textDelta);
-                outputLength = nextLength;
-                return true;
-              }).pipe(
-                Effect.flatMap((accepted) =>
-                  accepted
-                    ? Effect.void
-                    : Deferred.fail(
-                        turnDone,
-                        failWith(`Droid output exceeded the ${MAX_OUTPUT_CHARS}-character limit.`),
-                      ).pipe(Effect.asVoid),
+            case "structured_output":
+              return encodeJson(notification.structuredOutput).pipe(
+                Effect.flatMap((encodedOutput) => {
+                  if (Buffer.byteLength(encodedOutput, "utf8") > MAX_OUTPUT_BYTES)
+                    return failTurn(`Droid output exceeded the ${MAX_OUTPUT_BYTES}-byte limit.`);
+                  structuredOutput = notification.structuredOutput;
+                  return Effect.void;
+                }),
+                Effect.catchTag("SchemaError", (cause) =>
+                  failTurn("Droid returned invalid structured output.", cause),
                 ),
               );
             case "agent_turn_completed":
@@ -117,23 +111,26 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
             cwd,
             autonomyLevel: "off",
             interactionMode: "auto",
-            // Text generation must never touch the workspace.
-            // Droid treats an empty restriction as unrestricted; an unknown
-            // non-empty id collapses the tool allowlist to zero.
             restrictToolIds: ["t3_text_generation"],
+            blockOnMcpLoad: false,
             ...(modelSelection.model ? { modelId: modelSelection.model } : {}),
             ...(reasoningEffort ? { reasoningEffort } : {}),
           },
-          { timeoutMs: SESSION_INIT_TIMEOUT_MS },
+          { timeoutMs: DROID_SESSION_REQUEST_TIMEOUT_MS },
         )
-        .pipe(Effect.mapError((cause) => failWith("Failed to initialize Droid session.", cause)));
+        .pipe(mapRpcError("Failed to initialize Droid session."));
 
       yield* rpc
-        .request("droid.add_user_message", { messageId: yield* randomUUIDv4, text: prompt })
-        .pipe(Effect.mapError((cause) => failWith("Droid rejected the prompt.", cause)));
+        .request("droid.add_user_message", {
+          messageId: yield* randomUUIDv4,
+          text: prompt,
+          outputFormat: {
+            type: "json_schema",
+            schema: toJsonSchemaObject(outputSchema),
+          },
+        })
+        .pipe(mapRpcError("Droid rejected the prompt."));
 
-      // Race the completion against process death: a crashed CLI must fail
-      // immediately, not ride out the full generation timeout.
       const completionReason = yield* Effect.raceFirst(
         Deferred.await(turnDone),
         Effect.flatMap(rpc.exits, (exit) =>
@@ -151,25 +148,19 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
         ),
       );
 
-      if (completionReason !== "completed") {
+      if (completionReason !== "completed")
         return yield* failWith(
           completionReason === "cancelled"
             ? "Droid request was cancelled."
             : `Droid request failed (${completionReason ?? "unknown reason"}).`,
         );
-      }
+      if (structuredOutput === undefined || structuredOutput === null)
+        return yield* failWith("Droid returned no structured output.");
 
-      const trimmed = outputChunks.join("").trim();
-      if (!trimmed) {
-        return yield* failWith("Droid returned empty output.");
-      }
-
-      const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson));
-      return yield* decodeOutput(extractJsonObject(trimmed)).pipe(
-        Effect.catchTags({
-          SchemaError: (cause) =>
-            Effect.fail(failWith("Droid returned invalid structured output.", cause)),
-        }),
+      return yield* Schema.decodeUnknownEffect(outputSchema)(structuredOutput).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(failWith("Droid returned invalid structured output.", cause)),
+        ),
       );
     }).pipe(
       Effect.mapError((cause) =>
@@ -184,106 +175,46 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
       Effect.scoped,
     );
 
-  const generateCommitMessage: TextGeneration.TextGeneration["Service"]["generateCommitMessage"] =
-    Effect.fn("DroidTextGeneration.generateCommitMessage")(function* (input) {
-      const { prompt, outputSchema } = buildCommitMessagePrompt({
-        branch: input.branch,
-        stagedSummary: input.stagedSummary,
-        stagedPatch: input.stagedPatch,
-        includeBranch: input.includeBranch === true,
-        policy: input.policy,
-      });
-
+  const generate = <P, S extends Schema.Top, O>(
+    operation: TextGeneration.TextGenerationOperation,
+    buildPrompt: (input: P) => { readonly prompt: string; readonly outputSchema: S },
+    sanitize: (generated: S["Type"]) => O,
+  ) =>
+    Effect.fn(`DroidTextGeneration.${operation}`)(function* (
+      input: P & { readonly cwd: string; readonly modelSelection: ModelSelection },
+    ) {
+      const { prompt, outputSchema } = buildPrompt(input);
       const generated = yield* runDroidJson({
-        operation: "generateCommitMessage",
+        operation,
         cwd: input.cwd,
         prompt,
-        outputSchemaJson: outputSchema,
+        outputSchema,
         modelSelection: input.modelSelection,
       });
+      return sanitize(generated);
+    });
 
-      return {
+  return {
+    generateCommitMessage: generate(
+      "generateCommitMessage",
+      buildCommitMessagePrompt,
+      (generated) => ({
         subject: sanitizeCommitSubject(generated.subject),
         body: generated.body.trim(),
         ...("branch" in generated && typeof generated.branch === "string"
           ? { branch: sanitizeFeatureBranchName(generated.branch) }
           : {}),
-      };
-    });
-
-  const generatePrContent: TextGeneration.TextGeneration["Service"]["generatePrContent"] =
-    Effect.fn("DroidTextGeneration.generatePrContent")(function* (input) {
-      const { prompt, outputSchema } = buildPrContentPrompt({
-        baseBranch: input.baseBranch,
-        headBranch: input.headBranch,
-        commitSummary: input.commitSummary,
-        diffSummary: input.diffSummary,
-        diffPatch: input.diffPatch,
-        policy: input.policy,
-        changeRequestTemplate: input.changeRequestTemplate,
-      });
-
-      const generated = yield* runDroidJson({
-        operation: "generatePrContent",
-        cwd: input.cwd,
-        prompt,
-        outputSchemaJson: outputSchema,
-        modelSelection: input.modelSelection,
-      });
-
-      return {
-        title: sanitizePrTitle(generated.title),
-        body: generated.body.trim(),
-      };
-    });
-
-  const generateBranchName: TextGeneration.TextGeneration["Service"]["generateBranchName"] =
-    Effect.fn("DroidTextGeneration.generateBranchName")(function* (input) {
-      const { prompt, outputSchema } = buildBranchNamePrompt({
-        message: input.message,
-        attachments: input.attachments,
-        policy: input.policy,
-      });
-
-      const generated = yield* runDroidJson({
-        operation: "generateBranchName",
-        cwd: input.cwd,
-        prompt,
-        outputSchemaJson: outputSchema,
-        modelSelection: input.modelSelection,
-      });
-
-      return {
-        branch: sanitizeBranchFragment(generated.branch),
-      };
-    });
-
-  const generateThreadTitle: TextGeneration.TextGeneration["Service"]["generateThreadTitle"] =
-    Effect.fn("DroidTextGeneration.generateThreadTitle")(function* (input) {
-      const { prompt, outputSchema } = buildThreadTitlePrompt({
-        message: input.message,
-        previousTitle: input.previousTitle,
-        attachments: input.attachments,
-        policy: input.policy,
-      });
-
-      const generated = yield* runDroidJson({
-        operation: "generateThreadTitle",
-        cwd: input.cwd,
-        prompt,
-        outputSchemaJson: outputSchema,
-        modelSelection: input.modelSelection,
-      });
-
-      return {
-        title: sanitizeThreadTitle(generated.title),
-      } satisfies TextGeneration.ThreadTitleGenerationResult;
-    });
-
-  return {
-    generateCommitMessage,
-    generatePrContent,
-    generateBranchName,
-    generateThreadTitle,
+      }),
+    ),
+    generatePrContent: generate("generatePrContent", buildPrContentPrompt, (generated) => ({
+      title: sanitizePrTitle(generated.title),
+      body: generated.body.trim(),
+    })),
+    generateBranchName: generate("generateBranchName", buildBranchNamePrompt, (generated) => ({
+      branch: sanitizeBranchFragment(generated.branch),
+    })),
+    generateThreadTitle: generate("generateThreadTitle", buildThreadTitlePrompt, (generated) => ({
+      title: sanitizeThreadTitle(generated.title),
+    })),
   } satisfies TextGeneration.TextGeneration["Service"];
 });

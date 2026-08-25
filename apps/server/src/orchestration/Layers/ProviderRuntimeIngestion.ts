@@ -10,6 +10,7 @@ import {
   classifyTaskAgentKind,
   EventId,
   isToolLifecycleItemType,
+  providerRequestKindFromRequestType,
   ThreadId,
   type ThreadTokenUsageSnapshot,
   TurnId,
@@ -296,28 +297,6 @@ function sessionStatusAllowsActiveTurn(
   return status === "starting" || status === "running";
 }
 
-function requestKindFromCanonicalRequestType(
-  requestType: string | undefined,
-): "command" | "file-read" | "file-change" | "plan" | "mcp-elicitation" | undefined {
-  switch (requestType) {
-    case "command_execution_approval":
-    case "exec_command_approval":
-    case "dynamic_tool_call":
-      return "command";
-    case "file_read_approval":
-      return "file-read";
-    case "file_change_approval":
-    case "apply_patch_approval":
-      return "file-change";
-    case "plan_approval":
-      return "plan";
-    case "mcp_elicitation_approval":
-      return "mcp-elicitation";
-    default:
-      return undefined;
-  }
-}
-
 /**
  * Copies the optional TaskAgentLinkage bundle from a task.* runtime payload
  * into the persisted activity payload. Identity fields ride on every row so
@@ -379,7 +358,7 @@ export function runtimeEventToActivities(
       if (event.payload.requestType === "tool_user_input") {
         return [];
       }
-      const requestKind = requestKindFromCanonicalRequestType(event.payload.requestType);
+      const requestKind = providerRequestKindFromRequestType(event.payload.requestType);
       return [
         {
           id: event.eventId,
@@ -416,7 +395,7 @@ export function runtimeEventToActivities(
       if (event.payload.requestType === "tool_user_input") {
         return [];
       }
-      const requestKind = requestKindFromCanonicalRequestType(event.payload.requestType);
+      const requestKind = providerRequestKindFromRequestType(event.payload.requestType);
       return [
         {
           id: event.eventId,

@@ -23,7 +23,6 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
-  TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
@@ -254,6 +253,7 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
   upsert: () => Effect.void,
   updateResumeCursorIfOwned: () => Effect.succeed(false),
   updateRuntimePayloadIfOwned: () => Effect.succeed(false),
+  matchesOwnership: () => Effect.succeed(true),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
   getBinding: () => Effect.succeed(Option.none()),
@@ -634,7 +634,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         Effect.forkChild,
       );
 
-      yield* adapter.startSession({
+      const session = yield* adapter.startSession({
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -645,6 +645,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.deepEqual(
         events.map((event) => event.type),
         ["session.started", "thread.started", "session.exited"],
+      );
+      NodeAssert.equal(
+        events.every((event) => event.sessionLease === session.sessionLease),
+        true,
       );
     }),
   );
@@ -1093,135 +1097,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.deepEqual(runtimeMock.state.promptCalls, []);
     }).pipe(Effect.provide(adapterLayer));
   });
-
-  it.effect("reverts the full thread when rollback removes every assistant turn", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-rollback-all");
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access",
-      });
-
-      runtimeMock.state.messages = [
-        {
-          info: { id: "assistant-1", role: "assistant" },
-          parts: [],
-        },
-        {
-          info: { id: "assistant-2", role: "assistant" },
-          parts: [],
-        },
-      ];
-
-      const snapshot = yield* adapter.rollbackThread(threadId, { turnIds: [] });
-
-      NodeAssert.deepEqual(runtimeMock.state.revertCalls, [
-        { sessionID: "http://127.0.0.1:9999/session" },
-      ]);
-      NodeAssert.deepEqual(snapshot.turns, []);
-    }),
-  );
-
-  it.effect("returns the existing snapshot without rereading a no-op rollback", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-rollback-noop");
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access",
-      });
-      runtimeMock.state.messages = [
-        {
-          info: { id: "assistant-1", role: "assistant" },
-          parts: [{ type: "text", text: "Done" }],
-        },
-      ];
-
-      const snapshot = yield* adapter.rollbackThread(threadId, {
-        turnIds: [TurnId.make("assistant-1")],
-      });
-
-      NodeAssert.equal(runtimeMock.state.messagesCalls, 1);
-      NodeAssert.deepEqual(runtimeMock.state.revertCalls, []);
-      NodeAssert.deepEqual(snapshot.turns, [
-        {
-          id: TurnId.make("assistant-1"),
-          items: [
-            { id: "assistant-1", role: "assistant" },
-            { type: "text", text: "Done" },
-          ],
-        },
-      ]);
-    }),
-  );
-
-  it.effect("rejects rollback targets from a different OpenCode history", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-rollback-mismatch");
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access",
-      });
-      runtimeMock.state.messages = [
-        {
-          info: { id: "assistant-1", role: "assistant" },
-          parts: [],
-        },
-      ];
-
-      const error = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [TurnId.make("foreign-turn")],
-        })
-        .pipe(Effect.flip);
-
-      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
-      if (error._tag === "ProviderAdapterValidationError") {
-        NodeAssert.equal(error.issue, "Rollback target does not match the current thread history.");
-      }
-      NodeAssert.deepEqual(runtimeMock.state.revertCalls, []);
-    }),
-  );
-
-  it.effect("rejects a stale OpenCode rollback anchor", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-rollback-stale-anchor");
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "full-access",
-      });
-      runtimeMock.state.messages = [
-        {
-          info: { id: "assistant-1", role: "assistant" },
-          parts: [],
-        },
-        {
-          info: { id: "assistant-2", role: "assistant" },
-          parts: [],
-        },
-      ];
-
-      const error = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [TurnId.make("assistant-1")],
-          anchorTurnId: TurnId.make("stale-assistant"),
-        })
-        .pipe(Effect.flip);
-
-      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
-      if (error._tag === "ProviderAdapterValidationError") {
-        NodeAssert.equal(error.issue, "Rollback target does not match the current thread history.");
-      }
-      NodeAssert.deepEqual(runtimeMock.state.revertCalls, []);
-    }),
-  );
 
   it.effect("classifies a confirmed not-found across the shapes the SDK/runtime can produce", () =>
     Effect.sync(() => {

@@ -175,25 +175,6 @@ describe("pending approvals", () => {
       },
     ]);
   });
-
-  it("removes an app access approval after a remote client rejects it", () => {
-    const requested = makeActivity({
-      id: EventId.make("approval-safari-open"),
-      kind: "approval.requested",
-      summary: "App access approval requested",
-      createdAt: "2026-08-24T00:00:00.000Z",
-      payload: { requestId: "req-safari", requestKind: "mcp-elicitation" },
-    });
-    const resolved = makeActivity({
-      id: EventId.make("approval-safari-resolved"),
-      kind: "approval.resolved",
-      summary: "Approval resolved",
-      createdAt: "2026-08-24T00:00:01.000Z",
-      payload: { requestId: "req-safari", decision: "decline" },
-    });
-
-    expect(derivePendingApprovals([requested, resolved])).toEqual([]);
-  });
 });
 
 function makeActivity(
@@ -232,66 +213,6 @@ function makeThread(
     settledAt: input.settledAt ?? null,
   };
 }
-
-describe("derivePendingApprovals", () => {
-  it("maps plan approval requestType payloads into pending approvals", () => {
-    const options = [
-      { decision: "accept", label: "Approve" },
-      { decision: "decline", label: "Decline" },
-    ];
-    const activities = [
-      makeActivity({
-        id: EventId.make("approval-open-plan-approval"),
-        kind: "approval.requested",
-        summary: "Plan approval requested",
-        tone: "approval",
-        createdAt: "2026-04-01T00:00:01.000Z",
-        payload: {
-          requestId: "req-plan-approval",
-          requestType: "plan_approval",
-          options,
-          detail: "1. Map plan approvals\n2. Render the approval card",
-        },
-      }),
-    ];
-
-    expect(derivePendingApprovals(activities)).toEqual([
-      {
-        requestId: "req-plan-approval",
-        requestKind: "plan",
-        options,
-        createdAt: "2026-04-01T00:00:01.000Z",
-        detail: "1. Map plan approvals\n2. Render the approval card",
-      },
-    ]);
-  });
-
-  it("maps dynamic tool calls into actionable generic approvals", () => {
-    const activities = [
-      makeActivity({
-        id: EventId.make("approval-open-dynamic-tool"),
-        kind: "approval.requested",
-        summary: "Approval requested",
-        tone: "approval",
-        createdAt: "2026-04-01T00:00:01.000Z",
-        payload: {
-          requestId: "req-dynamic-tool",
-          requestType: "dynamic_tool_call",
-          detail: "Search the web",
-        },
-      }),
-    ];
-
-    expect(derivePendingApprovals(activities)).toEqual([
-      {
-        requestId: "req-dynamic-tool",
-        requestKind: "command",
-        createdAt: "2026-04-01T00:00:01.000Z",
-        detail: "Search the web",
-      },
-    ]);
-  });
-});
 
 describe("buildThreadFeed", () => {
   it("keeps older local feedback before newer messages returned by the server", () => {

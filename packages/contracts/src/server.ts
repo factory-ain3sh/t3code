@@ -20,6 +20,7 @@ import {
 import { EditorId, RemoteOpenTarget } from "./editor.ts";
 import { ModelCapabilities } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { ResourceTelemetryProcessCategory } from "./resourceTelemetry.ts";
 import { ServerSettings } from "./settings.ts";
 
 const KeybindingsMalformedConfigIssue = Schema.Struct({
@@ -319,6 +320,7 @@ export const ServerProcessDiagnosticsEntry = Schema.Struct({
   rssBytes: NonNegativeInt,
   elapsed: TrimmedNonEmptyString,
   command: TrimmedNonEmptyString,
+  category: ResourceTelemetryProcessCategory,
   depth: NonNegativeInt,
   childPids: Schema.Array(PositiveInt),
 });

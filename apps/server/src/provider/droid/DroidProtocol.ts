@@ -1,6 +1,4 @@
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import * as SchemaTransformation from "effect/SchemaTransformation";
 
 // factory-mono: protocol/session/settings/schema.ts
 export const DroidTokenUsage = Schema.Struct({
@@ -327,7 +325,20 @@ const ChildSessionAvailable = Schema.Struct({
   description: Schema.optional(Schema.String),
 });
 
-const KnownDroidSessionNotification = Schema.Union([
+const SessionCompacted = Schema.Struct({
+  type: Schema.Literal("session_compacted"),
+  summaryId: Schema.String,
+  removedCount: Schema.Number,
+  visibleBoundaryMessageId: Schema.NullOr(Schema.String),
+});
+
+const StructuredOutput = Schema.Struct({
+  type: Schema.Literal("structured_output"),
+  messageId: Schema.String,
+  structuredOutput: Schema.NullOr(Schema.Record(Schema.String, Schema.Unknown)),
+});
+
+export const DroidSessionNotification = Schema.Union([
   AssistantTextDelta,
   AssistantTextComplete,
   ThinkingTextDelta,
@@ -342,46 +353,11 @@ const KnownDroidSessionNotification = Schema.Union([
   LlmRetry,
   SessionTitleUpdated,
   ChildSessionAvailable,
-  Schema.Struct({ type: Schema.Literal("tool_execution_phase_changed") }),
-  Schema.Struct({ type: Schema.Literal("droid_working_state_changed") }),
-  Schema.Struct({ type: Schema.Literal("session_compacted") }),
-  Schema.Struct({ type: Schema.Literal("permission_resolved") }),
-  Schema.Struct({ type: Schema.Literal("queued_messages_discarded") }),
-  Schema.Struct({ type: Schema.Literal("mcp_status_changed") }),
-  Schema.Struct({ type: Schema.Literal("settings_updated") }),
-  Schema.Struct({ type: Schema.Literal("structured_output") }),
-]);
-
-export const knownDroidSessionNotificationTypes: ReadonlySet<string> = new Set(
-  KnownDroidSessionNotification.members.map((member) => member.fields.type.literal),
-);
-
-const DroidUnknownNotificationPayload = Schema.Record(Schema.String, Schema.Unknown).check(
-  Schema.makeFilter(
-    (input) =>
-      (typeof input.type === "string" && !knownDroidSessionNotificationTypes.has(input.type)) ||
-      "Expected an unknown Droid notification type",
-  ),
-);
-
-export const DroidUnknownNotification = DroidUnknownNotificationPayload.pipe(
-  Schema.decodeTo(
-    Schema.Struct({
-      type: Schema.Literal("__unknown__"),
-    }),
-    SchemaTransformation.transformOrFail({
-      decode: () => Effect.succeed({ type: "__unknown__" as const }),
-      encode: () =>
-        Effect.succeed({
-          type: "__unknown__",
-        } as typeof DroidUnknownNotificationPayload.Encoded),
-    }),
-  ),
-);
-export type DroidUnknownNotification = typeof DroidUnknownNotification.Type;
-
-export const DroidSessionNotification = Schema.Union([
-  KnownDroidSessionNotification,
-  DroidUnknownNotification,
+  SessionCompacted,
+  StructuredOutput,
 ]);
 export type DroidSessionNotification = typeof DroidSessionNotification.Type;
+
+export const knownDroidSessionNotificationTypes: ReadonlySet<string> = new Set(
+  DroidSessionNotification.members.map((member) => member.fields.type.literal),
+);

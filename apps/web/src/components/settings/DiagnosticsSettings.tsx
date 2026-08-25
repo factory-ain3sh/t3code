@@ -299,7 +299,7 @@ function formatProcessName(command: string): string {
 
 function formatProcessType(process: ServerProcessDiagnosticsEntry): string {
   if (process.depth > 0) return "Subprocess";
-  if (/\b(codex|claude|opencode|cursor|droid)\b/i.test(process.command)) return "Agent";
+  if (process.category === "provider-root") return "Agent";
   return "Process";
 }
 

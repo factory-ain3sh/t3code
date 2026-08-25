@@ -214,11 +214,6 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "opus-4.5": "claude-opus-4-5",
   },
   [OPENCODE_DRIVER_KIND]: {},
-  [DROID_DRIVER_KIND]: {
-    opus: "claude-opus-5",
-    sonnet: "claude-sonnet-5",
-    haiku: "claude-haiku-4-5",
-  },
 };
 
 // ── Provider display names ────────────────────────────────────────────

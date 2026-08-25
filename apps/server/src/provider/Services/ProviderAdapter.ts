@@ -7,36 +7,40 @@
  *
  * @module ProviderAdapter
  */
-import type {
-  ApprovalRequestId,
-  ProviderApprovalDecision,
-  ProviderDriverKind,
-  ProviderUserInputAnswers,
-  ProviderRuntimeEvent,
-  ProviderSendTurnInput,
-  ProviderSession,
-  ProviderSessionLease,
-  ProviderSessionStartInput,
-  ProviderUploadFeedbackInput,
-  ProviderUploadFeedbackResult,
-  ThreadId,
-  ProviderTurnStartResult,
-  TurnId,
+import {
+  TrimmedNonEmptyString,
+  type ApprovalRequestId,
+  type ProviderApprovalDecision,
+  type ProviderDriverKind,
+  type ProviderUserInputAnswers,
+  type ProviderRuntimeEvent,
+  type ProviderSendTurnInput,
+  type ProviderSession,
+  type ProviderSessionLease,
+  type ProviderSessionStartInput,
+  type ProviderUploadFeedbackInput,
+  type ProviderUploadFeedbackResult,
+  type ThreadId,
+  type ProviderTurnStartResult,
+  type TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Semaphore from "effect/Semaphore";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type * as Stream from "effect/Stream";
-import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { ProviderAdapterSessionNotFoundError } from "../Errors.ts";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
+export type ProviderConversationRollbackMode = "supported" | "unsupported";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /** Declares whether rollback survives provider session restart/resume. */
+  readonly conversationRollback: ProviderConversationRollbackMode;
 }
 
 export interface ProviderThreadTurnSnapshot {
@@ -82,72 +86,13 @@ export function parseVersionedSessionResumeCursor(
   raw: unknown,
   schemaVersion: number,
 ): string | undefined {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    return undefined;
-  }
-  const record = raw as Record<string, unknown>;
-  if (record.schemaVersion !== schemaVersion || typeof record.sessionId !== "string") {
-    return undefined;
-  }
-  const sessionId = record.sessionId.trim();
-  return sessionId.length > 0 ? sessionId : undefined;
-}
-
-export function makeKeyedLock<Key>(options?: { readonly retain?: (key: Key) => boolean }) {
-  return Effect.gen(function* () {
-    interface Entry {
-      readonly semaphore: Semaphore.Semaphore;
-      readonly references: number;
-    }
-    const entries = yield* SynchronizedRef.make(new Map<Key, Entry>());
-
-    const acquire = (key: Key) =>
-      SynchronizedRef.modifyEffect(entries, (current) => {
-        const existing = current.get(key);
-        if (existing !== undefined) {
-          const next = new Map(current);
-          next.set(key, { ...existing, references: existing.references + 1 });
-          return Effect.succeed([existing.semaphore, next] as const);
-        }
-        return Semaphore.make(1).pipe(
-          Effect.map((semaphore) => {
-            const next = new Map(current);
-            next.set(key, { semaphore, references: 1 });
-            return [semaphore, next] as const;
-          }),
-        );
-      });
-
-    const release = (key: Key) =>
-      SynchronizedRef.update(entries, (current) => {
-        const existing = current.get(key);
-        if (existing === undefined) return current;
-        const next = new Map(current);
-        if (existing.references === 1 && options?.retain?.(key) !== true) {
-          next.delete(key);
-        } else {
-          next.set(key, { ...existing, references: existing.references - 1 });
-        }
-        return next;
-      });
-
-    const withLock = <A, E, R>(key: Key, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-      Effect.acquireUseRelease(
-        acquire(key),
-        (semaphore) => semaphore.withPermit(effect),
-        () => release(key),
-      );
-
-    const inspect = (key: Key) =>
-      SynchronizedRef.get(entries).pipe(
-        Effect.map((current) => ({
-          keyCount: current.size,
-          references: current.get(key)?.references ?? 0,
-        })),
-      );
-
-    return { withLock, inspect } as const;
-  });
+  const decode = Schema.decodeUnknownOption(
+    Schema.Struct({
+      schemaVersion: Schema.Literal(schemaVersion),
+      sessionId: TrimmedNonEmptyString,
+    }),
+  );
+  return Option.getOrUndefined(Option.map(decode(raw), (cursor) => cursor.sessionId));
 }
 
 export type ProviderAdapterSession = ProviderSession & {
@@ -233,7 +178,7 @@ export interface ProviderAdapterShape<TError> {
   /**
    * Roll back a provider thread to one absolute target.
    */
-  readonly rollbackThread: (
+  readonly rollbackThread?: (
     threadId: ThreadId,
     target: ProviderThreadRollbackTarget,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;

@@ -6,87 +6,53 @@ import * as NodePath from "node:path";
 import * as NodeReadline from "node:readline";
 import * as NodeTimersPromises from "node:timers/promises";
 
-const emitToolCall = process.env.T3_DROID_MOCK_EMIT_TOOL_CALL === "1";
-const requestPermission = process.env.T3_DROID_MOCK_REQUEST_PERMISSION === "1";
-const permissionOptionsMode = process.env.T3_DROID_MOCK_PERMISSION_OPTIONS;
-const permissionResponseFile = process.env.T3_DROID_MOCK_PERMISSION_RESPONSE_FILE;
-const askUser = process.env.T3_DROID_MOCK_ASK_USER === "1";
-const hangTurn = process.env.T3_DROID_MOCK_HANG_TURN === "1";
-const failInit = process.env.T3_DROID_MOCK_FAIL_INIT === "1";
-const failUpdateSettings = process.env.T3_DROID_MOCK_FAIL_UPDATE_SETTINGS === "1";
-const loadInSpecMode = process.env.T3_DROID_MOCK_LOAD_IN_SPEC_MODE === "1";
-const loadSteeringMessages = process.env.T3_DROID_MOCK_LOAD_STEERING_MESSAGES === "1";
-const exitMidTurn = process.env.T3_DROID_MOCK_EXIT_MID_TURN === "1";
-const emitUnknownNotification = process.env.T3_DROID_MOCK_EMIT_UNKNOWN_NOTIFICATION === "1";
-const omitUsageNotification = process.env.T3_DROID_MOCK_OMIT_USAGE_NOTIFICATION === "1";
-const startRaceDir = process.env.T3_DROID_MOCK_START_RACE_DIR;
-const permissionFloodCount = Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "0");
-const permissionFloodReadyFile = process.env.T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE;
-const interruptOrderDir = process.env.T3_DROID_MOCK_INTERRUPT_ORDER_DIR;
-const settingsLogPath = process.env.T3_DROID_MOCK_SETTINGS_LOG;
-
-if (startRaceDir) {
-  NodeFS.writeFileSync(NodePath.join(startRaceDir, `pid-${process.pid}`), String(process.pid));
-  process.once("exit", () => {
-    NodeFS.writeFileSync(NodePath.join(startRaceDir, `exit-${process.pid}`), "");
-  });
+const scenarioNames = new Set(
+  `default rpc-roundtrip permission permission-empty-options permission-unknown-options permission-accept-only park-hitl permission-flood ask-user hang-turn hang-first-turn late-terminal usage-reset
+  exit-hitl interrupt-race fail-init fail-update-settings load-spec-mode-report steering-coalesced steering-separate exit-mid-turn unknown-notification omit-usage start-race spec-autonomy-handoff
+  spec-handoff late-spec-approval foreign-spec-envelope future-terminal-reason compaction child-session hanging-child-session
+  child-session-exit taskless-progress report-selected-model incomplete-items shared-tool-isolation`.split(
+    /\s+/,
+  ),
+);
+const currentScenario = process.env.T3_DROID_MOCK_SCENARIO ?? "default";
+if (!scenarioNames.has(currentScenario)) {
+  throw new Error(`Unknown T3_DROID_MOCK_SCENARIO: ${currentScenario}`);
 }
 
-const initializedSessionId = "mock-session-1";
-const knownLoadSessionId = "mock-session-known";
-const rewoundSessionId = "mock-session-rewound";
-const specSuccessorSessionId = "mock-session-spec-successor";
-const childSessionId = "mock-session-child";
-let currentSessionId = initializedSessionId;
-let previousSessionId: string | undefined;
-let emitPostLoadStraggler = false;
-let serverRequestId = 0;
-let currentSettings = {
-  modelId: "mock-fast",
-  reasoningEffort: "medium",
-  specModeModelId: "mock-spec-default",
-  specModeReasoningEffort: "max",
-  interactionMode: "auto",
-  autonomyLevel: "off",
+const env = {
+  permissionResponseFile: process.env.T3_DROID_MOCK_PERMISSION_RESPONSE_FILE,
+  permissionFloodReadyFile: process.env.T3_DROID_MOCK_PERMISSION_FLOOD_READY_FILE,
+  startRaceDir: process.env.T3_DROID_MOCK_START_RACE_DIR,
+  interruptOrderDir: process.env.T3_DROID_MOCK_INTERRUPT_ORDER_DIR,
+  settingsLogPath: process.env.T3_DROID_MOCK_SETTINGS_LOG,
+  requestLogPath: process.env.T3_DROID_MOCK_REQUEST_LOG,
+  coordinationDir: process.env.T3_DROID_MOCK_COORDINATION_DIR,
 };
-// Mirrors the CLI: the approved ExitSpecMode OUTCOME decides implementation
-// autonomy (proceed_auto_run_* raises it, proceed_once keeps normal
-// prompting); interaction mode always returns to auto.
-function applyExitSpecModeOutcome(selectedOption: unknown): void {
-  const selected = typeof selectedOption === "string" ? selectedOption : "";
-  const autonomyLevel =
-    selected === "proceed_auto_run_high" || selected === "proceed_new_session_high"
-      ? "high"
-      : selected === "proceed_auto_run_medium" || selected === "proceed_new_session_medium"
-        ? "medium"
-        : selected === "proceed_auto_run_low" || selected === "proceed_new_session_low"
-          ? "low"
-          : "off";
-  currentSettings = { ...currentSettings, autonomyLevel, interactionMode: "auto" };
-  if (settingsLogPath) {
-    NodeFS.appendFileSync(
-      settingsLogPath,
-      `${JSON.stringify({ exitSpecModeSelectedOption: selected, resultingAutonomyLevel: autonomyLevel })}\n`,
-    );
-  }
-}
+const permissionModes: Record<string, "default" | "empty" | "unknown" | "accept-only"> = {
+  "rpc-roundtrip": "default",
+  permission: "default",
+  "permission-empty-options": "empty",
+  "permission-unknown-options": "unknown",
+  "permission-accept-only": "accept-only",
+  "park-hitl": "default",
+};
+const permissionFloodCount =
+  currentScenario === "permission-flood"
+    ? Number(process.env.T3_DROID_MOCK_PERMISSION_FLOOD_COUNT ?? "24")
+    : 0;
 
-let activeTurn:
-  | {
-      readonly turnId: string;
-      completed: boolean;
-    }
-  | undefined;
-let interruptRequestBlocked = false;
-
-const pendingServerRequests = new Map<
-  string,
-  {
-    readonly resolve: (result: unknown) => void;
-    readonly reject: (error: Error) => void;
-  }
->();
-
+const sessions = {
+  initialized: "mock-session-1",
+  known: "mock-session-known",
+  rewound: "mock-session-rewound",
+  successor: "mock-session-spec-successor",
+  child: "mock-session-child",
+};
+const protocol = {
+  jsonrpc: "2.0",
+  factoryApiVersion: "1.0.0",
+  factoryProtocolVersion: "1.187.0",
+};
 const models = [
   {
     id: "mock-fast",
@@ -107,7 +73,6 @@ const models = [
     isCustom: false,
   },
 ];
-
 const tokenUsage = {
   inputTokens: 20,
   outputTokens: 8,
@@ -115,31 +80,91 @@ const tokenUsage = {
   cacheReadTokens: 4,
   thinkingTokens: 3,
 };
+const autonomyLevels = ["off", "low", "medium", "high"];
+const decisionOptions = [
+  { label: "Allow once", value: "proceed_once" },
+  { label: "Deny", value: "cancel" },
+];
+const specTool = (id: string) => ({
+  toolUse: {
+    type: "tool_use",
+    id,
+    input: { plan: "Implement the approved plan." },
+    name: "ExitSpecMode",
+  },
+  details: {
+    type: "exit_spec_mode",
+    plan: "Implement the approved plan.",
+    title: "Approved plan",
+  },
+});
+const execTool = (id: string, command: string, risk = false) => ({
+  toolUse: { type: "tool_use", id, input: { command }, name: "Execute" },
+  ...(risk ? { confirmationType: "exec" } : {}),
+  details: {
+    type: "exec",
+    fullCommand: command,
+    command: "echo",
+    ...(risk ? { impactLevel: "low", riskLevelReason: "The mock command only prints text." } : {}),
+  },
+});
+const permissionParams = (
+  tool: ReturnType<typeof specTool> | ReturnType<typeof execTool>,
+  options: ReadonlyArray<{ readonly label: string; readonly value: string }>,
+) => ({ toolUses: [tool], options });
+
+let currentSessionId = sessions.initialized;
+let previousSessionId: string | undefined;
+let emitPostLoadStraggler = false;
+let serverRequestId = 0;
+let turnSequence = 0;
+let firstTurnId: string | undefined;
+let currentSettings = {
+  modelId: "mock-fast",
+  reasoningEffort: "medium",
+  specModeModelId: "mock-spec-default",
+  specModeReasoningEffort: "max",
+  interactionMode: "auto",
+  autonomyLevel: "off",
+};
+let activeTurn: { readonly turnId: string; completed: boolean } | undefined;
+let interruptRequestBlocked = false;
+let sharedToolRole: "delayed" | "execute" | undefined;
+const pendingServerRequests = new Map<
+  string,
+  { readonly resolve: (result: unknown) => void; readonly reject: (error: Error) => void }
+>();
+
+if (currentScenario === "shared-tool-isolation") {
+  if (!env.coordinationDir) {
+    throw new Error("shared-tool-isolation requires T3_DROID_MOCK_COORDINATION_DIR");
+  }
+  try {
+    NodeFS.writeFileSync(NodePath.join(env.coordinationDir, "shared-tool-first"), "", {
+      flag: "wx",
+    });
+    sharedToolRole = "delayed";
+  } catch (error) {
+    if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+    sharedToolRole = "execute";
+  }
+}
+if (env.startRaceDir) {
+  NodeFS.writeFileSync(NodePath.join(env.startRaceDir, `pid-${process.pid}`), String(process.pid));
+  process.once("exit", () => {
+    NodeFS.writeFileSync(NodePath.join(env.startRaceDir!, `exit-${process.pid}`), "");
+  });
+}
 
 function write(message: Record<string, unknown>): void {
-  process.stdout.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      factoryApiVersion: "1.0.0",
-      ...message,
-    })}\n`,
-  );
+  process.stdout.write(`${JSON.stringify({ ...protocol, ...message })}\n`);
 }
-
-function respond(id: string | number | null, result: unknown): void {
+function respond(id: string, result: unknown): void {
   write({ type: "response", id, result });
 }
-
-function fail(id: string | number | null, code: number, message: string): void {
+function fail(id: string, code: number, message: string): void {
   write({ type: "response", id, error: { code, message } });
 }
-
-async function writeJsonReceipt(filePath: string, value: unknown): Promise<void> {
-  const tempPath = `${filePath}.${process.pid}.tmp`;
-  await NodeFSP.writeFile(tempPath, JSON.stringify(value), "utf8");
-  await NodeFSP.rename(tempPath, filePath);
-}
-
 function notifyForSession(sessionId: string, notification: Record<string, unknown>): void {
   write({
     type: "notification",
@@ -147,74 +172,99 @@ function notifyForSession(sessionId: string, notification: Record<string, unknow
     params: { sessionId, notification },
   });
 }
-
 function notify(notification: Record<string, unknown>): void {
   notifyForSession(currentSessionId, notification);
 }
-
+function item(
+  type: string,
+  messageId: string,
+  blockIndex: number,
+  fields: Record<string, unknown> = {},
+  sessionId?: string,
+): void {
+  const notification = { type, messageId, blockIndex, ...fields };
+  if (sessionId) notifyForSession(sessionId, notification);
+  else notify(notification);
+}
+function textDelta(messageId: string, textDelta: string, blockIndex = 1, sessionId?: string): void {
+  item("assistant_text_delta", messageId, blockIndex, { textDelta }, sessionId);
+}
+function textComplete(messageId: string, blockIndex = 1, sessionId?: string): void {
+  item("assistant_text_complete", messageId, blockIndex, {}, sessionId);
+}
+function toolCall(id: string, name: string, input: Record<string, unknown>): void {
+  notify({ type: "tool_call", toolUse: { type: "tool_use", id, input, name } });
+}
+function toolResult(messageId: string, toolUseId: string, text: string): void {
+  notify({
+    type: "tool_result",
+    messageId,
+    toolUseId,
+    content: [{ type: "text", text }],
+  });
+}
+function usageChanged(lastCallTokenUsage: Record<string, number>): void {
+  notify({
+    type: "session_token_usage_changed",
+    sessionId: currentSessionId,
+    tokenUsage,
+    inclusiveTokenUsage: tokenUsage,
+    lastCallTokenUsage,
+  });
+}
 function requestClient(method: string, params: unknown): Promise<unknown> {
   const id = `server-${++serverRequestId}`;
   write({ type: "request", id, method, params });
-  return new Promise((resolve, reject) => {
-    pendingServerRequests.set(id, { resolve, reject });
-  });
+  return new Promise((resolve, reject) => pendingServerRequests.set(id, { resolve, reject }));
 }
-
 function initializeResult() {
   return {
     sessionId: currentSessionId,
     session: { messages: [] },
     availableModels: models,
-    settings: {
-      ...currentSettings,
-      availableAutonomyLevels: ["off", "low", "medium", "high"],
-    },
+    settings: { ...currentSettings, availableAutonomyLevels: autonomyLevels },
   };
 }
-
-function emitTerminalForSession(sessionId: string, reason: string, turnId: string): void {
+function emitTerminalForSession(
+  sessionId: string,
+  reason: string,
+  turnId: string,
+  usage = tokenUsage,
+): void {
   notifyForSession(sessionId, {
     type: "agent_turn_completed",
     reason,
     turnId,
-    tokenUsage,
-    cumulativeTokenUsage: tokenUsage,
+    tokenUsage: usage,
+    cumulativeTokenUsage: usage,
     durationMs: 10,
   });
 }
-
-function emitTurnCompleted(reason: string, turnId: string): void {
-  if (!activeTurn || activeTurn.turnId !== turnId || activeTurn.completed) {
-    return;
-  }
+function emitTurnCompleted(
+  reason: string,
+  turnId: string,
+  options?: { readonly emitUsage?: boolean; readonly terminalUsage?: typeof tokenUsage },
+): void {
+  if (!activeTurn || activeTurn.turnId !== turnId || activeTurn.completed) return;
   activeTurn.completed = true;
-  if (!omitUsageNotification) {
-    notify({
-      type: "session_token_usage_changed",
-      sessionId: currentSessionId,
-      tokenUsage,
-      inclusiveTokenUsage: tokenUsage,
-      lastCallTokenUsage: {
-        inputTokens: 7,
-        cacheReadTokens: 2,
-        outputTokens: 3,
-      },
-    });
+  if (options?.emitUsage !== false && currentScenario !== "omit-usage") {
+    usageChanged({ inputTokens: 7, cacheReadTokens: 2, outputTokens: 3 });
   }
-  emitTerminalForSession(currentSessionId, reason, turnId);
-  notify({
-    type: "droid_working_state_changed",
-    newState: "idle",
-  });
+  emitTerminalForSession(currentSessionId, reason, turnId, options?.terminalUsage);
+  notify({ type: "droid_working_state_changed", newState: "idle" });
   activeTurn = undefined;
 }
-
+async function writeJsonReceipt(filePath: string, value: unknown): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await NodeFSP.writeFile(tempPath, JSON.stringify(value), "utf8");
+  await NodeFSP.rename(tempPath, filePath);
+}
 async function waitForFile(filePath: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const watcher = NodeFS.watch(NodePath.dirname(filePath), (_eventType, filename) => {
-      if (String(filename) !== NodePath.basename(filePath)) return;
-      void NodeFSP.access(filePath).then(finish, () => {});
+      if (String(filename) === NodePath.basename(filePath))
+        void NodeFSP.access(filePath).then(finish, () => {});
     });
     const finish = () => {
       if (settled) return;
@@ -230,63 +280,63 @@ async function waitForFile(filePath: string): Promise<void> {
     void NodeFSP.access(filePath).then(finish, () => {});
   });
 }
+function applyExitSpecModeOutcome(selectedOption: unknown): void {
+  const selected = typeof selectedOption === "string" ? selectedOption : "";
+  const autonomyLevel =
+    /^(?:proceed_auto_run|proceed_new_session)_(high|medium|low)$/.exec(selected)?.[1] ?? "off";
+  currentSettings = { ...currentSettings, autonomyLevel, interactionMode: "auto" };
+  if (env.settingsLogPath) {
+    NodeFS.appendFileSync(
+      env.settingsLogPath,
+      `${JSON.stringify({ exitSpecModeSelectedOption: selected, resultingAutonomyLevel: autonomyLevel })}\n`,
+    );
+  }
+}
+function permissionOptions() {
+  switch (permissionModes[currentScenario]) {
+    case "empty":
+      return [];
+    case "unknown":
+      return [{ label: "Unexpected", value: "unexpected" }];
+    case "accept-only":
+      return decisionOptions.slice(0, 1);
+    default:
+      return decisionOptions;
+  }
+}
+async function requestDecision(params: unknown): Promise<{ selectedOption?: unknown }> {
+  return (await requestClient("droid.request_permission", params)) as {
+    selectedOption?: unknown;
+  };
+}
 
-async function runTurn(params: {
-  readonly messageId: string;
-  readonly text: string;
-}): Promise<void> {
-  const turnId = params.messageId;
-  activeTurn = { turnId, completed: false };
-
-  if (emitPostLoadStraggler && previousSessionId !== undefined) {
-    emitPostLoadStraggler = false;
-    notifyForSession(previousSessionId, {
-      type: "assistant_text_delta",
-      messageId: `assistant-stale-${turnId}`,
-      blockIndex: 0,
-      textDelta: "stale pre-rewind output",
+async function runLateTerminal(turnId: string): Promise<boolean> {
+  if (currentScenario !== "late-terminal") return false;
+  if (turnSequence === 1) {
+    firstTurnId = turnId;
+    return true;
+  }
+  textDelta(`replacement-${turnId}`, "replacement output", 0);
+  usageChanged({ inputTokens: 3, cacheReadTokens: 1, outputTokens: 2 });
+  if (firstTurnId) {
+    emitTerminalForSession(currentSessionId, "completed", firstTurnId, {
+      inputTokens: 900,
+      outputTokens: 90,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 9,
+      thinkingTokens: 0,
     });
   }
-
-  notify({ type: "droid_working_state_changed", newState: "thinking" });
-  notify({
-    type: "thinking_text_delta",
-    messageId: `assistant-${turnId}`,
-    blockIndex: 0,
-    textDelta: "Mock thinking",
-  });
-
-  if (exitMidTurn) {
-    process.exit(7);
-  }
-
-  if (emitUnknownNotification) {
-    notify({
-      type: "future_mock_notification",
-      futurePayload: { supported: true },
-    });
-  }
-
-  if (params.text === "mock spec autonomy handoff") {
-    // Mirrors the CLI's real exit_spec_mode option list: the selected outcome,
-    // not any settings update, decides the implementation autonomy.
-    const result = (await requestClient("droid.request_permission", {
-      toolUses: [
-        {
-          toolUse: {
-            type: "tool_use",
-            id: `exit-spec-autonomy-tool-${turnId}`,
-            input: { plan: "Implement the approved plan." },
-            name: "ExitSpecMode",
-          },
-          details: {
-            type: "exit_spec_mode",
-            plan: "Implement the approved plan.",
-            title: "Approved plan",
-          },
-        },
-      ],
-      options: [
+  textComplete(`replacement-${turnId}`, 0);
+  emitTurnCompleted("completed", turnId, { emitUsage: false });
+  return true;
+}
+async function runSpecScenario(turnId: string): Promise<boolean> {
+  const tool = specTool(`exit-spec-tool-${turnId}`);
+  if (currentScenario === "spec-autonomy-handoff") {
+    tool.toolUse.id = `exit-spec-autonomy-tool-${turnId}`;
+    const result = await requestDecision(
+      permissionParams(tool, [
         { label: "Proceed with implementation", value: "proceed_once" },
         { label: "Proceed, and allow file edits (Low)", value: "proceed_auto_run_low" },
         {
@@ -297,161 +347,78 @@ async function runTurn(params: {
         { label: "Proceed in a new session (no autonomy)", value: "proceed_new_session" },
         { label: "Proceed in a new session (High autonomy)", value: "proceed_new_session_high" },
         { label: "No, keep iterating on spec", value: "cancel" },
-      ],
-    })) as { selectedOption?: unknown };
-    if (result.selectedOption === "cancel") {
-      emitTurnCompleted("permission_rejected", turnId);
-      return;
+      ]),
+    );
+    if (result.selectedOption === "cancel") emitTurnCompleted("permission_rejected", turnId);
+    else {
+      applyExitSpecModeOutcome(result.selectedOption);
+      textDelta(`assistant-inline-impl-${turnId}`, "in-session implementation", 0);
+      textComplete(`assistant-inline-impl-${turnId}`, 0);
+      emitTurnCompleted("completed", turnId);
     }
-    applyExitSpecModeOutcome(result.selectedOption);
-    // proceed_once / proceed_auto_run_* implement in the SAME session; only
-    // proceed_new_session* fork a successor.
-    notify({
-      type: "assistant_text_delta",
-      messageId: `assistant-inline-impl-${turnId}`,
-      blockIndex: 0,
-      textDelta: "in-session implementation",
-    });
-    notify({
-      type: "assistant_text_complete",
-      messageId: `assistant-inline-impl-${turnId}`,
-      blockIndex: 0,
-    });
-    emitTurnCompleted("completed", turnId);
-    return;
+    return true;
   }
-
-  if (params.text === "mock spec handoff") {
-    const result = (await requestClient("droid.request_permission", {
-      toolUses: [
-        {
-          toolUse: {
-            type: "tool_use",
-            id: `exit-spec-tool-${turnId}`,
-            input: { plan: "Implement the approved plan." },
-            name: "ExitSpecMode",
-          },
-          details: {
-            type: "exit_spec_mode",
-            plan: "Implement the approved plan.",
-            title: "Approved plan",
-          },
-        },
-      ],
-      // A successor session only follows the new-session outcomes; the
-      // in-session variants live in "mock spec autonomy handoff".
-      options: [
+  if (currentScenario === "spec-handoff") {
+    const result = await requestDecision(
+      permissionParams(tool, [
         { label: "Implement", value: "proceed_new_session_high" },
         { label: "Cancel", value: "cancel" },
-      ],
-    })) as { selectedOption?: unknown };
-    if (result.selectedOption === "cancel") {
-      emitTurnCompleted("permission_rejected", turnId);
-      return;
+      ]),
+    );
+    if (result.selectedOption === "cancel") emitTurnCompleted("permission_rejected", turnId);
+    else {
+      applyExitSpecModeOutcome(result.selectedOption);
+      textDelta(`assistant-successor-${turnId}`, "implementation successor", 0, sessions.successor);
+      textComplete(`assistant-successor-${turnId}`, 0, sessions.successor);
+      emitTerminalForSession(sessions.successor, "completed", `successor-${turnId}`);
+      emitTurnCompleted("spec_handoff", turnId);
     }
-    applyExitSpecModeOutcome(result.selectedOption);
-    notifyForSession(specSuccessorSessionId, {
-      type: "assistant_text_delta",
-      messageId: `assistant-successor-${turnId}`,
-      blockIndex: 0,
-      textDelta: "implementation successor",
-    });
-    notifyForSession(specSuccessorSessionId, {
-      type: "assistant_text_complete",
-      messageId: `assistant-successor-${turnId}`,
-      blockIndex: 0,
-    });
-    emitTerminalForSession(specSuccessorSessionId, "completed", `successor-${turnId}`);
-    emitTurnCompleted("spec_handoff", turnId);
-    return;
+    return true;
   }
-
-  if (params.text === "mock late spec approval") {
-    // The turn settles while the exit_spec_mode permission is still pending;
-    // a late approval then streams successor traffic that the adapter must
-    // refuse to adopt. The settle waits on a marker file so the test can
-    // guarantee the request opened before the turn completes.
-    const pendingApproval = requestClient("droid.request_permission", {
-      toolUses: [
-        {
-          toolUse: {
-            type: "tool_use",
-            id: `late-exit-spec-tool-${turnId}`,
-            input: { plan: "Implement the approved plan." },
-            name: "ExitSpecMode",
-          },
-          details: {
-            type: "exit_spec_mode",
-            plan: "Implement the approved plan.",
-            title: "Approved plan",
-          },
-        },
-      ],
-      options: [
+  if (currentScenario === "late-spec-approval" && turnSequence === 1) {
+    tool.toolUse.id = `late-exit-spec-tool-${turnId}`;
+    void requestDecision(
+      permissionParams(tool, [
         { label: "Implement", value: "proceed_once" },
         { label: "Cancel", value: "cancel" },
-      ],
-    }) as Promise<{ selectedOption?: unknown }>;
-    void pendingApproval.then((result) => {
-      if (result.selectedOption === "cancel") {
-        return;
-      }
-      notifyForSession(specSuccessorSessionId, {
-        type: "assistant_text_delta",
-        messageId: `assistant-late-successor-${turnId}`,
-        blockIndex: 0,
-        textDelta: "late implementation successor",
-      });
-      emitTerminalForSession(specSuccessorSessionId, "completed", `late-successor-${turnId}`);
+      ]),
+    ).then((result) => {
+      if (result.selectedOption === "cancel") return;
+      textDelta(
+        `assistant-late-successor-${turnId}`,
+        "late implementation successor",
+        0,
+        sessions.successor,
+      );
+      emitTerminalForSession(sessions.successor, "completed", `late-successor-${turnId}`);
     });
     const settleFile = process.env.T3_DROID_MOCK_LATE_SPEC_SETTLE_FILE;
-    if (settleFile) {
-      await waitForFile(settleFile);
-    }
+    if (settleFile) await waitForFile(settleFile);
     emitTurnCompleted("completed", turnId);
+    return true;
+  }
+  return false;
+}
+function emitForeignSpecTraffic(turnId: string): void {
+  if (
+    currentScenario !== "foreign-spec-envelope" &&
+    !(currentScenario === "late-spec-approval" && turnSequence > 1)
+  ) {
     return;
   }
-
-  if (params.text === "mock foreign spec envelope") {
-    notifyForSession(specSuccessorSessionId, {
-      type: "assistant_text_delta",
-      messageId: `assistant-foreign-${turnId}`,
-      blockIndex: 0,
-      textDelta: "unapproved implementation successor",
-    });
-    emitTerminalForSession(specSuccessorSessionId, "completed", `foreign-${turnId}`);
-  }
-
-  if (params.text === "mock future terminal reason") {
-    emitTurnCompleted("future_terminal_reason", turnId);
-    emitTerminalForSession(currentSessionId, "completed", turnId);
-    return;
-  }
-
-  if (params.text === "mock compaction") {
-    notify({
-      type: "session_compacted",
-      summaryId: "mock-summary-1",
-      removedCount: 3,
-      visibleBoundaryMessageId: null,
-    });
-    notify({
-      type: "session_token_usage_changed",
-      sessionId: currentSessionId,
-      tokenUsage,
-      inclusiveTokenUsage: tokenUsage,
-      lastCallTokenUsage: {
-        inputTokens: 5,
-        cacheReadTokens: 1,
-        outputTokens: 2,
-      },
-    });
-  }
-
-  if (params.text === "mock child session") {
+  textDelta(
+    `assistant-foreign-${turnId}`,
+    "unapproved implementation successor",
+    0,
+    sessions.successor,
+  );
+  emitTerminalForSession(sessions.successor, "completed", `foreign-${turnId}`);
+}
+async function runChildScenario(turnId: string): Promise<boolean> {
+  if (currentScenario === "child-session") {
     notify({
       type: "child_session_available",
-      childSessionId,
+      childSessionId: sessions.child,
       toolUseId: `child-task-${turnId}`,
       description: "Mock delegated task",
       timestamp: 1,
@@ -463,199 +430,52 @@ async function runTurn(params: {
       update: {
         type: "message",
         text: "Inspecting delegated files",
-        subagentSessionId: childSessionId,
+        subagentSessionId: sessions.child,
       },
     });
-    notifyForSession(childSessionId, {
-      type: "assistant_text_delta",
-      messageId: `assistant-child-${turnId}`,
-      blockIndex: 0,
-      textDelta: "child-only output",
-    });
-    // The real CLI runs subagents in daemon-hosted processes: the child's own
-    // turn completion never crosses the parent's stdio. The parent's Task
-    // tool_result is the closure signal.
-    notify({
-      type: "tool_result",
-      toolUseId: `child-task-${turnId}`,
-      isError: false,
-    });
+    textDelta(`assistant-child-${turnId}`, "child-only output", 0, sessions.child);
+    notify({ type: "tool_result", toolUseId: `child-task-${turnId}`, isError: false });
+    return false;
   }
-
-  if (
-    params.text === "mock hanging child session" ||
-    params.text === "mock child session then exit"
-  ) {
-    notify({
-      type: "child_session_available",
-      childSessionId,
-      description: "Mock delegated task",
-      timestamp: 1,
-    });
-    if (params.text === "mock child session then exit") {
-      await new Promise<void>((resolve, reject) =>
-        process.stdout.write("", (error) => (error ? reject(error) : resolve())),
-      );
-      process.exit(7);
-    }
-    return;
+  if (currentScenario !== "hanging-child-session" && currentScenario !== "child-session-exit") {
+    return false;
   }
-
-  if (params.text === "mock taskless progress") {
-    notify({
-      type: "tool_progress_update",
-      toolUseId: `parent-tool-${turnId}`,
-      toolName: "Execute",
-      update: {
-        type: "status",
-        status: "running",
-      },
-    });
+  notify({
+    type: "child_session_available",
+    childSessionId: sessions.child,
+    description: "Mock delegated task",
+    timestamp: 1,
+  });
+  if (currentScenario === "child-session-exit") {
+    await new Promise<void>((resolve, reject) =>
+      process.stdout.write("", (error) => (error ? reject(error) : resolve())),
+    );
+    process.exit(7);
   }
-
-  if (
-    params.text === "mock report interaction mode" ||
-    params.text === "mock report selected model"
-  ) {
-    const report =
-      params.text === "mock report interaction mode"
-        ? currentSettings.interactionMode
-        : currentSettings.interactionMode === "spec"
-          ? `${currentSettings.specModeModelId}:${currentSettings.specModeReasoningEffort}`
-          : `${currentSettings.modelId}:${currentSettings.reasoningEffort}`;
-    notify({
-      type: "thinking_text_complete",
-      messageId: `assistant-${turnId}`,
-      blockIndex: 0,
-      durationMs: 5,
-    });
-    notify({
-      type: "assistant_text_delta",
-      messageId: `assistant-${turnId}`,
-      blockIndex: 1,
-      textDelta: report,
-    });
-    notify({
-      type: "assistant_text_complete",
-      messageId: `assistant-${turnId}`,
-      blockIndex: 1,
-    });
-    emitTurnCompleted("completed", turnId);
-    return;
-  }
-
-  if (params.text === "mock incomplete items") {
-    notify({
-      type: "assistant_text_delta",
-      messageId: `assistant-${turnId}`,
-      blockIndex: 1,
-      textDelta: "terminal without item completions",
-    });
-    notify({
-      type: "tool_call",
-      toolUse: {
-        type: "tool_use",
-        id: `incomplete-tool-${turnId}`,
-        input: { command: "echo incomplete" },
-        name: "Execute",
-      },
-    });
-    emitTurnCompleted("completed", turnId);
-    return;
-  }
-
-  if (params.text === "mock delayed shared tool") {
-    notify({
-      type: "tool_call",
-      toolUse: {
-        type: "tool_use",
-        id: "shared-tool-use",
-        input: { path: "README.md" },
-        name: "Read",
-      },
-    });
-    return;
-  }
-
-  if (params.text === "mock shared tool execute") {
-    notify({
-      type: "tool_call",
-      toolUse: {
-        type: "tool_use",
-        id: "shared-tool-use",
-        input: { command: "echo shared" },
-        name: "Execute",
-      },
-    });
-    notify({
-      type: "tool_result",
-      messageId: `assistant-${turnId}`,
-      toolUseId: "shared-tool-use",
-      content: [{ type: "text", text: "shared command output" }],
-    });
-  }
-
-  if (params.text === "mock steering original") {
-    notify({
-      type: "tool_call",
-      toolUse: {
-        type: "tool_use",
-        id: `steering-tool-${turnId}`,
-        input: { command: "echo steering" },
-        name: "Execute",
-      },
-    });
-    return;
-  }
-
-  if (requestPermission) {
-    const permissionOptions =
-      permissionOptionsMode === "empty"
-        ? []
-        : permissionOptionsMode === "unknown"
-          ? [{ label: "Unexpected", value: "unexpected" }]
-          : permissionOptionsMode === "accept-only"
-            ? [{ label: "Allow once", value: "proceed_once" }]
-            : [
-                { label: "Allow once", value: "proceed_once" },
-                { label: "Deny", value: "cancel" },
-              ];
+  return true;
+}
+async function runPermissionFlow(turnId: string): Promise<boolean> {
+  if (permissionModes[currentScenario]) {
     let result: { selectedOption?: unknown };
     try {
-      result = (await requestClient("droid.request_permission", {
-        toolUses: [
-          {
-            toolUse: {
-              type: "tool_use",
-              id: `permission-tool-${turnId}`,
-              input: { command: "echo mock" },
-              name: "Execute",
-            },
-            confirmationType: "exec",
-            details: {
-              type: "exec",
-              fullCommand: "echo mock",
-              command: "echo",
-              impactLevel: "low",
-              riskLevelReason: "The mock command only prints text.",
-            },
-          },
-        ],
-        options: permissionOptions,
-      })) as { selectedOption?: unknown };
-      if (permissionResponseFile) {
-        await writeJsonReceipt(permissionResponseFile, {
+      result = await requestDecision(
+        permissionParams(
+          execTool(`permission-tool-${turnId}`, "echo mock", true),
+          permissionOptions(),
+        ),
+      );
+      if (env.permissionResponseFile) {
+        await writeJsonReceipt(env.permissionResponseFile, {
           selectedOption: result.selectedOption,
         });
       }
     } catch (error) {
-      if (permissionResponseFile) {
-        await writeJsonReceipt(permissionResponseFile, {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return;
-      }
-      throw error;
+      if (currentScenario === "park-hitl") return true;
+      if (!env.permissionResponseFile) throw error;
+      await writeJsonReceipt(env.permissionResponseFile, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return true;
     }
     notify({
       type: "permission_resolved",
@@ -665,48 +485,117 @@ async function runTurn(params: {
     });
     if (result.selectedOption === "cancel") {
       emitTurnCompleted("permission_rejected", turnId);
-      return;
+      return true;
     }
   }
-
   if (permissionFloodCount > 0) {
     const requests: Array<Promise<unknown>> = [];
     for (let index = 0; index < permissionFloodCount; index += 1) {
       requests.push(
-        requestClient("droid.request_permission", {
-          toolUses: [
-            {
-              toolUse: {
-                type: "tool_use",
-                id: `permission-flood-tool-${turnId}-${index}`,
-                input: { command: `echo ${index}` },
-                name: "Execute",
-              },
-              confirmationType: "exec",
-              details: {
-                type: "exec",
-                fullCommand: `echo ${index}`,
-                command: "echo",
-                impactLevel: "low",
-                riskLevelReason: "The mock command only prints text.",
-              },
-            },
-          ],
-          options: [
-            { label: "Allow once", value: "proceed_once" },
-            { label: "Deny", value: "cancel" },
-          ],
-        }),
+        requestClient(
+          "droid.request_permission",
+          permissionParams(
+            execTool(`permission-flood-tool-${turnId}-${index}`, `echo ${index}`, true),
+            decisionOptions,
+          ),
+        ),
       );
       await NodeTimersPromises.setTimeout(5);
     }
-    if (permissionFloodReadyFile) {
-      NodeFS.writeFileSync(permissionFloodReadyFile, "");
-    }
+    if (env.permissionFloodReadyFile) NodeFS.writeFileSync(env.permissionFloodReadyFile, "");
     await Promise.all(requests);
   }
+  return false;
+}
 
-  if (askUser) {
+async function runTurn(turnId: string): Promise<void> {
+  turnSequence += 1;
+  activeTurn = { turnId, completed: false };
+  if (emitPostLoadStraggler && previousSessionId) {
+    emitPostLoadStraggler = false;
+    textDelta(`assistant-stale-${turnId}`, "stale pre-rewind output", 0, previousSessionId);
+  }
+  notify({ type: "droid_working_state_changed", newState: "thinking" });
+  item("thinking_text_delta", `assistant-${turnId}`, 0, { textDelta: "Mock thinking" });
+  if (currentScenario === "exit-mid-turn") process.exit(7);
+  if (currentScenario === "unknown-notification" || currentScenario === "rpc-roundtrip") {
+    notify({ type: "future_mock_notification", futurePayload: { supported: true } });
+  }
+  if (await runLateTerminal(turnId)) return;
+  if (currentScenario === "usage-reset") {
+    if (turnSequence === 1) usageChanged({ inputTokens: 70, cacheReadTokens: 20, outputTokens: 9 });
+    emitTurnCompleted("completed", turnId, { emitUsage: false });
+    return;
+  }
+  if (currentScenario === "exit-hitl") {
+    if (!env.coordinationDir) throw new Error("exit-hitl requires T3_DROID_MOCK_COORDINATION_DIR");
+    void requestClient(
+      "droid.request_permission",
+      permissionParams(execTool(`exit-hitl-tool-${turnId}`, "echo parked"), [
+        { label: "Allow once", value: "proceed_once" },
+      ]),
+    ).catch(() => {});
+    await waitForFile(NodePath.join(env.coordinationDir, "release-exit"));
+    process.exit(7);
+  }
+  if (await runSpecScenario(turnId)) return;
+  emitForeignSpecTraffic(turnId);
+  if (currentScenario === "future-terminal-reason") {
+    emitTurnCompleted("future_terminal_reason", turnId);
+    emitTerminalForSession(currentSessionId, "completed", turnId);
+    return;
+  }
+  if (currentScenario === "compaction") {
+    notify({
+      type: "session_compacted",
+      summaryId: "mock-summary-1",
+      removedCount: 3,
+      visibleBoundaryMessageId: null,
+    });
+    usageChanged({ inputTokens: 5, cacheReadTokens: 1, outputTokens: 2 });
+  }
+  if (await runChildScenario(turnId)) return;
+  if (currentScenario === "taskless-progress") {
+    notify({
+      type: "tool_progress_update",
+      toolUseId: `parent-tool-${turnId}`,
+      toolName: "Execute",
+      update: { type: "status", status: "running" },
+    });
+  }
+  if (currentScenario === "load-spec-mode-report" || currentScenario === "report-selected-model") {
+    const report =
+      currentScenario === "load-spec-mode-report"
+        ? currentSettings.interactionMode
+        : currentSettings.interactionMode === "spec"
+          ? `${currentSettings.specModeModelId}:${currentSettings.specModeReasoningEffort}`
+          : `${currentSettings.modelId}:${currentSettings.reasoningEffort}`;
+    item("thinking_text_complete", `assistant-${turnId}`, 0, { durationMs: 5 });
+    textDelta(`assistant-${turnId}`, report);
+    textComplete(`assistant-${turnId}`);
+    emitTurnCompleted("completed", turnId);
+    return;
+  }
+  if (currentScenario === "incomplete-items") {
+    textDelta(`assistant-${turnId}`, "terminal without item completions");
+    toolCall(`incomplete-tool-${turnId}`, "Execute", { command: "echo incomplete" });
+    emitTurnCompleted("completed", turnId);
+    return;
+  }
+  if (sharedToolRole === "delayed") {
+    toolCall("shared-tool-use", "Read", { path: "README.md" });
+    return;
+  }
+  if (sharedToolRole === "execute") {
+    toolCall("shared-tool-use", "Execute", { command: "echo shared" });
+    toolResult(`assistant-${turnId}`, "shared-tool-use", "shared command output");
+  }
+  if (currentScenario === "steering-coalesced" || currentScenario === "steering-separate") {
+    toolCall(`steering-tool-${turnId}`, "Execute", { command: "echo steering" });
+    return;
+  }
+  if (await runPermissionFlow(turnId)) return;
+  if (currentScenario === "ask-user" || currentScenario === "rpc-roundtrip") {
     await requestClient("droid.ask_user", {
       toolCallId: `ask-${turnId}`,
       questions: [
@@ -719,269 +608,208 @@ async function runTurn(params: {
       ],
     });
   }
-
-  if (emitToolCall) {
-    notify({
-      type: "tool_call",
-      toolUse: {
-        type: "tool_use",
-        id: `tool-${turnId}`,
-        input: { path: "README.md" },
-        name: "Read",
-      },
-    });
-    notify({
-      type: "tool_result",
-      messageId: `assistant-${turnId}`,
-      toolUseId: `tool-${turnId}`,
-      content: [{ type: "text", text: "mock file contents" }],
-    });
+  if (currentScenario === "rpc-roundtrip") {
+    toolCall(`tool-${turnId}`, "Read", { path: "README.md" });
+    toolResult(`assistant-${turnId}`, `tool-${turnId}`, "mock file contents");
   }
-
-  notify({
-    type: "thinking_text_complete",
-    messageId: `assistant-${turnId}`,
-    blockIndex: 0,
-    durationMs: 5,
-  });
-  notify({
-    type: "assistant_text_delta",
-    messageId: `assistant-${turnId}`,
-    blockIndex: 1,
-    textDelta: "hello from ",
-  });
-  notify({
-    type: "assistant_text_delta",
-    messageId: `assistant-${turnId}`,
-    blockIndex: 1,
-    textDelta: "droid mock",
-  });
-  notify({
-    type: "assistant_text_complete",
-    messageId: `assistant-${turnId}`,
-    blockIndex: 1,
-  });
-
-  if (hangTurn || params.text === "mock hang this turn") {
+  item("thinking_text_complete", `assistant-${turnId}`, 0, { durationMs: 5 });
+  textDelta(`assistant-${turnId}`, "hello from ");
+  textDelta(`assistant-${turnId}`, "droid mock");
+  textComplete(`assistant-${turnId}`);
+  if (
+    currentScenario === "hang-turn" ||
+    currentScenario === "interrupt-race" ||
+    (currentScenario === "hang-first-turn" && turnSequence === 1)
+  ) {
     return;
   }
   emitTurnCompleted("completed", turnId);
 }
 
+const loadedMessages = {
+  default: [
+    { id: "loaded-user-1", role: "user", content: [{ type: "text", text: "loaded prompt" }] },
+    {
+      id: "loaded-assistant-1",
+      role: "assistant",
+      content: [{ type: "text", text: "loaded response" }],
+    },
+  ],
+  steering: [
+    {
+      id: "loaded-opening-user",
+      role: "user",
+      content: [{ type: "text", text: "loaded opening prompt" }],
+    },
+    { id: "loaded-steer-user", role: "user", content: [{ type: "text", text: "loaded steer" }] },
+    {
+      id: "loaded-assistant-1",
+      role: "assistant",
+      content: [{ type: "text", text: "loaded response" }],
+    },
+  ],
+};
+function parseUserMessage(params: unknown): { messageId: string; text: string } | undefined {
+  if (typeof params !== "object" || params === null) return undefined;
+  const values = params as { messageId?: unknown; text?: unknown };
+  return typeof values.messageId === "string" &&
+    values.messageId.length > 0 &&
+    typeof values.text === "string"
+    ? { messageId: values.messageId, text: values.text }
+    : undefined;
+}
+function emitSteeringMessage(messageId: string, text: string): void {
+  notify({
+    type: "create_message",
+    message: { id: messageId, role: "user", content: [{ type: "text", text }] },
+  });
+}
+async function handleAddUserMessage(id: string, params: unknown): Promise<void> {
+  const userMessage = parseUserMessage(params);
+  if (!userMessage) {
+    fail(id, -32602, "add_user_message requires messageId and text");
+    return;
+  }
+  if (currentScenario === "start-race" && env.startRaceDir) {
+    await NodeFSP.writeFile(NodePath.join(env.startRaceDir, "thread-lock-held"), "");
+    await waitForFile(NodePath.join(env.startRaceDir, "release-thread-lock"));
+  }
+  if (env.interruptOrderDir && interruptRequestBlocked) {
+    await NodeFSP.writeFile(
+      NodePath.join(env.interruptOrderDir, "turn-started-before-interrupt"),
+      "",
+    );
+  }
+  respond(id, {});
+  if (sharedToolRole === "delayed" && activeTurn && !activeTurn.completed) {
+    const openingTurnId = activeTurn.turnId;
+    emitSteeringMessage(userMessage.messageId, userMessage.text);
+    toolResult(`assistant-${openingTurnId}`, "shared-tool-use", "shared file contents");
+    emitTurnCompleted("completed", openingTurnId);
+    return;
+  }
+  if (currentScenario === "steering-coalesced" && activeTurn && !activeTurn.completed) {
+    const openingTurnId = activeTurn.turnId;
+    emitSteeringMessage(userMessage.messageId, userMessage.text);
+    textDelta(`assistant-${openingTurnId}`, "steered output");
+    textComplete(`assistant-${openingTurnId}`);
+    emitTurnCompleted("completed", openingTurnId);
+    return;
+  }
+  if (currentScenario === "steering-separate" && activeTurn && !activeTurn.completed) {
+    emitTurnCompleted("completed", activeTurn.turnId);
+  }
+  void runTurn(userMessage.messageId);
+}
+async function initialize(id: string): Promise<void> {
+  if (currentScenario === "fail-init") {
+    fail(id, -32603, "Mock initialization failure");
+    return;
+  }
+  if (env.startRaceDir) {
+    try {
+      await NodeFSP.writeFile(NodePath.join(env.startRaceDir, "first-init"), "", { flag: "wx" });
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+      await NodeFSP.writeFile(NodePath.join(env.startRaceDir, "replacement-init-started"), "");
+      await waitForFile(NodePath.join(env.startRaceDir, "release-replacement-init"));
+    }
+  }
+  previousSessionId = undefined;
+  currentSessionId = sessions.initialized;
+  respond(id, initializeResult());
+}
+function loadSession(id: string, params: unknown): void {
+  const sessionId =
+    typeof params === "object" &&
+    params !== null &&
+    "sessionId" in params &&
+    typeof params.sessionId === "string"
+      ? params.sessionId
+      : "";
+  if (!sessionId) {
+    fail(id, -32602, "load_session requires sessionId");
+    return;
+  }
+  if (sessionId !== sessions.known && sessionId !== sessions.rewound) {
+    fail(id, -32004, "Mock session not found");
+    return;
+  }
+  previousSessionId = currentSessionId;
+  currentSessionId = sessionId;
+  if (currentScenario === "load-spec-mode-report") {
+    currentSettings = { ...currentSettings, interactionMode: "spec" };
+  }
+  if (sessionId === sessions.rewound) emitPostLoadStraggler = true;
+  const loadSteering =
+    currentScenario === "steering-coalesced" || currentScenario === "steering-separate";
+  respond(id, {
+    session: {
+      title: "Loaded mock session",
+      messages: loadSteering ? loadedMessages.steering : loadedMessages.default,
+    },
+    settings: {
+      ...currentSettings,
+      ...(currentScenario === "fail-update-settings" ? { autonomyLevel: "high" } : {}),
+      availableAutonomyLevels: autonomyLevels,
+    },
+    availableModels: models,
+    tokenUsage,
+  });
+}
+async function interrupt(id: string): Promise<void> {
+  if (env.interruptOrderDir) {
+    interruptRequestBlocked = true;
+    await NodeFSP.writeFile(NodePath.join(env.interruptOrderDir, "interrupt-received"), "");
+    await waitForFile(NodePath.join(env.interruptOrderDir, "release-interrupt"));
+    interruptRequestBlocked = false;
+  }
+  if (activeTurn) {
+    emitTurnCompleted(
+      currentScenario === "interrupt-race" ? "completed" : "cancelled",
+      activeTurn.turnId,
+    );
+  }
+  respond(id, {});
+}
+function updateSettings(id: string, params: unknown): void {
+  if (currentScenario === "fail-update-settings") {
+    fail(id, -32603, "Mock settings update failure");
+    return;
+  }
+  if (env.settingsLogPath)
+    NodeFS.appendFileSync(env.settingsLogPath, `${JSON.stringify(params)}\n`);
+  if (typeof params === "object" && params !== null)
+    currentSettings = { ...currentSettings, ...params };
+  respond(id, {});
+  notify({ type: "settings_updated", settings: currentSettings });
+}
 async function handleRequest(message: {
-  readonly id: string | number | null;
+  readonly id: string;
   readonly method: string;
   readonly params?: unknown;
 }): Promise<void> {
+  if (env.requestLogPath) {
+    NodeFS.appendFileSync(
+      env.requestLogPath,
+      `${JSON.stringify({ method: message.method, params: message.params })}\n`,
+    );
+  }
   switch (message.method) {
     case "droid.initialize_session":
-      if (failInit) {
-        fail(message.id, -32603, "Mock initialization failure");
-      } else {
-        if (startRaceDir) {
-          const firstInitPath = NodePath.join(startRaceDir, "first-init");
-          try {
-            await NodeFSP.writeFile(firstInitPath, "", { flag: "wx" });
-          } catch (error) {
-            if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") {
-              throw error;
-            }
-            await NodeFSP.writeFile(NodePath.join(startRaceDir, "replacement-init-started"), "");
-            await waitForFile(NodePath.join(startRaceDir, "release-replacement-init"));
-          }
-        }
-        previousSessionId = undefined;
-        currentSessionId = initializedSessionId;
-        respond(message.id, initializeResult());
-      }
+      await initialize(message.id);
       return;
     case "droid.load_session":
-      if (
-        typeof message.params !== "object" ||
-        message.params === null ||
-        !("sessionId" in message.params) ||
-        typeof message.params.sessionId !== "string" ||
-        message.params.sessionId.length === 0
-      ) {
-        fail(message.id, -32602, "load_session requires sessionId");
-        return;
-      }
-      if (
-        message.params.sessionId !== knownLoadSessionId &&
-        message.params.sessionId !== rewoundSessionId
-      ) {
-        fail(message.id, -32004, "Mock session not found");
-        return;
-      }
-      previousSessionId = currentSessionId;
-      currentSessionId = message.params.sessionId;
-      if (loadInSpecMode) {
-        currentSettings = { ...currentSettings, interactionMode: "spec" };
-      }
-      if (currentSessionId === rewoundSessionId) {
-        emitPostLoadStraggler = true;
-      }
-      respond(message.id, {
-        session: {
-          title: "Loaded mock session",
-          messages: loadSteeringMessages
-            ? [
-                {
-                  id: "loaded-opening-user",
-                  role: "user",
-                  content: [{ type: "text", text: "loaded opening prompt" }],
-                },
-                {
-                  id: "loaded-steer-user",
-                  role: "user",
-                  content: [{ type: "text", text: "loaded steer" }],
-                },
-                {
-                  id: "loaded-assistant-1",
-                  role: "assistant",
-                  content: [{ type: "text", text: "loaded response" }],
-                },
-              ]
-            : [
-                {
-                  id: "loaded-user-1",
-                  role: "user",
-                  content: [{ type: "text", text: "loaded prompt" }],
-                },
-                {
-                  id: "loaded-assistant-1",
-                  role: "assistant",
-                  content: [{ type: "text", text: "loaded response" }],
-                },
-              ],
-        },
-        settings: {
-          ...currentSettings,
-          ...(failUpdateSettings ? { autonomyLevel: "high" } : {}),
-          availableAutonomyLevels: ["off", "low", "medium", "high"],
-        },
-        availableModels: models,
-        tokenUsage,
-      });
+      loadSession(message.id, message.params);
       return;
-    case "droid.add_user_message": {
-      const params =
-        typeof message.params === "object" && message.params !== null
-          ? (message.params as { messageId?: unknown; text?: unknown })
-          : {};
-      if (
-        typeof params.messageId !== "string" ||
-        params.messageId.length === 0 ||
-        typeof params.text !== "string"
-      ) {
-        fail(message.id, -32602, "add_user_message requires messageId and text");
-        return;
-      }
-      if (startRaceDir && params.text === "mock hold thread lock") {
-        await NodeFSP.writeFile(NodePath.join(startRaceDir, "thread-lock-held"), "");
-        await waitForFile(NodePath.join(startRaceDir, "release-thread-lock"));
-      }
-      if (interruptOrderDir && interruptRequestBlocked) {
-        await NodeFSP.writeFile(
-          NodePath.join(interruptOrderDir, "turn-started-before-interrupt"),
-          "",
-        );
-      }
-      respond(message.id, {});
-      if (
-        params.text === "mock release shared tool" &&
-        activeTurn !== undefined &&
-        !activeTurn.completed
-      ) {
-        const openingTurnId = activeTurn.turnId;
-        notify({
-          type: "create_message",
-          message: {
-            id: params.messageId,
-            role: "user",
-            content: [{ type: "text", text: params.text }],
-          },
-        });
-        notify({
-          type: "tool_result",
-          messageId: `assistant-${openingTurnId}`,
-          toolUseId: "shared-tool-use",
-          content: [{ type: "text", text: "shared file contents" }],
-        });
-        emitTurnCompleted("completed", openingTurnId);
-        return;
-      }
-      if (
-        params.text === "mock steering coalesced" &&
-        activeTurn !== undefined &&
-        !activeTurn.completed
-      ) {
-        const openingTurnId = activeTurn.turnId;
-        notify({
-          type: "create_message",
-          message: {
-            id: params.messageId,
-            role: "user",
-            content: [{ type: "text", text: params.text }],
-          },
-        });
-        notify({
-          type: "assistant_text_delta",
-          messageId: `assistant-${openingTurnId}`,
-          blockIndex: 1,
-          textDelta: "steered output",
-        });
-        notify({
-          type: "assistant_text_complete",
-          messageId: `assistant-${openingTurnId}`,
-          blockIndex: 1,
-        });
-        emitTurnCompleted("completed", openingTurnId);
-        return;
-      }
-      if (
-        params.text === "mock steering separate" &&
-        activeTurn !== undefined &&
-        !activeTurn.completed
-      ) {
-        emitTurnCompleted("completed", activeTurn.turnId);
-        void runTurn({ messageId: params.messageId, text: params.text });
-        return;
-      }
-      void runTurn({ messageId: params.messageId, text: params.text });
+    case "droid.add_user_message":
+      await handleAddUserMessage(message.id, message.params);
       return;
-    }
     case "droid.interrupt_session":
-      if (interruptOrderDir) {
-        interruptRequestBlocked = true;
-        await NodeFSP.writeFile(NodePath.join(interruptOrderDir, "interrupt-received"), "");
-        await waitForFile(NodePath.join(interruptOrderDir, "release-interrupt"));
-        interruptRequestBlocked = false;
-      }
-      if (activeTurn) {
-        emitTurnCompleted(
-          process.env.T3_DROID_MOCK_INTERRUPT_RACE === "1" ? "completed" : "cancelled",
-          activeTurn.turnId,
-        );
-      }
-      respond(message.id, {});
+      await interrupt(message.id);
       return;
     case "droid.update_session_settings":
-      if (failUpdateSettings) {
-        fail(message.id, -32603, "Mock settings update failure");
-        return;
-      }
-      if (settingsLogPath) {
-        NodeFS.appendFileSync(settingsLogPath, `${JSON.stringify(message.params)}\n`);
-      }
-      if (typeof message.params === "object" && message.params !== null) {
-        currentSettings = { ...currentSettings, ...message.params };
-      }
-      respond(message.id, {});
-      notify({
-        type: "settings_updated",
-        settings: currentSettings,
-      });
+      updateSettings(message.id, message.params);
       return;
     case "droid.list_models":
       respond(message.id, { models });
@@ -1009,7 +837,7 @@ async function handleRequest(message: {
       return;
     case "droid.execute_rewind":
       respond(message.id, {
-        newSessionId: rewoundSessionId,
+        newSessionId: sessions.rewound,
         restoredCount: 1,
         deletedCount: 1,
         failedRestoreCount: 0,
@@ -1023,61 +851,43 @@ async function handleRequest(message: {
 
 function handleMessage(raw: unknown): void {
   if (typeof raw !== "object" || raw === null) {
-    return;
+    throw new Error("Mock peer received a non-object JSON-RPC message");
   }
-  const message = raw as {
-    readonly type?: unknown;
-    readonly id?: unknown;
-    readonly method?: unknown;
-    readonly params?: unknown;
-    readonly result?: unknown;
-    readonly error?: unknown;
-  };
+  const message = raw as Record<string, unknown>;
   if (
-    message.type === "response" &&
-    (typeof message.id === "string" || typeof message.id === "number")
+    message.jsonrpc !== protocol.jsonrpc ||
+    message.factoryApiVersion !== protocol.factoryApiVersion ||
+    typeof message.factoryProtocolVersion !== "string"
   ) {
-    const pending = pendingServerRequests.get(String(message.id));
-    if (!pending) {
-      return;
-    }
-    pendingServerRequests.delete(String(message.id));
-    if (typeof message.error === "object" && message.error !== null) {
+    throw new Error("Mock peer received an invalid Factory JSON-RPC envelope");
+  }
+  if (message.type === "response" && typeof message.id === "string") {
+    const hasResult = "result" in message;
+    const hasError = "error" in message;
+    if (hasResult === hasError)
+      throw new Error("Mock peer received an invalid JSON-RPC response variant");
+    const pending = pendingServerRequests.get(message.id);
+    if (!pending) return;
+    pendingServerRequests.delete(message.id);
+    if (hasError && typeof message.error === "object" && message.error !== null) {
       pending.reject(new Error(JSON.stringify(message.error)));
-    } else {
-      pending.resolve(message.result);
-    }
+    } else pending.resolve(message.result);
     return;
   }
   if (
     message.type === "request" &&
-    (typeof message.id === "string" || typeof message.id === "number" || message.id === null) &&
+    typeof message.id === "string" &&
     typeof message.method === "string"
   ) {
-    void handleRequest({
-      id: message.id,
-      method: message.method,
-      params: message.params,
-    });
-  }
-}
-
-const input = NodeReadline.createInterface({
-  input: process.stdin,
-  crlfDelay: Infinity,
-});
-
-input.on("line", (line) => {
-  if (line.trim().length === 0) {
+    void handleRequest({ id: message.id, method: message.method, params: message.params });
     return;
   }
-  handleMessage(JSON.parse(line));
-});
+  throw new Error("Mock peer received an invalid JSON-RPC message shape");
+}
 
-input.once("close", () => {
-  process.exit(0);
+const input = NodeReadline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on("line", (line) => {
+  if (line.trim()) handleMessage(JSON.parse(line));
 });
-
-process.once("SIGTERM", () => {
-  process.exit(0);
-});
+input.once("close", () => process.exit(0));
+process.once("SIGTERM", () => process.exit(0));

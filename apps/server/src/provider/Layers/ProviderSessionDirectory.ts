@@ -3,16 +3,18 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
-import * as Semaphore from "effect/Semaphore";
 
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectoryPersistenceError, ProviderValidationError } from "../Errors.ts";
+import { makeKeyedLock } from "../internal/keyedLock.ts";
 import {
   CHECKPOINT_REVERT_INTENT_KEY,
   ProviderSessionDirectory,
   type ProviderRuntimeBinding,
   type ProviderRuntimeBindingWithMetadata,
+  type ProviderSessionOwnership,
   type ProviderSessionDirectoryShape,
 } from "../Services/ProviderSessionDirectory.ts";
 const decodeProviderDriverKindValue = Schema.decodeUnknownEffect(ProviderDriverKind);
@@ -63,15 +65,9 @@ function mergeRuntimePayload(
 // state, not incarnation-scoped runtime state: locked recovery replaces the
 // session incarnation mid-revert, and wiping the intent with the outgoing
 // incarnation's payload would strand a rewound provider with no startup
-// replay. The intent survives the wipe re-stamped to the incoming lease (the
-// new incarnation inherits the revert obligation), and staleness stays with
-// the reactor's provider/instance guard, its turn-identity progress fence,
-// and adapter rollback validation. Only the reactor's explicit null write
-// clears the slot.
-function threadDurableRuntimePayload(
-  existing: unknown | null,
-  incomingLease: string | null | undefined,
-): Record<string, unknown> | null {
+// replay. Ownership belongs to the binding, so the intent carries no lease
+// and survives unchanged until the reactor explicitly clears it.
+function threadDurableRuntimePayload(existing: unknown | null): Record<string, unknown> | null {
   if (!isRecord(existing)) {
     return null;
   }
@@ -80,10 +76,7 @@ function threadDurableRuntimePayload(
     return null;
   }
   return {
-    [CHECKPOINT_REVERT_INTENT_KEY]:
-      incomingLease === null || incomingLease === undefined
-        ? intent
-        : { ...intent, sessionLease: incomingLease },
+    [CHECKPOINT_REVERT_INTENT_KEY]: intent,
   };
 }
 
@@ -116,6 +109,8 @@ function toRuntimeBinding(
 
 const makeProviderSessionDirectory = Effect.gen(function* () {
   const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const ownershipByThread = yield* Ref.make(new Map<ThreadId, ProviderSessionOwnership>());
+  const writeLocks = yield* makeKeyedLock<ThreadId>();
 
   // upsert reads the row, merges in process, and replaces the full row in a
   // second statement, while the ownership-CAS updates commit single
@@ -125,31 +120,53 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
   // every write to a thread's row serializes on a per-thread mutex here,
   // where the row lives, instead of relying on caller lock discipline. The
   // CAS predicates stay: they are ownership semantics, not race guards.
-  const writeLocks = new Map<ThreadId, Semaphore.Semaphore>();
   const withThreadWriteLock = <A, E>(
     threadId: ThreadId,
     effect: Effect.Effect<A, E>,
-  ): Effect.Effect<A, E> =>
-    Effect.suspend(() => {
-      let lock = writeLocks.get(threadId);
-      if (lock === undefined) {
-        lock = Semaphore.makeUnsafe(1);
-        writeLocks.set(threadId, lock);
+  ): Effect.Effect<A, E> => writeLocks.withLock(threadId, effect);
+
+  const setOwnership = (
+    threadId: ThreadId,
+    ownership: ProviderSessionOwnership | undefined,
+  ): Effect.Effect<void> =>
+    Ref.update(ownershipByThread, (current) => {
+      const next = new Map(current);
+      if (ownership === undefined) {
+        next.delete(threadId);
+      } else {
+        next.set(threadId, ownership);
       }
-      return lock.withPermit(effect);
+      return next;
     });
 
+  const ownershipFromBinding = (
+    binding: ProviderRuntimeBinding,
+  ): ProviderSessionOwnership | undefined =>
+    binding.providerInstanceId === undefined
+      ? undefined
+      : {
+          providerInstanceId: binding.providerInstanceId,
+          sessionLease: binding.sessionLease ?? null,
+        };
+
   const getBinding = (threadId: ThreadId) =>
-    repository.getByThreadId({ threadId }).pipe(
-      Effect.mapError(toPersistenceError("ProviderSessionDirectory.getBinding:getByThreadId")),
-      Effect.flatMap((runtime) =>
-        Option.match(runtime, {
-          onNone: () => Effect.succeed(Option.none<ProviderRuntimeBinding>()),
-          onSome: (value) =>
-            toRuntimeBinding(value, "ProviderSessionDirectory.getBinding").pipe(
-              Effect.map((binding) => Option.some(binding)),
-            ),
-        }),
+    withThreadWriteLock(
+      threadId,
+      repository.getByThreadId({ threadId }).pipe(
+        Effect.mapError(toPersistenceError("ProviderSessionDirectory.getBinding:getByThreadId")),
+        Effect.flatMap((runtime) =>
+          Option.match(runtime, {
+            onNone: () =>
+              setOwnership(threadId, undefined).pipe(
+                Effect.as(Option.none<ProviderRuntimeBinding>()),
+              ),
+            onSome: (value) =>
+              toRuntimeBinding(value, "ProviderSessionDirectory.getBinding").pipe(
+                Effect.tap((binding) => setOwnership(threadId, ownershipFromBinding(binding))),
+                Effect.map(Option.some),
+              ),
+          }),
+        ),
       ),
     );
 
@@ -212,20 +229,34 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
               ? null
               : (existingRuntime?.resumeCursor ?? null),
         runtimePayload: mergeRuntimePayload(
-          ownerChanged || sessionIncarnationChanged
-            ? threadDurableRuntimePayload(
-                existingRuntime?.runtimePayload ?? null,
-                binding.sessionLease,
-              )
-            : (existingRuntime?.runtimePayload ?? null),
+          ownerChanged
+            ? null
+            : sessionIncarnationChanged
+              ? threadDurableRuntimePayload(existingRuntime?.runtimePayload ?? null)
+              : (existingRuntime?.runtimePayload ?? null),
           binding.runtimePayload,
         ),
       })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
+    return {
+      providerInstanceId,
+      sessionLease:
+        binding.sessionLease !== undefined
+          ? binding.sessionLease
+          : ownerChanged
+            ? null
+            : (existingRuntime?.sessionLease ?? null),
+    } satisfies ProviderSessionOwnership;
   });
 
   const upsert: ProviderSessionDirectoryShape["upsert"] = (binding) =>
-    withThreadWriteLock(binding.threadId, upsertUnlocked(binding));
+    withThreadWriteLock(
+      binding.threadId,
+      setOwnership(binding.threadId, undefined).pipe(
+        Effect.andThen(upsertUnlocked(binding)),
+        Effect.tap((ownership) => setOwnership(binding.threadId, ownership)),
+      ),
+    ).pipe(Effect.asVoid);
 
   const getProvider: ProviderSessionDirectoryShape["getProvider"] = (threadId) =>
     getBinding(threadId).pipe(
@@ -241,6 +272,17 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
             ),
         }),
       ),
+    );
+
+  const matchesOwnership: ProviderSessionDirectoryShape["matchesOwnership"] = (input) =>
+    Ref.get(ownershipByThread).pipe(
+      Effect.map((current) => {
+        const ownership = current.get(input.threadId);
+        return (
+          ownership?.providerInstanceId === input.providerInstanceId &&
+          ownership.sessionLease === input.sessionLease
+        );
+      }),
     );
 
   const updateResumeCursorIfOwned: ProviderSessionDirectoryShape["updateResumeCursorIfOwned"] = (
@@ -298,12 +340,35 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
           { concurrency: "unbounded" },
         ),
       ),
+      Effect.tap((bindings) =>
+        Effect.forEach(
+          bindings,
+          (binding) =>
+            withThreadWriteLock(
+              binding.threadId,
+              Ref.update(ownershipByThread, (current) => {
+                if (current.has(binding.threadId)) {
+                  return current;
+                }
+                const ownership = ownershipFromBinding(binding);
+                if (ownership === undefined) {
+                  return current;
+                }
+                const next = new Map(current);
+                next.set(binding.threadId, ownership);
+                return next;
+              }),
+            ),
+          { concurrency: "unbounded", discard: true },
+        ),
+      ),
     );
 
   return {
     upsert,
     getProvider,
     getBinding,
+    matchesOwnership,
     updateResumeCursorIfOwned,
     updateRuntimePayloadIfOwned,
     listThreadIds,

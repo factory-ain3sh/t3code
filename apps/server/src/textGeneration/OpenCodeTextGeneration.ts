@@ -34,12 +34,7 @@ import * as OpenCodeRuntime from "../provider/opencodeRuntime.ts";
 
 const OPENCODE_TEXT_GENERATION_IDLE_TTL = "30 seconds";
 
-const OpenCodeTextGenerationOperation = Schema.Literals([
-  "generateCommitMessage",
-  "generatePrContent",
-  "generateBranchName",
-  "generateThreadTitle",
-]);
+const OpenCodeTextGenerationOperation = Schema.Literals(TextGeneration.TEXT_GENERATION_OPERATIONS);
 
 type OpenCodeTextGenerationOperation = typeof OpenCodeTextGenerationOperation.Type;
 
@@ -249,11 +244,7 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
 
   const acquireSharedServer = (input: {
     readonly binaryPath: string;
-    readonly operation:
-      | "generateCommitMessage"
-      | "generatePrContent"
-      | "generateBranchName"
-      | "generateThreadTitle";
+    readonly operation: TextGeneration.TextGenerationOperation;
   }) =>
     sharedServerMutex.withPermit(
       Effect.gen(function* () {

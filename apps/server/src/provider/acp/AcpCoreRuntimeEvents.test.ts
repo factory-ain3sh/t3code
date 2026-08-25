@@ -1,4 +1,9 @@
-import { ProviderDriverKind, RuntimeRequestId, TurnId } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderSessionLease,
+  RuntimeRequestId,
+  TurnId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -11,6 +16,8 @@ import {
 } from "./AcpCoreRuntimeEvents.ts";
 
 describe("AcpCoreRuntimeEvents", () => {
+  const sessionLease = ProviderSessionLease.make("lease-1");
+
   it("maps ACP permission requests to canonical runtime events", () => {
     const stamp = { eventId: "event-1" as never, createdAt: "2026-03-27T00:00:00.000Z" };
     const turnId = TurnId.make("turn-1");
@@ -31,6 +38,7 @@ describe("AcpCoreRuntimeEvents", () => {
       makeAcpRequestOpenedEvent({
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId,
         requestId: RuntimeRequestId.make("request-1"),
@@ -48,6 +56,7 @@ describe("AcpCoreRuntimeEvents", () => {
       }),
     ).toMatchObject({
       type: "request.opened",
+      sessionLease,
       payload: {
         requestType: "exec_command_approval",
         options: [
@@ -63,6 +72,7 @@ describe("AcpCoreRuntimeEvents", () => {
       makeAcpRequestResolvedEvent({
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId,
         requestId: RuntimeRequestId.make("request-1"),
@@ -71,6 +81,7 @@ describe("AcpCoreRuntimeEvents", () => {
       }),
     ).toMatchObject({
       type: "request.resolved",
+      sessionLease,
       payload: {
         requestType: "exec_command_approval",
         decision: "accept",
@@ -86,6 +97,7 @@ describe("AcpCoreRuntimeEvents", () => {
       const request = {
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId: TurnId.make("turn-1"),
         requestId: RuntimeRequestId.make(`request-${kind}`),
@@ -136,6 +148,7 @@ describe("AcpCoreRuntimeEvents", () => {
       makeAcpPlanUpdatedEvent({
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId,
         payload: {
@@ -156,6 +169,7 @@ describe("AcpCoreRuntimeEvents", () => {
       makeAcpToolCallEvent({
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId,
         toolCall: {
@@ -180,6 +194,7 @@ describe("AcpCoreRuntimeEvents", () => {
       makeAcpContentDeltaEvent({
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId,
         itemId: "assistant:session-1:segment:0",
@@ -198,6 +213,7 @@ describe("AcpCoreRuntimeEvents", () => {
       makeAcpAssistantItemEvent({
         stamp,
         provider: ProviderDriverKind.make("cursor"),
+        sessionLease,
         threadId: "thread-1" as never,
         turnId,
         itemId: "assistant:session-1:segment:0",

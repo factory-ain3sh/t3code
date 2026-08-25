@@ -1,4 +1,3 @@
-import { resolveProviderDisplayName } from "@t3tools/client-runtime/providerDisplayName";
 import type { OrchestrationThreadActivity, ThreadTokenUsageSnapshot } from "@t3tools/contracts";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -25,15 +24,6 @@ export type ContextWindowSnapshot = NullableContextWindowUsage & {
   readonly remainingPercentage: number | null;
   readonly updatedAt: string;
 };
-
-/** Map a provider driver kind to a user-facing display name. */
-export function formatProviderDisplayName(provider: string | null | undefined): string {
-  if (!provider) return "This agent";
-  const trimmed = provider.replace(/Agent$/i, "").trim();
-  const fallback =
-    trimmed.length === 0 ? provider : trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
-  return resolveProviderDisplayName(provider, fallback);
-}
 
 export function deriveLatestContextWindowSnapshot(
   activities: ReadonlyArray<OrchestrationThreadActivity>,

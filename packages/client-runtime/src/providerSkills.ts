@@ -60,6 +60,9 @@ export function resolveProviderSkillSourceKind(
     case "user":
     case "personal":
       return "personal";
+    case "automation":
+      return "app";
+    case "builtin":
     case "system":
       return "system";
     case undefined:

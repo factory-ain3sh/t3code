@@ -35,6 +35,11 @@ droid
 Follow the browser sign-in flow. Run this on the machine that runs the T3 Code server. Droid stores
 the resulting Factory account credentials in that user's Factory home.
 
+The Droid card can detect that a credential source is present, but that detection is not a live
+Factory identity check. Until Droid exposes an identity probe for this flow, T3 Code reports the
+credential state as unverified rather than claiming that the account or key is authenticated. If a
+request fails, run `droid` in a terminal to refresh the login and try again.
+
 For automation, set `FACTORY_API_KEY` in the Droid provider's Environment variables section in
 Settings. Mark it as sensitive so T3 Code stores it as a server secret and does not send it back to
 the app after saving. When both are present, the API key takes precedence over the stored Factory
@@ -49,12 +54,16 @@ Factory adds or updates models without requiring a T3 Code update.
 You can change the model or reasoning effort in an existing thread. T3 Code applies the new choice
 before it sends the next message to Droid.
 
+For private metadata generation that requires a schema, T3 Code requests Droid's native structured
+output and validates the returned object. It does not scrape JSON out of assistant text.
+
 ## Slash Commands And Skills
 
 T3 Code reads your Droid slash commands and skills when it checks the provider, so they appear in the
 composer alongside every other provider's. Custom commands keep their argument hints, and skills keep
-their descriptions and source. Skills Droid does not let you invoke directly, such as its built-ins,
-stay out of the list.
+their descriptions and source. Factory built-ins are labeled as system skills, automations as app
+skills, and user or project skills keep their provider-owned source. Skills Droid does not let you
+invoke directly stay out of the list.
 
 Commands and skills resolve on the machine running the server against the server's working
 directory, so project-local entries are discovered alongside personal ones. Add a command or skill,
@@ -79,9 +88,9 @@ message to tell Droid how to proceed.
 When T3 Code's plan mode is enabled, it uses Droid's Spec Mode. Droid researches and writes a plan
 before implementation, then presents the plan approval as an approval request in the conversation.
 Approve it to begin implementation. Rejecting it cancels the turn; send another message in plan mode
-to refine the plan. On approval, Droid hands the work to an implementation session in the same
-thread; the turn keeps streaming and the thread resumes onto the implementation conversation
-afterward.
+to refine the plan. On approval, Droid may continue in the current Factory session or hand the work
+to a successor session. T3 Code keeps both paths on the same thread, and the turn continues streaming
+through the handoff.
 
 ## Context And Subagents
 
@@ -99,6 +108,10 @@ left off instead of starting a new Droid conversation.
 
 Checkpoint rollback remains available after a server restart. T3 Code resumes Droid before
 rewinding and continues future messages from the rewound conversation.
+
+Conversation-aware checkpoint rollback is currently supported for Codex and Droid. Claude, Cursor,
+Grok, and OpenCode do not yet expose a restart-safe rewind that T3 Code can prove, so T3 Code rejects
+checkpoint revert requests for those providers before changing provider or workspace state.
 
 ## Early Access
 

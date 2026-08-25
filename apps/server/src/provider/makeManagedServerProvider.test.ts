@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
@@ -35,6 +36,7 @@ const fastModeCapabilities = createModelCapabilities({
 
 interface TestSettings {
   readonly enabled: boolean;
+  readonly enableEnrichment?: boolean;
 }
 
 const maintenanceCapabilities = {
@@ -452,5 +454,67 @@ describe("makeManagedServerProvider", () => {
         assert.deepStrictEqual(latest, enrichedSnapshotSecond);
       }),
     ).pipe(Effect.provide(AlwaysRunTestLayer)),
+  );
+
+  it.effect(
+    "restarts enrichment from the current snapshot without rerunning the provider check",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const settingsRef = yield* Ref.make<TestSettings>({
+            enabled: true,
+            enableEnrichment: false,
+          });
+          const settingsChanges = yield* Queue.unbounded<TestSettings>();
+          const checkCalls = yield* Ref.make(0);
+          const releaseCheck = yield* Deferred.make<void>();
+          const enrichmentStarts = yield* Queue.unbounded<{
+            readonly settings: TestSettings;
+            readonly snapshot: ServerProvider;
+            readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
+          }>();
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            maintenanceCapabilities,
+            getSettings: Ref.get(settingsRef),
+            streamSettings: Stream.fromQueue(settingsChanges),
+            haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+            haveEnrichmentSettingsChanged: (previous, next) =>
+              previous.enableEnrichment !== next.enableEnrichment,
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Ref.update(checkCalls, (count) => count + 1).pipe(
+              Effect.flatMap(() => Deferred.await(releaseCheck)),
+              Effect.as(refreshedSnapshot),
+            ),
+            enrichSnapshot: (input) => Queue.offer(enrichmentStarts, input).pipe(Effect.asVoid),
+            refreshInterval: "1 hour",
+          });
+
+          yield* Deferred.succeed(releaseCheck, undefined);
+
+          const firstEnrichment = yield* Queue.take(enrichmentStarts);
+          assert.deepStrictEqual(firstEnrichment.snapshot, refreshedSnapshot);
+          yield* firstEnrichment.publishSnapshot(enrichedSnapshot);
+
+          const updatesFiber = yield* Stream.take(provider.streamChanges, 1).pipe(
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          yield* Effect.yieldNow;
+          const nextSettings = { enabled: true, enableEnrichment: true };
+          yield* Ref.set(settingsRef, nextSettings);
+          yield* Queue.offer(settingsChanges, nextSettings);
+
+          const secondEnrichment = yield* Queue.take(enrichmentStarts);
+          assert.deepStrictEqual(secondEnrichment.settings, nextSettings);
+          assert.deepStrictEqual(secondEnrichment.snapshot, enrichedSnapshot);
+          assert.strictEqual(yield* Ref.get(checkCalls), 1);
+          yield* secondEnrichment.publishSnapshot(enrichedSnapshotSecond);
+
+          assert.deepStrictEqual(Array.from(yield* Fiber.join(updatesFiber)), [
+            enrichedSnapshotSecond,
+          ]);
+          assert.deepStrictEqual(yield* provider.getSnapshot, enrichedSnapshotSecond);
+        }),
+      ).pipe(Effect.provide(AlwaysRunTestLayer)),
   );
 });

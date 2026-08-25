@@ -9,6 +9,7 @@ import {
   ProviderRuntimeEvent,
   ProviderSession,
   ProviderInstanceId,
+  ProviderSessionLease,
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
@@ -41,6 +42,11 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { makeProviderServiceMock } from "../../provider/testUtils/providerServiceMock.ts";
+import {
+  makeProviderRuntimeEvent,
+  type ProviderRuntimeEventFixture,
+} from "../../provider/testUtils/providerRuntimeEvent.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
@@ -67,71 +73,17 @@ const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 
-type LegacyProviderRuntimeEvent = {
-  readonly type: string;
-  readonly eventId: EventId;
-  readonly provider: ProviderRuntimeEvent["provider"];
-  readonly createdAt: string;
-  readonly threadId: ThreadId;
-  readonly turnId?: string | undefined;
-  readonly itemId?: string | undefined;
-  readonly requestId?: string | undefined;
-  readonly payload?: unknown | undefined;
-  readonly [key: string]: unknown;
-};
-
-type LegacyTurnCompletedEvent = LegacyProviderRuntimeEvent & {
-  readonly type: "turn.completed";
-  readonly payload?: undefined;
-  readonly status: "completed" | "failed" | "interrupted" | "cancelled";
-  readonly errorMessage?: string | undefined;
-};
-
-function isLegacyTurnCompletedEvent(
-  event: LegacyProviderRuntimeEvent,
-): event is LegacyTurnCompletedEvent {
-  return (
-    event.type === "turn.completed" &&
-    event.payload === undefined &&
-    typeof event.status === "string"
-  );
-}
-
 function createProviderServiceHarness() {
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const runtimeSessions: ProviderSession[] = [];
+  const sessionLease = ProviderSessionLease.make("lease-provider-runtime-ingestion");
 
-  const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
-  const service: ProviderServiceShape = {
-    startSession: () => unsupported(),
-    sendTurn: () => unsupported(),
-    interruptTurn: () => unsupported(),
-    respondToRequest: () => unsupported(),
-    respondToUserInput: () => unsupported(),
-    stopSession: () => unsupported(),
+  const service: ProviderServiceShape = makeProviderServiceMock({
     listSessions: () => Effect.succeed([...runtimeSessions]),
-    recoverSession: () => unsupported(),
-    withSessionLifecycleLock: (_threadId, effect) => effect,
-    getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
-    getInstanceInfo: (instanceId) => {
-      const driverKind = ProviderDriverKind.make(String(instanceId));
-      return Effect.succeed({
-        instanceId,
-        driverKind,
-        displayName: undefined,
-        enabled: true,
-        continuationIdentity: {
-          driverKind,
-          continuationKey: `${driverKind}:instance:${instanceId}`,
-        },
-      });
-    },
-    rollbackConversation: () => unsupported(),
-    uploadFeedback: () => unsupported(),
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
-  };
+  });
 
   const setSession = (session: ProviderSession): void => {
     const existingIndex = runtimeSessions.findIndex((entry) => entry.threadId === session.threadId);
@@ -142,28 +94,19 @@ function createProviderServiceHarness() {
     runtimeSessions.push(session);
   };
 
-  const normalizeLegacyEvent = (event: LegacyProviderRuntimeEvent): ProviderRuntimeEvent => {
-    if (isLegacyTurnCompletedEvent(event)) {
-      const normalized: Extract<ProviderRuntimeEvent, { type: "turn.completed" }> = {
-        ...(event as Omit<Extract<ProviderRuntimeEvent, { type: "turn.completed" }>, "payload">),
-        payload: {
-          state: event.status,
-          ...(typeof event.errorMessage === "string" ? { errorMessage: event.errorMessage } : {}),
-        },
-      };
-      return normalized;
-    }
-
-    return event as ProviderRuntimeEvent;
+  const emit = (event: ProviderRuntimeEventFixture): void => {
+    Effect.runSync(
+      PubSub.publish(runtimeEventPubSub, makeProviderRuntimeEvent(event, sessionLease)),
+    );
   };
-
-  const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, normalizeLegacyEvent(event)));
+  const emitRaw = (event: ProviderRuntimeEvent): void => {
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, event));
   };
 
   return {
     service,
     emit,
+    emitRaw,
     setSession,
   };
 }
@@ -324,6 +267,7 @@ describe("ProviderRuntimeIngestion", () => {
       dispatch,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       emit: provider.emit,
+      emitRaw: provider.emitRaw,
       setProviderSession: provider.setSession,
       drain,
     };
@@ -732,7 +676,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-midturn-lifecycle"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await waitForThread(
@@ -787,7 +731,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-claude-placeholder"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await waitForThread(
@@ -822,7 +766,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-aux"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await harness.drain();
@@ -838,7 +782,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-primary"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await waitForThread(
@@ -877,7 +821,7 @@ describe("ProviderRuntimeIngestion", () => {
       provider: ProviderDriverKind.make("claudeAgent"),
       createdAt: seededAt,
       threadId: asThreadId("thread-1"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await harness.drain();
@@ -917,7 +861,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: seededAt,
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-late"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await waitForThread(harness.readModel, (thread) => thread.session?.status === "ready");
@@ -950,7 +894,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-guarded-other"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await harness.drain();
@@ -966,7 +910,7 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-guarded-main"),
-      status: "completed",
+      payload: { state: "completed" },
     });
 
     await waitForThread(
@@ -2885,7 +2829,7 @@ describe("ProviderRuntimeIngestion", () => {
         explanation: "Working through the plan",
         plan: [
           { step: "Inspect files", status: "completed" },
-          { step: "Apply patch", status: "in_progress" },
+          { step: "Apply patch", status: "inProgress" },
         ],
       },
     });
@@ -2900,7 +2844,7 @@ describe("ProviderRuntimeIngestion", () => {
       itemId: asItemId("item-p1-tool"),
       payload: {
         itemType: "command_execution",
-        status: "in_progress",
+        status: "inProgress",
         title: "Run tests",
         detail: "bun test",
         data: { pid: 123 },
@@ -2972,7 +2916,7 @@ describe("ProviderRuntimeIngestion", () => {
         : undefined;
     expect(toolUpdate?.kind).toBe("tool.updated");
     expect(toolUpdatePayload?.itemType).toBe("command_execution");
-    expect(toolUpdatePayload?.status).toBe("in_progress");
+    expect(toolUpdatePayload?.status).toBe("inProgress");
     expect(toolUpdatePayload?.toolCallId).toBe("item-p1-tool");
 
     const warning = thread.activities.find(
@@ -3590,10 +3534,12 @@ describe("ProviderRuntimeIngestion", () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
 
-    harness.emit({
+    harness.emitRaw({
       type: "content.delta",
       eventId: asEventId("evt-invalid-delta"),
       provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      sessionLease: ProviderSessionLease.make("lease-provider-runtime-ingestion"),
       createdAt: now,
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-invalid"),

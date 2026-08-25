@@ -1,16 +1,24 @@
-import { EventId, ProviderDriverKind, RuntimeRequestId } from "@t3tools/contracts";
-import type { LegacyProviderRuntimeEvent } from "../TestProviderAdapter.integration.ts";
+import {
+  EventId,
+  ProviderDriverKind,
+  RuntimeRequestId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
+import type { FixtureProviderRuntimeEvent } from "../TestProviderAdapter.integration.ts";
 
 const PROVIDER = ProviderDriverKind.make("codex");
 const SESSION_ID = "fixture-session";
-const THREAD_ID = "fixture-thread";
-const TURN_ID = "fixture-turn";
+const THREAD_ID = ThreadId.make("fixture-thread");
+const TURN_ID = TurnId.make("fixture-turn");
 const REQUEST_ID = RuntimeRequestId.make("req-1");
 
 function baseEvent(
   eventId: string,
   createdAt: string,
-): Pick<LegacyProviderRuntimeEvent, "eventId" | "provider" | "sessionId" | "createdAt"> {
+): Pick<FixtureProviderRuntimeEvent, "eventId" | "provider" | "createdAt"> & {
+  readonly sessionId: string;
+} {
   return {
     eventId: EventId.make(eventId),
     provider: PROVIDER,
@@ -56,7 +64,7 @@ export const codexTurnTextFixture = [
       state: "completed",
     },
   },
-] satisfies ReadonlyArray<LegacyProviderRuntimeEvent>;
+] satisfies ReadonlyArray<FixtureProviderRuntimeEvent>;
 
 export const codexTurnToolFixture = [
   {
@@ -108,7 +116,7 @@ export const codexTurnToolFixture = [
       state: "completed",
     },
   },
-] satisfies ReadonlyArray<LegacyProviderRuntimeEvent>;
+] satisfies ReadonlyArray<FixtureProviderRuntimeEvent>;
 
 export const codexTurnApprovalFixture = [
   {
@@ -159,4 +167,4 @@ export const codexTurnApprovalFixture = [
       state: "completed",
     },
   },
-] satisfies ReadonlyArray<LegacyProviderRuntimeEvent>;
+] satisfies ReadonlyArray<FixtureProviderRuntimeEvent>;

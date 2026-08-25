@@ -24,7 +24,12 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
-import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderRuntimeBinding,
+  type ProviderSessionDirectoryShape,
+  type ProviderSessionDirectoryWriteError,
+} from "../Services/ProviderSessionDirectory.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 
 function makeDirectoryLayer<E, R>(persistenceLayer: Layer.Layer<SqlClient.SqlClient, E, R>) {
@@ -40,6 +45,13 @@ function makeDirectoryLayer<E, R>(persistenceLayer: Layer.Layer<SqlClient.SqlCli
   );
 }
 
+const droid = ProviderDriverKind.make("droid");
+const droidOwner = ProviderInstanceId.make("droid-owner");
+
+function getBinding(directory: ProviderSessionDirectoryShape, threadId: ThreadId) {
+  return directory.getBinding(threadId).pipe(Effect.map(Option.getOrThrow));
+}
+
 it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryLive", (it) => {
   it.effect("upserts and reads thread bindings", () =>
     Effect.gen(function* () {
@@ -47,10 +59,12 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
 
       const initialThreadId = ThreadId.make("thread-1");
+      const initialLease = ProviderSessionLease.make("lease-initial");
 
       yield* directory.upsert({
         provider: ProviderDriverKind.make("codex"),
         providerInstanceId: ProviderInstanceId.make("codex"),
+        sessionLease: initialLease,
         threadId: initialThreadId,
       });
 
@@ -60,6 +74,22 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       assert.equal(initialBinding.threadId, initialThreadId);
       assert.equal(initialBinding.provider, "codex");
       assert.equal(initialBinding.providerInstanceId, "codex");
+      assert.equal(
+        yield* directory.matchesOwnership({
+          threadId: initialThreadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: initialLease,
+        }),
+        true,
+      );
+      assert.equal(
+        yield* directory.matchesOwnership({
+          threadId: initialThreadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-stale"),
+        }),
+        false,
+      );
 
       const nextThreadId = ThreadId.make("thread-2");
 
@@ -137,123 +167,91 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
     }),
   );
 
-  it.effect("updates resume cursors only for the owning provider session incarnation", () =>
+  it.effect("ownership-checks cursor and payload updates", () =>
     Effect.gen(function* () {
       const directory = yield* ProviderSessionDirectory;
-      const threadId = ThreadId.make("thread-owned-cursor");
-      const owner = ProviderInstanceId.make("droid-owner");
       const currentLease = ProviderSessionLease.make("lease-current");
+      const cases: ReadonlyArray<{
+        readonly name: string;
+        readonly initial: Partial<ProviderRuntimeBinding>;
+        readonly staleValue: unknown;
+        readonly currentValue: unknown;
+        readonly initialValue: unknown;
+        readonly finalValue: unknown;
+        readonly update: (
+          directory: ProviderSessionDirectoryShape,
+          input: {
+            readonly threadId: ThreadId;
+            readonly providerInstanceId: ProviderInstanceId;
+            readonly sessionLease: ProviderSessionLease;
+          },
+          value: unknown,
+        ) => Effect.Effect<boolean, ProviderSessionDirectoryWriteError>;
+        readonly read: (binding: ProviderRuntimeBinding) => unknown;
+      }> = [
+        {
+          name: "cursor",
+          initial: { resumeCursor: { sessionId: "original" } },
+          staleValue: { sessionId: "stale" },
+          currentValue: { sessionId: "current" },
+          initialValue: { sessionId: "original" },
+          finalValue: { sessionId: "current" },
+          update: (service, input, resumeCursor) =>
+            service.updateResumeCursorIfOwned({ ...input, resumeCursor }),
+          read: (binding) => binding.resumeCursor,
+        },
+        {
+          name: "payload",
+          initial: {
+            runtimePayload: { cwd: "/tmp/project", checkpointRevertIntent: null },
+          },
+          staleValue: { checkpointRevertIntent: { turnCount: 1 } },
+          currentValue: { checkpointRevertIntent: { turnCount: 2 } },
+          initialValue: { cwd: "/tmp/project", checkpointRevertIntent: null },
+          finalValue: {
+            cwd: "/tmp/project",
+            checkpointRevertIntent: { turnCount: 2 },
+          },
+          update: (service, input, runtimePayload) =>
+            service.updateRuntimePayloadIfOwned({ ...input, runtimePayload }),
+          read: (binding) => binding.runtimePayload,
+        },
+      ];
 
-      yield* directory.upsert({
-        provider: ProviderDriverKind.make("droid"),
-        providerInstanceId: owner,
-        sessionLease: currentLease,
-        threadId,
-        resumeCursor: { sessionId: "original" },
-      });
+      for (const testCase of cases) {
+        const threadId = ThreadId.make(`thread-owned-${testCase.name}`);
+        const ownership = { threadId, providerInstanceId: droidOwner, sessionLease: currentLease };
+        yield* directory.upsert({
+          provider: droid,
+          ...ownership,
+          ...testCase.initial,
+        });
 
-      assert.equal(
-        yield* directory.updateResumeCursorIfOwned({
-          threadId,
-          providerInstanceId: ProviderInstanceId.make("droid-stale"),
-          sessionLease: currentLease,
-          resumeCursor: { sessionId: "stale" },
-        }),
-        false,
-      );
-      assert.equal(
-        yield* directory.updateResumeCursorIfOwned({
-          threadId,
-          providerInstanceId: owner,
-          sessionLease: ProviderSessionLease.make("lease-stale"),
-          resumeCursor: { sessionId: "stale" },
-        }),
-        false,
-      );
+        assert.isFalse(
+          yield* testCase.update(
+            directory,
+            { ...ownership, providerInstanceId: ProviderInstanceId.make("droid-stale") },
+            testCase.staleValue,
+          ),
+        );
+        assert.isFalse(
+          yield* testCase.update(
+            directory,
+            { ...ownership, sessionLease: ProviderSessionLease.make("lease-stale") },
+            testCase.staleValue,
+          ),
+        );
+        assert.deepEqual(
+          testCase.read(yield* getBinding(directory, threadId)),
+          testCase.initialValue,
+        );
 
-      // Refused writes leave the persisted cursor untouched.
-      const refusedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
-      assert.deepEqual(refusedBinding.resumeCursor, { sessionId: "original" });
-
-      assert.equal(
-        yield* directory.updateResumeCursorIfOwned({
-          threadId,
-          providerInstanceId: owner,
-          sessionLease: currentLease,
-          resumeCursor: { sessionId: "current" },
-        }),
-        true,
-      );
-
-      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
-      assert.equal(binding.threadId, threadId);
-      assert.equal(binding.provider, "droid");
-      assert.equal(binding.providerInstanceId, owner);
-      assert.equal(binding.sessionLease, currentLease);
-      assert.deepEqual(binding.resumeCursor, { sessionId: "current" });
-    }),
-  );
-
-  it.effect("updates runtime payload only for the owning provider session incarnation", () =>
-    Effect.gen(function* () {
-      const directory = yield* ProviderSessionDirectory;
-      const threadId = ThreadId.make("thread-owned-payload");
-      const owner = ProviderInstanceId.make("droid-owner");
-      const currentLease = ProviderSessionLease.make("lease-current");
-
-      yield* directory.upsert({
-        provider: ProviderDriverKind.make("droid"),
-        providerInstanceId: owner,
-        sessionLease: currentLease,
-        threadId,
-        runtimePayload: { cwd: "/tmp/project", checkpointRevertIntent: null },
-      });
-
-      assert.equal(
-        yield* directory.updateRuntimePayloadIfOwned({
-          threadId,
-          providerInstanceId: ProviderInstanceId.make("droid-stale"),
-          sessionLease: currentLease,
-          runtimePayload: { checkpointRevertIntent: { turnCount: 1 } },
-        }),
-        false,
-      );
-      assert.equal(
-        yield* directory.updateRuntimePayloadIfOwned({
-          threadId,
-          providerInstanceId: owner,
-          sessionLease: ProviderSessionLease.make("lease-stale"),
-          runtimePayload: { checkpointRevertIntent: { turnCount: 1 } },
-        }),
-        false,
-      );
-
-      // Refused writes leave the persisted payload untouched.
-      const refusedBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
-      assert.deepEqual(refusedBinding.runtimePayload, {
-        cwd: "/tmp/project",
-        checkpointRevertIntent: null,
-      });
-
-      assert.equal(
-        yield* directory.updateRuntimePayloadIfOwned({
-          threadId,
-          providerInstanceId: owner,
-          sessionLease: currentLease,
-          runtimePayload: { checkpointRevertIntent: { turnCount: 2 } },
-        }),
-        true,
-      );
-
-      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
-      assert.equal(binding.threadId, threadId);
-      assert.equal(binding.provider, "droid");
-      assert.equal(binding.providerInstanceId, owner);
-      assert.equal(binding.sessionLease, currentLease);
-      assert.deepEqual(binding.runtimePayload, {
-        cwd: "/tmp/project",
-        checkpointRevertIntent: { turnCount: 2 },
-      });
+        assert.isTrue(yield* testCase.update(directory, ownership, testCase.currentValue));
+        const binding = yield* getBinding(directory, threadId);
+        assert.equal(binding.providerInstanceId, droidOwner);
+        assert.equal(binding.sessionLease, currentLease);
+        assert.deepEqual(testCase.read(binding), testCase.finalValue);
+      }
     }),
   );
 
@@ -300,75 +298,75 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
     }),
   );
 
-  it.effect("wipes incarnation payload on lease change but carries the revert intent", () =>
+  it.effect("resets incarnation payload with the correct revert-intent durability", () =>
     Effect.gen(function* () {
       const directory = yield* ProviderSessionDirectory;
-      const threadId = ThreadId.make("thread-incarnation-payload");
-      const owner = ProviderInstanceId.make("droid-owner");
-
-      yield* directory.upsert({
-        provider: ProviderDriverKind.make("droid"),
-        providerInstanceId: owner,
-        sessionLease: ProviderSessionLease.make("lease-a"),
+      const intent = (threadId: ThreadId) => ({
+        commandId: "server:checkpoint-revert-complete:test",
         threadId,
-        resumeCursor: { sessionId: "session-a" },
-        runtimePayload: {
-          cwd: "/tmp/project",
-          activeTurnId: "turn-live",
-          checkpointRevertIntent: { turnCount: 1, sessionLease: "lease-a" },
-        },
-      });
-      yield* directory.upsert({
-        provider: ProviderDriverKind.make("droid"),
-        providerInstanceId: owner,
-        sessionLease: ProviderSessionLease.make("lease-b"),
-        threadId,
-        runtimePayload: { cwd: "/tmp/project" },
-      });
-
-      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
-      assert.equal(binding.threadId, threadId);
-      assert.equal(binding.provider, "droid");
-      assert.equal(binding.providerInstanceId, owner);
-      assert.equal(binding.sessionLease, "lease-b");
-      // The resume cursor survives a lease change and incarnation-scoped
-      // payload does not merge across incarnations, but the persisted revert
-      // intent is thread-durable recovery state: it survives the wipe
-      // re-stamped to the incoming lease, so the incarnation minted by locked
-      // recovery mid-revert inherits the revert obligation.
-      assert.deepEqual(binding.resumeCursor, { sessionId: "session-a" });
-      assert.deepEqual(binding.runtimePayload, {
+        provider: "droid",
+        providerInstanceId: droidOwner,
         cwd: "/tmp/project",
-        checkpointRevertIntent: { turnCount: 1, sessionLease: "lease-b" },
+        turnCount: 1,
+        retainedTurnIds: ["turn-1"],
+        staleCheckpoints: [{ turnId: "turn-2", checkpointRef: `refs/test/${threadId}/2` }],
+        createdAt: "2026-01-01T00:00:00.000Z",
       });
-    }),
-  );
+      const cases = [
+        {
+          name: "lease-change-carry",
+          nextOwner: droidOwner,
+          initialIntent: intent,
+          expectedIntent: intent,
+          preservesCursor: true,
+        },
+        {
+          name: "cleared-intent-drop",
+          nextOwner: droidOwner,
+          initialIntent: () => null,
+          expectedIntent: () => undefined,
+          preservesCursor: true,
+        },
+        {
+          name: "owner-rebind-drop",
+          nextOwner: ProviderInstanceId.make("droid-next"),
+          initialIntent: intent,
+          expectedIntent: () => undefined,
+          preservesCursor: false,
+        },
+      ] as const;
 
-  it.effect("drops a cleared revert intent with the outgoing incarnation's payload", () =>
-    Effect.gen(function* () {
-      const directory = yield* ProviderSessionDirectory;
-      const threadId = ThreadId.make("thread-incarnation-cleared-intent");
-      const owner = ProviderInstanceId.make("droid-owner");
+      for (const testCase of cases) {
+        const threadId = ThreadId.make(`thread-${testCase.name}`);
+        const checkpointRevertIntent = testCase.initialIntent(threadId);
+        yield* directory.upsert({
+          provider: droid,
+          providerInstanceId: droidOwner,
+          sessionLease: ProviderSessionLease.make("lease-a"),
+          threadId,
+          resumeCursor: { sessionId: "session-a" },
+          runtimePayload: { activeTurnId: "turn-live", checkpointRevertIntent },
+        });
+        yield* directory.upsert({
+          provider: droid,
+          providerInstanceId: testCase.nextOwner,
+          sessionLease: ProviderSessionLease.make("lease-b"),
+          threadId,
+          runtimePayload: { cwd: "/tmp/project" },
+        });
 
-      yield* directory.upsert({
-        provider: ProviderDriverKind.make("droid"),
-        providerInstanceId: owner,
-        sessionLease: ProviderSessionLease.make("lease-a"),
-        threadId,
-        runtimePayload: { activeTurnId: "turn-live", checkpointRevertIntent: null },
-      });
-      yield* directory.upsert({
-        provider: ProviderDriverKind.make("droid"),
-        providerInstanceId: owner,
-        sessionLease: ProviderSessionLease.make("lease-b"),
-        threadId,
-        runtimePayload: { cwd: "/tmp/project" },
-      });
-
-      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
-      // A terminally cleared intent is an empty slot, not durable state; the
-      // incarnation wipe must not resurrect it.
-      assert.deepEqual(binding.runtimePayload, { cwd: "/tmp/project" });
+        const binding = yield* getBinding(directory, threadId);
+        assert.equal(binding.providerInstanceId, testCase.nextOwner);
+        assert.deepEqual(
+          binding.resumeCursor,
+          testCase.preservesCursor ? { sessionId: "session-a" } : null,
+        );
+        const expectedIntent = testCase.expectedIntent(threadId);
+        assert.deepEqual(binding.runtimePayload, {
+          cwd: "/tmp/project",
+          ...(expectedIntent === undefined ? {} : { checkpointRevertIntent: expectedIntent }),
+        });
+      }
     }),
   );
 
@@ -507,6 +505,7 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
         yield* directory.upsert({
           provider: ProviderDriverKind.make("codex"),
           providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-restart"),
           threadId,
         });
       }).pipe(Effect.provide(directoryLayer));
@@ -514,6 +513,15 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       yield* Effect.gen(function* () {
         const directory = yield* ProviderSessionDirectory;
         const sql = yield* SqlClient.SqlClient;
+        yield* directory.listBindings();
+        assert.equal(
+          yield* directory.matchesOwnership({
+            threadId,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            sessionLease: ProviderSessionLease.make("lease-restart"),
+          }),
+          true,
+        );
         const provider = yield* directory.getProvider(threadId);
         assert.equal(provider, "codex");
 

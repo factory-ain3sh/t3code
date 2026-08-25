@@ -7,7 +7,7 @@ import {
   NonNegativeInt,
   ProviderDriverKind,
   ProviderInstanceId,
-  ProviderSessionLease,
+  type ProviderSessionLease,
   type ProjectId,
   ThreadId,
   TurnId,
@@ -67,17 +67,26 @@ const CheckpointRevertIntent = Schema.Struct({
   threadId: ThreadId,
   provider: ProviderDriverKind,
   providerInstanceId: ProviderInstanceId,
-  sessionLease: ProviderSessionLease,
   cwd: Schema.String,
   turnCount: NonNegativeInt,
-  turnIds: Schema.Array(TurnId),
-  anchorTurnId: Schema.optional(TurnId),
-  checkpointRef: CheckpointRef,
-  staleCheckpointRefs: Schema.Array(CheckpointRef),
-  staleTurnIds: Schema.Array(TurnId),
+  retainedTurnIds: Schema.Array(TurnId),
+  staleCheckpoints: Schema.Array(
+    Schema.Struct({
+      turnId: TurnId,
+      checkpointRef: CheckpointRef,
+    }),
+  ),
   createdAt: IsoDateTime,
 });
 type CheckpointRevertIntent = typeof CheckpointRevertIntent.Type;
+
+interface ResolvedSessionRuntime {
+  readonly threadId: ThreadId;
+  readonly provider: ProviderDriverKind;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly sessionLease: ProviderSessionLease;
+  readonly cwd: string;
+}
 
 const decodeCheckpointRevertIntent = Schema.decodeUnknownOption(CheckpointRevertIntent);
 
@@ -249,8 +258,10 @@ const make = Effect.gen(function* () {
     readonly thread: { readonly projectId: ProjectId; readonly worktreePath: string | null };
     readonly projects: ReadonlyArray<{ readonly id: ProjectId; readonly workspaceRoot: string }>;
     readonly preferSessionRuntime: boolean;
+    readonly sessionRuntime?: Option.Option<ResolvedSessionRuntime>;
   }) {
-    const fromSession = yield* resolveSessionRuntimeForThread(input.threadId);
+    const fromSession =
+      input.sessionRuntime ?? (yield* resolveSessionRuntimeForThread(input.threadId));
     const fromThread = resolveThreadWorkspaceCwd({
       thread: input.thread,
       projects: input.projects,
@@ -414,7 +425,10 @@ const make = Effect.gen(function* () {
 
   // Captures a real git checkpoint when a turn completes via a runtime event.
   const captureCheckpointFromTurnCompletion = Effect.fn("captureCheckpointFromTurnCompletion")(
-    function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>) {
+    function* (
+      event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
+      sessionRuntime: Option.Option<ResolvedSessionRuntime>,
+    ) {
       const turnId = toTurnId(event.turnId);
       if (!turnId) {
         return;
@@ -447,6 +461,7 @@ const make = Effect.gen(function* () {
         thread,
         projects,
         preferSessionRuntime: true,
+        sessionRuntime,
       });
       if (!checkpointCwd) {
         return;
@@ -592,8 +607,10 @@ const make = Effect.gen(function* () {
 
   const refreshLocalGitStatusFromTurnCompletion = Effect.fn(
     "refreshLocalGitStatusFromTurnCompletion",
-  )(function* (event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>) {
-    const sessionRuntime = yield* resolveSessionRuntimeForThread(event.threadId);
+  )(function* (
+    event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
+    sessionRuntime: Option.Option<ResolvedSessionRuntime>,
+  ) {
     if (Option.isNone(sessionRuntime)) {
       return;
     }
@@ -748,11 +765,14 @@ const make = Effect.gen(function* () {
     });
   });
 
-  const persistCheckpointRevertIntent = (intent: CheckpointRevertIntent) =>
+  const persistCheckpointRevertIntent = (
+    intent: CheckpointRevertIntent,
+    sessionLease: ResolvedSessionRuntime["sessionLease"],
+  ) =>
     providerSessionDirectory.updateRuntimePayloadIfOwned({
       threadId: intent.threadId,
       providerInstanceId: intent.providerInstanceId,
-      sessionLease: intent.sessionLease,
+      sessionLease,
       runtimePayload: { [CHECKPOINT_REVERT_INTENT_KEY]: intent },
     });
 
@@ -860,22 +880,43 @@ const make = Effect.gen(function* () {
     );
     // A null lease is a stopped, unowned session: runStopAll nulls every
     // binding lease on graceful shutdown while the merged runtime payload
-    // keeps this intent, and locked recovery re-owns the session below. The
-    // directory re-stamps the persisted intent to the incoming lease at every
-    // incarnation transition (the same-thread successor inherits the revert
-    // obligation), so a mismatched live lease means the lease and payload
-    // were written out-of-band; discard rather than execute against a session
-    // the stamp never blessed. The driver kind is compared too: an instance
-    // rebound to a different driver between persist and replay must not
-    // execute an intent minted against the old provider's turn history.
+    // keeps this thread-durable intent, and locked recovery re-owns the
+    // session below. Driver and instance identity remain stable across those
+    // incarnations; a rebind to another provider cannot inherit the intent.
     if (
       binding?.provider !== intent.provider ||
-      binding.providerInstanceId !== intent.providerInstanceId ||
-      (binding.sessionLease !== null && binding.sessionLease !== intent.sessionLease)
+      binding.providerInstanceId !== intent.providerInstanceId
     ) {
       yield* clearUnexecutableRevertIntent(
         intent,
         "The provider session changed before the revert executed.",
+      );
+      return;
+    }
+
+    const durableActiveTurnId =
+      binding.runtimePayload !== null &&
+      typeof binding.runtimePayload === "object" &&
+      !Array.isArray(binding.runtimePayload) &&
+      "activeTurnId" in binding.runtimePayload
+        ? binding.runtimePayload.activeTurnId
+        : null;
+    if (durableActiveTurnId !== null && durableActiveTurnId !== undefined) {
+      yield* clearCheckpointRevertIntent(intent).pipe(Effect.orElseSucceed(() => false));
+      yield* appendRevertFailureActivity({
+        threadId: intent.threadId,
+        turnCount: intent.turnCount,
+        detail: "A turn became active before the revert executed; the revert was cancelled.",
+        createdAt: intent.createdAt,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+
+    const capabilities = yield* providerService.getCapabilities(intent.providerInstanceId);
+    if (capabilities.conversationRollback !== "supported") {
+      yield* clearUnexecutableRevertIntent(
+        intent,
+        `Provider '${intent.provider}' does not support conversation rollback.`,
       );
       return;
     }
@@ -888,7 +929,7 @@ const make = Effect.gen(function* () {
     // count, so a turn landed after a partially bookkept revert reuses a
     // discarded ref and would be invisible to a ref comparison.
     const thread = yield* resolveThreadDetail(intent.threadId);
-    const staleTurnIds = new Set(intent.staleTurnIds);
+    const staleTurnIds = new Set(intent.staleCheckpoints.map((checkpoint) => checkpoint.turnId));
     const progressed =
       thread === undefined ||
       thread.session?.activeTurnId != null ||
@@ -912,9 +953,10 @@ const make = Effect.gen(function* () {
     // rewound behind an unrestored tree. turnCount 0 falls back to HEAD and
     // needs no ref.
     if (intent.turnCount !== 0) {
+      const checkpointRef = checkpointRefForThreadTurn(intent.threadId, intent.turnCount);
       const hasRef = yield* checkpointStore.hasCheckpointRef({
         cwd: intent.cwd,
-        checkpointRef: intent.checkpointRef,
+        checkpointRef,
       });
       if (!hasRef) {
         yield* clearUnexecutableRevertIntent(
@@ -931,14 +973,15 @@ const make = Effect.gen(function* () {
     // revert on a thread with no checkpoints is the exception: it retains no
     // turns and anchors on none, an empty target ProviderService rejects, so
     // there is no conversation to rewind and the restore proceeds directly.
+    const anchorTurnId = intent.staleCheckpoints[0]?.turnId;
     const rollback: Option.Option<{ readonly resumeCursor?: unknown }> =
-      intent.turnIds.length === 0 && intent.anchorTurnId === undefined
+      intent.retainedTurnIds.length === 0 && anchorTurnId === undefined
         ? Option.some({ resumeCursor: undefined })
         : yield* providerService
             .rollbackConversation({
               threadId: intent.threadId,
-              turnIds: intent.turnIds,
-              ...(intent.anchorTurnId !== undefined ? { anchorTurnId: intent.anchorTurnId } : {}),
+              turnIds: intent.retainedTurnIds,
+              ...(anchorTurnId !== undefined ? { anchorTurnId } : {}),
             })
             .pipe(
               Effect.map(Option.some),
@@ -977,9 +1020,10 @@ const make = Effect.gen(function* () {
     // equal-length target is a no-op, the restore is idempotent, and
     // thread.revert.complete reuses the intent's commandId.
     yield* Effect.gen(function* () {
+      const checkpointRef = checkpointRefForThreadTurn(intent.threadId, intent.turnCount);
       const restored = yield* checkpointStore.restoreCheckpoint({
         cwd: intent.cwd,
-        checkpointRef: intent.checkpointRef,
+        checkpointRef,
         fallbackToHead: intent.turnCount === 0,
       });
       if (!restored) {
@@ -1002,10 +1046,10 @@ const make = Effect.gen(function* () {
       // reflects the reverted filesystem state.
       yield* workspaceEntries.refresh(intent.cwd);
 
-      if (intent.staleCheckpointRefs.length > 0) {
+      if (intent.staleCheckpoints.length > 0) {
         yield* checkpointStore.deleteCheckpointRefs({
           cwd: intent.cwd,
-          checkpointRefs: intent.staleCheckpointRefs,
+          checkpointRefs: intent.staleCheckpoints.map((checkpoint) => checkpoint.checkpointRef),
         });
       }
 
@@ -1103,6 +1147,19 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    const capabilities = yield* providerService.getCapabilities(
+      sessionRuntime.value.providerInstanceId,
+    );
+    if (capabilities.conversationRollback !== "supported") {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: `Provider '${sessionRuntime.value.provider}' does not support conversation rollback.`,
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+
     const orderedCheckpoints = [...thread.checkpoints].sort(
       (left, right) => left.checkpointTurnCount - right.checkpointTurnCount,
     );
@@ -1160,20 +1217,22 @@ const make = Effect.gen(function* () {
       threadId: event.payload.threadId,
       provider: sessionRuntime.value.provider,
       providerInstanceId: sessionRuntime.value.providerInstanceId,
-      sessionLease: sessionRuntime.value.sessionLease,
       cwd: sessionRuntime.value.cwd,
       turnCount: event.payload.turnCount,
-      turnIds: orderedCheckpoints
+      retainedTurnIds: orderedCheckpoints
         .filter((checkpoint) => checkpoint.checkpointTurnCount <= event.payload.turnCount)
         .map((checkpoint) => checkpoint.turnId),
-      ...(staleCheckpoints[0] !== undefined ? { anchorTurnId: staleCheckpoints[0].turnId } : {}),
-      checkpointRef: targetCheckpointRef,
-      staleCheckpointRefs: staleCheckpoints.map((checkpoint) => checkpoint.checkpointRef),
-      staleTurnIds: staleCheckpoints.map((checkpoint) => checkpoint.turnId),
+      staleCheckpoints: staleCheckpoints.map((checkpoint) => ({
+        turnId: checkpoint.turnId,
+        checkpointRef: checkpoint.checkpointRef,
+      })),
       createdAt: now,
     };
 
-    const persisted = yield* persistCheckpointRevertIntent(intent);
+    const persisted = yield* persistCheckpointRevertIntent(
+      intent,
+      sessionRuntime.value.sessionLease,
+    );
     if (!persisted) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
@@ -1233,15 +1292,25 @@ const make = Effect.gen(function* () {
     event: ProviderRuntimeEvent,
   ) {
     if (event.sessionLease !== undefined) {
-      const binding = Option.getOrUndefined(
-        yield* providerSessionDirectory.getBinding(event.threadId),
-      );
-      if (
-        binding?.sessionLease !== event.sessionLease ||
-        (event.providerInstanceId !== undefined &&
-          binding.providerInstanceId !== event.providerInstanceId)
-      ) {
+      if (event.providerInstanceId === undefined) {
         return;
+      }
+      const ownership = {
+        threadId: event.threadId,
+        providerInstanceId: event.providerInstanceId,
+        sessionLease: event.sessionLease,
+      };
+      const indexedMatch = yield* providerSessionDirectory.matchesOwnership(ownership);
+      if (!indexedMatch) {
+        const binding = Option.getOrUndefined(
+          yield* providerSessionDirectory.getBinding(event.threadId),
+        );
+        if (
+          binding?.providerInstanceId !== ownership.providerInstanceId ||
+          binding.sessionLease !== ownership.sessionLease
+        ) {
+          return;
+        }
       }
     }
     if (event.type === "turn.started") {
@@ -1251,8 +1320,9 @@ const make = Effect.gen(function* () {
 
     if (event.type === "turn.completed") {
       const turnId = toTurnId(event.turnId);
-      yield* refreshLocalGitStatusFromTurnCompletion(event);
-      yield* captureCheckpointFromTurnCompletion(event).pipe(
+      const sessionRuntime = yield* resolveSessionRuntimeForThread(event.threadId);
+      yield* refreshLocalGitStatusFromTurnCompletion(event, sessionRuntime);
+      yield* captureCheckpointFromTurnCompletion(event, sessionRuntime).pipe(
         Effect.catch((error) =>
           Effect.flatMap(nowIso, (createdAt) =>
             appendCaptureFailureActivity({
@@ -1296,10 +1366,8 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processInputSafely);
 
-  // Replays persisted revert intents. A dedicated startup phase sequenced
-  // after provider-session reconciliation: enqueued from start(), the replay
-  // races the orphan sweep, which can stomp a freshly recovered lease with
-  // its stale liveness snapshot.
+  // Replays persisted revert intents in the dedicated startup phase after
+  // provider-session reconciliation and before command readiness.
   const recoverPersistedIntents: CheckpointReactorShape["recoverPersistedIntents"] = Effect.fn(
     "recoverPersistedIntents",
   )(function* () {
@@ -1316,6 +1384,7 @@ const make = Effect.gen(function* () {
         yield* worker.enqueue({ source: "recovery", intent: intent.value });
       }
     }
+    yield* worker.drain;
   });
 
   const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {

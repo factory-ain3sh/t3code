@@ -3,7 +3,6 @@ import {
   EventId,
   ProviderApprovalDecision,
   ProviderRuntimeEvent,
-  RuntimeSessionId,
   ProviderSessionLease,
   ProviderTurnStartResult,
   ThreadId,
@@ -26,6 +25,10 @@ import type {
   ProviderThreadTurnSnapshot,
 } from "../src/provider/Services/ProviderAdapter.ts";
 import { rollbackTargetMatchesKnownHistory } from "../src/provider/Services/ProviderAdapter.ts";
+import {
+  makeProviderRuntimeEvent,
+  type ProviderRuntimeEventFixture,
+} from "../src/provider/testUtils/providerRuntimeEvent.ts";
 
 export interface TestTurnResponse {
   readonly events: ReadonlyArray<FixtureProviderRuntimeEvent>;
@@ -35,21 +38,7 @@ export interface TestTurnResponse {
   }) => Effect.Effect<void, never>;
 }
 
-export type FixtureProviderRuntimeEvent = {
-  readonly type: string;
-  readonly eventId: EventId;
-  readonly provider: ProviderDriverKind;
-  readonly createdAt: string;
-  readonly threadId: string;
-  readonly turnId?: string | undefined;
-  readonly itemId?: string | undefined;
-  readonly requestId?: string | undefined;
-  readonly payload?: unknown | undefined;
-  readonly [key: string]: unknown;
-};
-
-// Temporary alias while fixtures migrate to the new name.
-export type LegacyProviderRuntimeEvent = FixtureProviderRuntimeEvent;
+export type FixtureProviderRuntimeEvent = ProviderRuntimeEventFixture;
 
 interface SessionState {
   readonly session: ProviderAdapterSession;
@@ -57,125 +46,6 @@ interface SessionState {
   turnCount: number;
   readonly queuedResponses: Array<TestTurnResponse>;
   readonly rollbackCalls: Array<number>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function normalizeTurnState(value: unknown): "completed" | "failed" | "interrupted" | "cancelled" {
-  if (
-    value === "completed" ||
-    value === "failed" ||
-    value === "interrupted" ||
-    value === "cancelled"
-  ) {
-    return value;
-  }
-  return "completed";
-}
-
-function mapRequestType(
-  requestKind: unknown,
-): "command_execution_approval" | "file_change_approval" | "unknown" {
-  if (requestKind === "command") {
-    return "command_execution_approval";
-  }
-  if (requestKind === "file-change") {
-    return "file_change_approval";
-  }
-  return "unknown";
-}
-
-function mapItemType(toolKind: unknown): "command_execution" | "file_change" | "unknown" {
-  if (toolKind === "command") {
-    return "command_execution";
-  }
-  if (toolKind === "file-change") {
-    return "file_change";
-  }
-  return "unknown";
-}
-
-function normalizeFixtureEvent(rawEvent: Record<string, unknown>): ProviderRuntimeEvent {
-  const type = typeof rawEvent.type === "string" ? rawEvent.type : "";
-  switch (type) {
-    case "turn.started":
-      return {
-        ...rawEvent,
-        type: "turn.started",
-        payload: isRecord(rawEvent.payload) ? rawEvent.payload : {},
-      } as ProviderRuntimeEvent;
-    case "turn.completed":
-      return {
-        ...rawEvent,
-        type: "turn.completed",
-        payload: isRecord(rawEvent.payload)
-          ? rawEvent.payload
-          : {
-              state: normalizeTurnState(rawEvent.status),
-            },
-      } as ProviderRuntimeEvent;
-    case "message.delta":
-      return {
-        ...rawEvent,
-        type: "content.delta",
-        payload: {
-          streamKind: "assistant_text",
-          delta: typeof rawEvent.delta === "string" ? rawEvent.delta : "",
-        },
-      } as ProviderRuntimeEvent;
-    case "message.completed":
-      return {
-        ...rawEvent,
-        type: "item.completed",
-        payload: {
-          itemType: "assistant_message",
-          ...(typeof rawEvent.detail === "string" ? { detail: rawEvent.detail } : {}),
-        },
-      } as ProviderRuntimeEvent;
-    case "tool.started":
-      return {
-        ...rawEvent,
-        type: "item.started",
-        payload: {
-          itemType: mapItemType(rawEvent.toolKind),
-          ...(typeof rawEvent.title === "string" ? { title: rawEvent.title } : {}),
-          ...(typeof rawEvent.detail === "string" ? { detail: rawEvent.detail } : {}),
-        },
-      } as ProviderRuntimeEvent;
-    case "tool.completed":
-      return {
-        ...rawEvent,
-        type: "item.completed",
-        payload: {
-          itemType: mapItemType(rawEvent.toolKind),
-          status: "completed",
-          ...(typeof rawEvent.title === "string" ? { title: rawEvent.title } : {}),
-          ...(typeof rawEvent.detail === "string" ? { detail: rawEvent.detail } : {}),
-        },
-      } as ProviderRuntimeEvent;
-    case "approval.requested":
-      return {
-        ...rawEvent,
-        type: "request.opened",
-        payload: {
-          requestType: mapRequestType(rawEvent.requestKind),
-          ...(typeof rawEvent.detail === "string" ? { detail: rawEvent.detail } : {}),
-        },
-      } as ProviderRuntimeEvent;
-    case "approval.resolved":
-      return {
-        ...rawEvent,
-        type: "request.resolved",
-        payload: {
-          requestType: mapRequestType(rawEvent.requestKind),
-          ...(typeof rawEvent.decision === "string" ? { decision: rawEvent.decision } : {}),
-        },
-      } as ProviderRuntimeEvent;
-    default:
-      return rawEvent as ProviderRuntimeEvent;
-  }
 }
 
 export interface TestProviderAdapterHarness {
@@ -242,13 +112,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       }>
     >();
 
-    const emit = (event: ProviderRuntimeEvent) => {
-      const sessionLease = sessions.get(event.threadId)?.session.sessionLease;
-      return Queue.offer(
-        runtimeEvents,
-        sessionLease === undefined ? event : { ...event, sessionLease },
-      );
-    };
+    const emit = (event: ProviderRuntimeEvent) => Queue.offer(runtimeEvents, event);
     const nextEventId = (threadId: ThreadId) => {
       eventCount += 1;
       return EventId.make(`test-provider:${provider}:${threadId}:${eventCount}`);
@@ -320,29 +184,21 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
         const assistantDeltas: string[] = [];
         const deferredTurnCompletedEvents: ProviderRuntimeEvent[] = [];
         for (const fixtureEvent of response.events) {
-          const rawEvent: Record<string, unknown> = {
-            ...(fixtureEvent as Record<string, unknown>),
-            eventId: nextEventId(input.threadId),
-            provider,
-            sessionId: RuntimeSessionId.make(String(input.threadId)),
-          };
-          rawEvent.threadId = state.snapshot.threadId;
-          if (Object.hasOwn(rawEvent, "turnId")) {
-            rawEvent.turnId = turnId;
-          }
-
-          const runtimeEvent = normalizeFixtureEvent(rawEvent);
-          const runtimeType = (runtimeEvent as { type: string }).type;
-          if (runtimeType === "content.delta") {
-            const payload = runtimeEvent.payload as { delta?: unknown } | undefined;
-            if (typeof payload?.delta === "string") {
-              assistantDeltas.push(payload.delta);
-            }
-          } else if (runtimeType === "message.delta") {
-            const legacyDelta = (runtimeEvent as { delta?: unknown }).delta;
-            if (typeof legacyDelta === "string") {
-              assistantDeltas.push(legacyDelta);
-            }
+          const runtimeEvent = makeProviderRuntimeEvent(
+            {
+              ...fixtureEvent,
+              threadId: state.snapshot.threadId,
+              ...(Object.hasOwn(fixtureEvent, "turnId") ? { turnId } : {}),
+              eventId: nextEventId(input.threadId),
+              provider,
+            },
+            state.session.sessionLease,
+          );
+          if (
+            runtimeEvent.type === "content.delta" &&
+            runtimeEvent.payload.streamKind === "assistant_text"
+          ) {
+            assistantDeltas.push(runtimeEvent.payload.delta);
           }
           if (runtimeEvent.type === "turn.completed") {
             deferredTurnCompletedEvents.push(runtimeEvent);
@@ -377,17 +233,22 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
         };
 
         if (deferredTurnCompletedEvents.length === 0) {
-          yield* emit({
-            type: "turn.completed",
-            eventId: nextEventId(input.threadId),
-            provider,
-            createdAt: nowIso(),
-            threadId: state.snapshot.threadId,
-            turnId,
-            payload: {
-              state: "completed",
-            },
-          });
+          yield* emit(
+            makeProviderRuntimeEvent(
+              {
+                type: "turn.completed",
+                eventId: nextEventId(input.threadId),
+                provider,
+                createdAt: nowIso(),
+                threadId: state.snapshot.threadId,
+                turnId,
+                payload: {
+                  state: "completed",
+                },
+              },
+              state.session.sessionLease,
+            ),
+          );
         } else {
           for (const completedEvent of deferredTurnCompletedEvents) {
             yield* emit(completedEvent);
@@ -495,6 +356,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       provider,
       capabilities: {
         sessionModelSwitch: "in-session",
+        conversationRollback: "supported",
       },
       startSession,
       sendTurn,

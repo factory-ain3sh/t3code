@@ -51,10 +51,10 @@ import {
 } from "../../observability/Metrics.ts";
 import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
 import {
-  makeKeyedLock,
   type ProviderAdapterSession,
   type ProviderAdapterShape,
 } from "../Services/ProviderAdapter.ts";
+import { makeKeyedLock } from "../internal/keyedLock.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -396,19 +396,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     event: ProviderRuntimeEvent,
   ) => {
     if (event.sessionLease === undefined) {
-      // Completions gate checkpoint capture and message finalization, so the
-      // ownership check is mandatory for them: an adapter that forgets to
-      // stamp its lease fails loudly here instead of publishing stale work.
-      if (event.type === "turn.completed") {
-        return Effect.logWarning("Dropped an unleased turn.completed runtime event.", {
-          provider: source.provider,
-          providerInstanceId: source.instanceId,
-          threadId: event.threadId,
-        }).pipe(Effect.as(false));
-      }
-      return Effect.succeed(true);
+      return Effect.logWarning("Dropped an unleased provider runtime event.", {
+        provider: source.provider,
+        providerInstanceId: source.instanceId,
+        threadId: event.threadId,
+        eventType: event.type,
+      }).pipe(Effect.as(false));
     }
-    const matchesBinding = directory.getBinding(event.threadId).pipe(
+    const matchesIndexedOwnership = directory.matchesOwnership({
+      threadId: event.threadId,
+      providerInstanceId: source.instanceId,
+      sessionLease: event.sessionLease,
+    });
+    const matchesDurableOwnership = directory.getBinding(event.threadId).pipe(
       Effect.map((binding) => {
         const current = Option.getOrUndefined(binding);
         return (
@@ -417,7 +417,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         );
       }),
     );
-    return matchesBinding.pipe(
+    return matchesIndexedOwnership.pipe(
       Effect.flatMap((matches) =>
         matches
           ? Effect.succeed(true)
@@ -426,7 +426,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             // landed). Wait for the thread's lifecycle lock to free, re-read
             // once, and only then treat the event as genuinely stale.
             withSessionLifecycleLock(event.threadId, Effect.void).pipe(
-              Effect.andThen(matchesBinding),
+              Effect.andThen(matchesDurableOwnership),
               Effect.tap((matchesNow) =>
                 matchesNow
                   ? Effect.void
@@ -1148,7 +1148,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               yield* Effect.logDebug("provider.session.stop.skipped-lease-mismatch", {
                 threadId: input.threadId,
               });
-              return;
+              return "ownership-mismatch" as const;
             }
           }
           const routed = yield* resolveRoutableSession({
@@ -1180,6 +1180,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           yield* analytics.record("provider.session.stopped", {
             provider: routed.adapter.provider,
           });
+          return "stopped" as const;
         }).pipe(
           withMetrics({
             counter: providerSessionsTotal,
@@ -1334,6 +1335,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         lifecycleLockHeld: true,
       });
       metricProvider = routed.adapter.provider;
+      if (
+        routed.adapter.capabilities.conversationRollback !== "supported" ||
+        routed.adapter.rollbackThread === undefined
+      ) {
+        return yield* toValidationError(
+          "ProviderService.rollbackConversation",
+          `Provider '${routed.adapter.provider}' does not support conversation rollback.`,
+        );
+      }
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "rollback-conversation",
         "provider.kind": routed.adapter.provider,

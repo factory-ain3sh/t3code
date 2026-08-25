@@ -17,6 +17,7 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import { ProviderSessionDirectoryPersistenceError } from "./provider/Errors.ts";
 import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
+import { makeProviderServiceMock } from "./provider/testUtils/providerServiceMock.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -44,22 +45,9 @@ const makeThread = (
 });
 
 const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
-  ({
-    startSession: () => Effect.die("unused"),
-    sendTurn: () => Effect.die("unused"),
-    interruptTurn: () => Effect.die("unused"),
-    respondToRequest: () => Effect.die("unused"),
-    respondToUserInput: () => Effect.die("unused"),
-    stopSession: () => Effect.die("unused"),
+  makeProviderServiceMock({
     listSessions: () => Effect.succeed(liveThreadIds.map((threadId) => ({ threadId }) as never)),
-    recoverSession: () => Effect.die("unused"),
-    withSessionLifecycleLock: (_threadId, effect) => effect,
-    getCapabilities: () => Effect.die("unused"),
-    getInstanceInfo: () => Effect.die("unused"),
-    rollbackConversation: () => Effect.die("unused"),
-    uploadFeedback: () => Effect.die("unused"),
-    streamEvents: Stream.empty,
-  }) satisfies ProviderService.ProviderService["Service"];
+  });
 
 const queryWithThreads = (threads: ReadonlyArray<ReturnType<typeof makeThread>>) =>
   ({
@@ -115,6 +103,7 @@ it.effect("reconciles multiple active and archived orphans but skips live sessio
     threads: [starting, running, staleActiveTurn, archived, live, settled],
     liveThreadIds: [live.id],
     directory: {
+      matchesOwnership: () => Effect.succeed(false),
       updateResumeCursorIfOwned: () => Effect.succeed(false),
       updateRuntimePayloadIfOwned: () => Effect.succeed(false),
       getBinding: (candidate) =>
@@ -187,6 +176,7 @@ it.effect(
     return runReconciliation({
       threads: [absent, corrupt, upsertFailure],
       directory: {
+        matchesOwnership: () => Effect.succeed(false),
         updateResumeCursorIfOwned: () => Effect.succeed(false),
         updateRuntimePayloadIfOwned: () => Effect.succeed(false),
         getBinding: (candidate) =>
@@ -237,6 +227,7 @@ it.effect("retries failed projections and continues after a persistent failure",
   return runReconciliation({
     threads: [transient, persistent, later],
     directory: {
+      matchesOwnership: () => Effect.succeed(false),
       updateResumeCursorIfOwned: () => Effect.succeed(false),
       updateRuntimePayloadIfOwned: () => Effect.succeed(false),
       getBinding: () => Effect.succeed(Option.none()),
@@ -287,6 +278,7 @@ it.effect("does not fail startup when the live provider session inventory cannot
       listSessions: () => Effect.die("provider inventory unavailable"),
     }),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, {
+      matchesOwnership: () => Effect.die("unused"),
       updateResumeCursorIfOwned: () => Effect.die("unused"),
       updateRuntimePayloadIfOwned: () => Effect.die("unused"),
       getBinding: () => Effect.die("unused"),

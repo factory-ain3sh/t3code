@@ -23,7 +23,6 @@ import {
   type ProviderRuntimeEvent,
   ThreadId,
   ProviderInstanceId,
-  TurnId,
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
@@ -169,63 +168,6 @@ const cursorAdapterTestLayer = it.layer(
 );
 
 cursorAdapterTestLayer("CursorAdapterLive", (it) => {
-  it.effect("rejects rollback targets from a different Cursor history", () =>
-    Effect.gen(function* () {
-      const adapter = yield* CursorAdapter;
-      const settings = yield* ServerSettingsService;
-      const threadId = ThreadId.make("cursor-rollback-mismatch");
-      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
-      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("cursor"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
-
-      const error = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [TurnId.make("foreign-turn")],
-        })
-        .pipe(Effect.flip);
-
-      assert.equal(error._tag, "ProviderAdapterValidationError");
-      if (error._tag === "ProviderAdapterValidationError") {
-        assert.equal(error.issue, "Rollback target does not match the current thread history.");
-      }
-      yield* adapter.stopSession(threadId);
-    }),
-  );
-
-  it.effect("rejects an unprovable anchored empty rollback", () =>
-    Effect.gen(function* () {
-      const adapter = yield* CursorAdapter;
-      const settings = yield* ServerSettingsService;
-      const threadId = ThreadId.make("cursor-anchored-empty-rollback");
-      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
-      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("cursor"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
-
-      const error = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [],
-          anchorTurnId: TurnId.make("unreconstructed-turn"),
-        })
-        .pipe(Effect.flip);
-
-      assert.equal(error._tag, "ProviderAdapterValidationError");
-      if (error._tag === "ProviderAdapterValidationError") {
-        assert.equal(error.issue, "Rollback target does not match the current thread history.");
-      }
-      yield* adapter.stopSession(threadId);
-    }),
-  );
-
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
@@ -304,6 +246,57 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         ]);
       }
 
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("returns after Cursor prompt dispatch while leased settlement continues", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-short-dispatch");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_PROMPT_DELAY_MS: "1500" }),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.completed"
+              ? Deferred.succeed(turnCompleted, undefined)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "dispatch without waiting",
+        attachments: [],
+      });
+
+      assert.isFalse(yield* Deferred.isDone(turnCompleted));
+      assert.equal(turn.threadId, threadId);
+      assert.isTrue(runtimeEvents.every((event) => event.sessionLease === session.sessionLease));
+
+      yield* Deferred.await(turnCompleted);
+      const terminal = runtimeEvents.find(
+        (event) => event.type === "turn.completed" && event.turnId === turn.turnId,
+      );
+      assert.equal(terminal?.sessionLease, session.sessionLease);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
     }),
   );
@@ -598,6 +591,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           modelSelection,
           interactionMode: "default",
         });
+        yield* Effect.promise(() => waitForFileContent(requestLogPath, 80));
         yield* adapter.stopSession(threadId);
 
         const finalRequests = yield* Effect.promise(() => readJsonLines(requestLogPath));
