@@ -206,8 +206,8 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
     const ownerChanged =
       providerChanged ||
       (existingRuntime !== undefined &&
-        existingRuntime.providerInstanceId !== null &&
-        existingRuntime.providerInstanceId !== providerInstanceId);
+        (existingRuntime.providerInstanceId ?? defaultInstanceIdForDriver(binding.provider)) !==
+          providerInstanceId);
     const sessionIncarnationChanged =
       binding.sessionLease !== undefined &&
       binding.sessionLease !== null &&

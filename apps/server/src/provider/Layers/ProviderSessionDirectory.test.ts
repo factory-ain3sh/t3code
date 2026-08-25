@@ -370,6 +370,53 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
     }),
   );
 
+  it.effect("treats a legacy null owner as the provider default during rebinding", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const defaultOwner = ProviderInstanceId.make("droid");
+      const sessionLease = ProviderSessionLease.make("lease-legacy");
+      const cases = [
+        { name: "default", nextOwner: defaultOwner, preservesState: true },
+        { name: "non-default", nextOwner: droidOwner, preservesState: false },
+      ] as const;
+
+      for (const testCase of cases) {
+        const threadId = ThreadId.make(`thread-legacy-owner-${testCase.name}`);
+        yield* runtimeRepository.upsert({
+          threadId,
+          providerName: "droid",
+          providerInstanceId: null,
+          sessionLease,
+          adapterKey: "droid",
+          runtimeMode: "full-access",
+          status: "running",
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+          resumeCursor: { sessionId: "session-legacy" },
+          runtimePayload: { activeTurnId: "turn-legacy" },
+        });
+
+        yield* directory.upsert({
+          provider: droid,
+          providerInstanceId: testCase.nextOwner,
+          threadId,
+        });
+
+        const binding = yield* getBinding(directory, threadId);
+        assert.equal(binding.providerInstanceId, testCase.nextOwner);
+        assert.equal(binding.sessionLease, testCase.preservesState ? sessionLease : null);
+        assert.deepEqual(
+          binding.resumeCursor,
+          testCase.preservesState ? { sessionId: "session-legacy" } : null,
+        );
+        assert.deepEqual(
+          binding.runtimePayload,
+          testCase.preservesState ? { activeTurnId: "turn-legacy" } : null,
+        );
+      }
+    }),
+  );
+
   it.effect("lists persisted bindings with metadata in oldest-first order", () =>
     Effect.gen(function* () {
       const directory = yield* ProviderSessionDirectory;
