@@ -11,9 +11,12 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { it, assert } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
@@ -531,3 +534,86 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
     }),
   );
 });
+
+it.effect("serializes a full-row upsert with ownership patches on the same thread", () =>
+  Effect.gen(function* () {
+    // upsert reads the row and replaces it in a second statement; an
+    // ownership patch issued inside that window must not be erased by the
+    // stale snapshot. The gate parks upsert's row write mid-window while a
+    // payload patch is issued; the directory's per-thread write mutex must
+    // hold the patch until the replacement lands, then merge it on top.
+    const writeGate = yield* Deferred.make<void>();
+    const writeEntered = yield* Deferred.make<void>();
+    const armed = yield* Ref.make(false);
+
+    const persistence = SqlitePersistenceMemory;
+    const repositoryLayer = ProviderSessionRuntime.layer.pipe(Layer.provide(persistence));
+    const gatedRepositoryLayer = Layer.effect(
+      ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+      Effect.gen(function* () {
+        const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        return {
+          ...repository,
+          upsert: (row) =>
+            Effect.gen(function* () {
+              if (yield* Ref.getAndSet(armed, false)) {
+                yield* Deferred.succeed(writeEntered, undefined);
+                yield* Deferred.await(writeGate);
+              }
+              return yield* repository.upsert(row);
+            }),
+        } satisfies typeof repository;
+      }),
+    ).pipe(Layer.provide(repositoryLayer));
+    const directoryLayer = ProviderSessionDirectoryLive.pipe(
+      Layer.provide(gatedRepositoryLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    yield* Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("thread-write-serialization");
+
+      yield* directory.upsert({
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        sessionLease: ProviderSessionLease.make("lease-a"),
+        threadId,
+        runtimePayload: { cwd: "/tmp/project" },
+      });
+
+      yield* Ref.set(armed, true);
+      const fullRowWrite = yield* directory
+        .upsert({
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-a"),
+          threadId,
+          status: "stopped",
+          runtimePayload: { activeTurnId: null },
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(writeEntered);
+
+      const ownershipPatch = yield* directory
+        .updateRuntimePayloadIfOwned({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          sessionLease: ProviderSessionLease.make("lease-a"),
+          runtimePayload: { checkpointRevertIntent: { turnCount: 1 } },
+        })
+        .pipe(Effect.forkScoped);
+
+      yield* Deferred.succeed(writeGate, undefined);
+      yield* Fiber.join(fullRowWrite);
+      assert.equal(yield* Fiber.join(ownershipPatch), true);
+
+      const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+      assert.deepEqual(binding.runtimePayload, {
+        cwd: "/tmp/project",
+        activeTurnId: null,
+        checkpointRevertIntent: { turnCount: 1 },
+      });
+    }).pipe(Effect.scoped, Effect.provide(directoryLayer));
+  }),
+);

@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectoryPersistenceError, ProviderValidationError } from "../Errors.ts";
@@ -116,6 +117,28 @@ function toRuntimeBinding(
 const makeProviderSessionDirectory = Effect.gen(function* () {
   const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
 
+  // upsert reads the row, merges in process, and replaces the full row in a
+  // second statement, while the ownership-CAS updates commit single
+  // statements from callers that hold no lifecycle lock (live-turn cursor
+  // persistence, the reactor's intent writes). A CAS committing inside
+  // upsert's read-to-write window would be erased by the stale snapshot, so
+  // every write to a thread's row serializes on a per-thread mutex here,
+  // where the row lives, instead of relying on caller lock discipline. The
+  // CAS predicates stay: they are ownership semantics, not race guards.
+  const writeLocks = new Map<ThreadId, Semaphore.Semaphore>();
+  const withThreadWriteLock = <A, E>(
+    threadId: ThreadId,
+    effect: Effect.Effect<A, E>,
+  ): Effect.Effect<A, E> =>
+    Effect.suspend(() => {
+      let lock = writeLocks.get(threadId);
+      if (lock === undefined) {
+        lock = Semaphore.makeUnsafe(1);
+        writeLocks.set(threadId, lock);
+      }
+      return lock.withPermit(effect);
+    });
+
   const getBinding = (threadId: ThreadId) =>
     repository.getByThreadId({ threadId }).pipe(
       Effect.mapError(toPersistenceError("ProviderSessionDirectory.getBinding:getByThreadId")),
@@ -130,7 +153,7 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       ),
     );
 
-  const upsert: ProviderSessionDirectoryShape["upsert"] = Effect.fn(function* (binding) {
+  const upsertUnlocked = Effect.fn(function* (binding: ProviderRuntimeBinding) {
     const existing = yield* repository
       .getByThreadId({ threadId: binding.threadId })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:getByThreadId")));
@@ -201,6 +224,9 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
   });
 
+  const upsert: ProviderSessionDirectoryShape["upsert"] = (binding) =>
+    withThreadWriteLock(binding.threadId, upsertUnlocked(binding));
+
   const getProvider: ProviderSessionDirectoryShape["getProvider"] = (threadId) =>
     getBinding(threadId).pipe(
       Effect.flatMap((binding) =>
@@ -220,32 +246,38 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
   const updateResumeCursorIfOwned: ProviderSessionDirectoryShape["updateResumeCursorIfOwned"] = (
     input,
   ) =>
-    DateTime.now.pipe(
-      Effect.flatMap((now) =>
-        repository.updateResumeCursorIfOwned({
-          ...input,
-          lastSeenAt: DateTime.formatIso(now),
-        }),
-      ),
-      Effect.mapError(
-        toPersistenceError(
-          "ProviderSessionDirectory.updateResumeCursorIfOwned:updateResumeCursorIfOwned",
-        ),
-      ),
-    );
-
-  const updateRuntimePayloadIfOwned: ProviderSessionDirectoryShape["updateRuntimePayloadIfOwned"] =
-    (input) =>
+    withThreadWriteLock(
+      input.threadId,
       DateTime.now.pipe(
         Effect.flatMap((now) =>
-          repository.updateRuntimePayloadIfOwned({
+          repository.updateResumeCursorIfOwned({
             ...input,
             lastSeenAt: DateTime.formatIso(now),
           }),
         ),
         Effect.mapError(
           toPersistenceError(
-            "ProviderSessionDirectory.updateRuntimePayloadIfOwned:updateRuntimePayloadIfOwned",
+            "ProviderSessionDirectory.updateResumeCursorIfOwned:updateResumeCursorIfOwned",
+          ),
+        ),
+      ),
+    );
+
+  const updateRuntimePayloadIfOwned: ProviderSessionDirectoryShape["updateRuntimePayloadIfOwned"] =
+    (input) =>
+      withThreadWriteLock(
+        input.threadId,
+        DateTime.now.pipe(
+          Effect.flatMap((now) =>
+            repository.updateRuntimePayloadIfOwned({
+              ...input,
+              lastSeenAt: DateTime.formatIso(now),
+            }),
+          ),
+          Effect.mapError(
+            toPersistenceError(
+              "ProviderSessionDirectory.updateRuntimePayloadIfOwned:updateRuntimePayloadIfOwned",
+            ),
           ),
         ),
       );
