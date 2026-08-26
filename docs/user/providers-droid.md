@@ -20,7 +20,10 @@ curl -fsSL https://app.factory.ai/cli | sh
 Windows:
 
 ```powershell
-irm https://app.factory.ai/cli/windows | iex
+curl.exe -fsSL https://app.factory.ai/cli/windows -o install-droid.ps1
+# Review the downloaded script, then run it:
+powershell -ExecutionPolicy Bypass -File .\install-droid.ps1
+Remove-Item .\install-droid.ps1
 ```
 
 Installations from these commands support automatic updates. Run `droid update` to check and update

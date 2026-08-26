@@ -63,7 +63,8 @@ to use, then authenticate it.
 | Grok Build | [Grok Build CLI](https://x.ai/cli)                    | See provider instructions                     | `grok`         | `grok login`                                 |
 | OpenCode   | [OpenCode](https://opencode.ai)                       | See provider instructions                     | `opencode`     | `opencode auth login`                        |
 
-On Windows, install Droid with `irm https://app.factory.ai/cli/windows | iex`.
+On Windows, follow the [Droid provider guide](providers-droid.md#install-and-log-in) to download and
+run the installer script.
 
 Codex, Claude, and Cursor are on by default. Droid, Grok Build, and OpenCode are off by default; turn
 them on in **Settings** → the provider's card when you want to use them.
