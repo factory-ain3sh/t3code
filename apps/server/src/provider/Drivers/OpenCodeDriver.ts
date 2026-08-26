@@ -12,7 +12,7 @@
  *
  * @module provider/Drivers/OpenCodeDriver
  */
-import { OpenCodeSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { OpenCodeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -38,8 +38,8 @@ import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
   type ProviderInstance,
-  withProviderInstanceIdentity,
 } from "../ProviderDriver.ts";
+import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
@@ -48,7 +48,6 @@ import {
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "../providerMaintenance.ts";
 import {
-  haveProviderSnapshotEnrichmentSettingsChanged,
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
@@ -70,6 +69,7 @@ const UPDATE = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "opencode-ai",
   homebrewFormula: "anomalyco/tap/opencode",
   nativeUpdate: {
+    executable: "opencode",
     args: ["upgrade"],
     lockKey: "opencode-native",
     isCommandPath: isOpenCodeNativeCommandPath,
@@ -87,6 +87,22 @@ export type OpenCodeDriverEnv =
   | ProviderEventLoggers
   | ServerConfig
   | ServerSettingsService;
+
+const withInstanceIdentity =
+  (input: {
+    readonly instanceId: ProviderInstance["instanceId"];
+    readonly displayName: string | undefined;
+    readonly accentColor: string | undefined;
+    readonly continuationGroupKey: string;
+  }) =>
+  (snapshot: ServerProviderDraft): ServerProvider => ({
+    ...snapshot,
+    instanceId: input.instanceId,
+    driver: DRIVER_KIND,
+    ...(input.displayName ? { displayName: input.displayName } : {}),
+    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
+    continuation: { groupKey: input.continuationGroupKey },
+  });
 
 export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv> = {
   driverKind: DRIVER_KIND,
@@ -108,11 +124,11 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         driverKind: DRIVER_KIND,
         instanceId,
       });
-      const stampIdentity = withProviderInstanceIdentity({
+      const stampIdentity = withInstanceIdentity({
         instanceId,
-        continuationIdentity,
         displayName,
         accentColor,
+        continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies OpenCodeSettings;
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
@@ -140,7 +156,6 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
           getSettings: snapshotSettings.getSettings,
           streamSettings: snapshotSettings.streamSettings,
           haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-          haveEnrichmentSettingsChanged: haveProviderSnapshotEnrichmentSettingsChanged,
           initialSnapshot: (settings) =>
             makePendingOpenCodeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
           checkProvider,
@@ -158,7 +173,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: "Failed to build OpenCode snapshot.",
+              detail: `Failed to build OpenCode snapshot: ${cause.message ?? String(cause)}`,
               cause,
             }),
         ),

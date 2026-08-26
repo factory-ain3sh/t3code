@@ -33,6 +33,11 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 const encodeJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+type DroidTextGenerationOperation =
+  | "generateCommitMessage"
+  | "generatePrContent"
+  | "generateBranchName"
+  | "generateThreadTitle";
 
 export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(function* (
   droidSettings: DroidSettings,
@@ -48,7 +53,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
     outputSchema,
     modelSelection,
   }: {
-    operation: TextGeneration.TextGenerationOperation;
+    operation: DroidTextGenerationOperation;
     cwd: string;
     prompt: string;
     outputSchema: S;
@@ -178,7 +183,7 @@ export const makeDroidTextGeneration = Effect.fn("makeDroidTextGeneration")(func
     );
 
   const generate = <P, S extends Schema.Top, O>(
-    operation: TextGeneration.TextGenerationOperation,
+    operation: DroidTextGenerationOperation,
     buildPrompt: (input: P) => { readonly prompt: string; readonly outputSchema: S },
     sanitize: (generated: S["Type"]) => O,
   ) =>

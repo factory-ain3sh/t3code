@@ -24,14 +24,7 @@ export function haveProviderSnapshotSettingsChanged<Settings>(
   previous: ProviderSnapshotSettings<Settings>,
   next: ProviderSnapshotSettings<Settings>,
 ): boolean {
-  return !Equal.equals(previous.provider, next.provider);
-}
-
-export function haveProviderSnapshotEnrichmentSettingsChanged<Settings>(
-  previous: ProviderSnapshotSettings<Settings>,
-  next: ProviderSnapshotSettings<Settings>,
-): boolean {
-  return previous.enableProviderUpdateChecks !== next.enableProviderUpdateChecks;
+  return !Equal.equals(previous, next);
 }
 
 export function makeProviderSnapshotSettingsSource<Settings>(

@@ -27,8 +27,8 @@ unattended until it finishes or asks a question of its own.
 For Droid, **Full access** selects its highest autonomy level. T3 Code does not pass Droid's
 `--skip-permissions-unsafe` override.
 
-Approvals appear inline in the conversation. Depending on the provider and request, rejecting one
-may end the current turn instead of letting the agent continue in place.
+Approvals appear inline in the conversation. Approve or reject one and the agent continues from
+there. For Droid, rejecting an approval ends the current turn.
 
 ## Choosing a Mode
 

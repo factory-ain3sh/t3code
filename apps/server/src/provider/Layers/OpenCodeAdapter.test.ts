@@ -2,7 +2,6 @@ import * as NodeAssert from "node:assert/strict";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -10,7 +9,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -18,7 +16,6 @@ import * as TestClock from "effect/testing/TestClock";
 import { beforeEach } from "vite-plus/test";
 
 import {
-  ApprovalRequestId,
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -69,7 +66,6 @@ const runtimeMock = {
     promptCalls: [] as Array<unknown>,
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
-    messagesCalls: 0,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
     sessionGetIds: [] as string[],
@@ -78,10 +74,6 @@ const runtimeMock = {
     sessionDirectoryById: new Map<string, string>(),
     sessionUpdateCalls: [] as Array<{ sessionID: string; permission: unknown }>,
     forkCalls: [] as Array<{ sessionID: string; directory?: string }>,
-    permissionReplyCalls: [] as Array<{
-      requestID: string;
-      reply: "once" | "always" | "reject";
-    }>,
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -94,7 +86,6 @@ const runtimeMock = {
     this.state.promptCalls.length = 0;
     this.state.promptAsyncError = null;
     this.state.closeError = null;
-    this.state.messagesCalls = 0;
     this.state.messages = [];
     this.state.subscribedEvents = [];
     this.state.sessionGetIds.length = 0;
@@ -103,7 +94,6 @@ const runtimeMock = {
     this.state.sessionDirectoryById.clear();
     this.state.sessionUpdateCalls.length = 0;
     this.state.forkCalls.length = 0;
-    this.state.permissionReplyCalls.length = 0;
   },
 };
 
@@ -193,10 +183,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             throw runtimeMock.state.promptAsyncError;
           }
         },
-        messages: async () => {
-          runtimeMock.state.messagesCalls += 1;
-          return { data: runtimeMock.state.messages };
-        },
+        messages: async () => ({ data: runtimeMock.state.messages }),
         revert: async ({ sessionID, messageID }: { sessionID: string; messageID?: string }) => {
           runtimeMock.state.revertCalls.push({
             sessionID,
@@ -225,11 +212,6 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           })(),
         }),
       },
-      permission: {
-        reply: async (input: { requestID: string; reply: "once" | "always" | "reject" }) => {
-          runtimeMock.state.permissionReplyCalls.push(input);
-        },
-      },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
     Effect.fail(
@@ -251,10 +233,6 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
 
 const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory, {
   upsert: () => Effect.void,
-  updateResumeCursorIfOwned: () => Effect.succeed(false),
-  updateRuntimePayloadIfOwned: () => Effect.succeed(false),
-  invalidateOwnership: () => Effect.void,
-  matchesOwnership: () => Effect.succeed(true),
   getProvider: () =>
     Effect.die(new Error("ProviderSessionDirectory.getProvider is not used in test")),
   getBinding: () => Effect.succeed(Option.none()),
@@ -635,7 +613,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         Effect.forkChild,
       );
 
-      const session = yield* adapter.startSession({
+      yield* adapter.startSession({
         provider: ProviderDriverKind.make("opencode"),
         threadId,
         runtimeMode: "full-access",
@@ -647,109 +625,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         events.map((event) => event.type),
         ["session.started", "thread.started", "session.exited"],
       );
-      NodeAssert.equal(
-        events.every((event) => event.sessionLease === session.sessionLease),
-        true,
-      );
-    }),
-  );
-
-  it.effect("exposes the OpenCode approval options on permission requests", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-opencode-permission-decisions");
-      const providerSessionId = "http://127.0.0.1:9999/session";
-      runtimeMock.state.subscribedEvents = [
-        {
-          type: "permission.asked",
-          properties: {
-            id: "permission-1",
-            sessionID: providerSessionId,
-            permission: "bash",
-            patterns: ["echo mock"],
-            metadata: {},
-          },
-        },
-      ];
-      const requestOpenedFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter(
-          (event): event is Extract<typeof event, { type: "request.opened" }> =>
-            event.threadId === threadId && event.type === "request.opened",
-        ),
-        Stream.runHead,
-        Effect.map(Option.getOrThrow),
-        Effect.forkChild,
-      );
-
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "approval-required",
-      });
-
-      const opened = yield* Fiber.join(requestOpenedFiber).pipe(Effect.timeout("1 second"));
-      NodeAssert.deepEqual(opened.payload.options, [
-        { decision: "accept", label: "Approve" },
-        { decision: "acceptForSession", label: "Always allow this session" },
-        { decision: "decline", label: "Decline" },
-      ]);
-
-      yield* adapter.respondToRequest(
-        threadId,
-        ApprovalRequestId.make(String(opened.requestId)),
-        "decline",
-      );
-      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
-        { requestID: "permission-1", reply: "reject" },
-      ]);
-      yield* adapter.stopSession(threadId);
-    }),
-  );
-
-  it.effect("maps a cancel decision to an OpenCode reject reply for legacy clients", () =>
-    Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
-      const threadId = asThreadId("thread-opencode-permission-cancel");
-      const providerSessionId = "http://127.0.0.1:9999/session";
-      runtimeMock.state.subscribedEvents = [
-        {
-          type: "permission.asked",
-          properties: {
-            id: "permission-1",
-            sessionID: providerSessionId,
-            permission: "bash",
-            patterns: ["echo mock"],
-            metadata: {},
-          },
-        },
-      ];
-      const requestOpenedFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter(
-          (event): event is Extract<typeof event, { type: "request.opened" }> =>
-            event.threadId === threadId && event.type === "request.opened",
-        ),
-        Stream.runHead,
-        Effect.map(Option.getOrThrow),
-        Effect.forkChild,
-      );
-
-      yield* adapter.startSession({
-        provider: ProviderDriverKind.make("opencode"),
-        threadId,
-        runtimeMode: "approval-required",
-      });
-
-      const opened = yield* Fiber.join(requestOpenedFiber).pipe(Effect.timeout("1 second"));
-      // Shipped clients render Cancel from their default option set even
-      // though OpenCode never advertises it; the reply must still resolve.
-      const cancelResult = yield* adapter
-        .respondToRequest(threadId, ApprovalRequestId.make(String(opened.requestId)), "cancel")
-        .pipe(Effect.result);
-      NodeAssert.equal(cancelResult._tag, "Success");
-      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
-        { requestID: "permission-1", reply: "reject" },
-      ]);
-      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -781,37 +656,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         "http://127.0.0.1:9999",
       ]);
       NodeAssert.deepEqual(sessions, []);
-    }),
-  );
-
-  it.effect("does not start OpenCode resources when lease generation fails", () =>
-    Effect.gen(function* () {
-      const crypto = yield* Crypto.Crypto;
-      const uuidError = PlatformError.systemError({
-        _tag: "Unknown",
-        module: "Crypto",
-        method: "randomUUIDv4",
-        description: "UUID generation unavailable",
-      });
-      const adapter = yield* makeOpenCodeAdapter(openCodeAdapterTestSettings).pipe(
-        Effect.provideService(Crypto.Crypto, {
-          ...crypto,
-          randomUUIDv4: Effect.fail(uuidError),
-        }),
-      );
-
-      const result = yield* adapter
-        .startSession({
-          provider: ProviderDriverKind.make("opencode"),
-          threadId: asThreadId("thread-start-lease-failure"),
-          runtimeMode: "full-access",
-        })
-        .pipe(Effect.result);
-
-      NodeAssert.equal(result._tag, "Failure");
-      NodeAssert.deepEqual(runtimeMock.state.sessionCreateUrls, []);
-      NodeAssert.deepEqual(runtimeMock.state.abortCalls, []);
-      NodeAssert.deepEqual(runtimeMock.state.closeCalls, []);
     }),
   );
 
@@ -1098,6 +942,36 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.deepEqual(runtimeMock.state.promptCalls, []);
     }).pipe(Effect.provide(adapterLayer));
   });
+
+  it.effect("reverts the full thread when rollback removes every assistant turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-rollback-all");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      runtimeMock.state.messages = [
+        {
+          info: { id: "assistant-1", role: "assistant" },
+          parts: [],
+        },
+        {
+          info: { id: "assistant-2", role: "assistant" },
+          parts: [],
+        },
+      ];
+
+      const snapshot = yield* adapter.rollbackThread(threadId, 2);
+
+      NodeAssert.deepEqual(runtimeMock.state.revertCalls, [
+        { sessionID: "http://127.0.0.1:9999/session" },
+      ]);
+      NodeAssert.deepEqual(snapshot.turns, []);
+    }),
+  );
 
   it.effect("classifies a confirmed not-found across the shapes the SDK/runtime can produce", () =>
     Effect.sync(() => {

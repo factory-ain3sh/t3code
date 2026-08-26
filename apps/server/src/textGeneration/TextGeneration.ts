@@ -8,14 +8,7 @@ import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstance
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
 
-export const TEXT_GENERATION_OPERATIONS = [
-  "generateCommitMessage",
-  "generatePrContent",
-  "generateBranchName",
-  "generateThreadTitle",
-] as const;
-
-export type TextGenerationOperation = (typeof TEXT_GENERATION_OPERATIONS)[number];
+export type TextGenerationProvider = "codex" | "claudeAgent" | "cursor" | "grok" | "opencode";
 
 export interface CommitMessageGenerationInput {
   cwd: string;
@@ -58,7 +51,6 @@ export interface BranchNameGenerationInput {
   cwd: string;
   message: string;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  policy?: TextGenerationPolicy | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
@@ -73,13 +65,21 @@ export interface ThreadTitleGenerationInput {
   /** Present when replacing an existing title from the current thread history. */
   previousTitle?: string | undefined;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  policy?: TextGenerationPolicy | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
 
 export interface ThreadTitleGenerationResult {
   title: string;
+}
+
+export interface TextGenerationService {
+  generateCommitMessage(
+    input: CommitMessageGenerationInput,
+  ): Promise<CommitMessageGenerationResult>;
+  generatePrContent(input: PrContentGenerationInput): Promise<PrContentGenerationResult>;
+  generateBranchName(input: BranchNameGenerationInput): Promise<BranchNameGenerationResult>;
+  generateThreadTitle(input: ThreadTitleGenerationInput): Promise<ThreadTitleGenerationResult>;
 }
 
 /**
@@ -116,9 +116,18 @@ export class TextGeneration extends Context.Service<
   }
 >()("t3/textGeneration/TextGeneration") {}
 
+/** @deprecated Use `TextGeneration["Service"]`. */
+export type TextGenerationShape = TextGeneration["Service"];
+
+type TextGenerationOp =
+  | "generateCommitMessage"
+  | "generatePrContent"
+  | "generateBranchName"
+  | "generateThreadTitle";
+
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
-  operation: TextGenerationOperation,
+  operation: TextGenerationOp,
   instanceId: ProviderInstanceId,
 ): Effect.Effect<ProviderInstance["textGeneration"], TextGenerationError> =>
   registry.getInstance(instanceId).pipe(

@@ -43,14 +43,6 @@
       "types": "./src/providerSkills.ts",
       "default": "./src/providerSkills.ts"
     },
-    "./approvalRequests": {
-      "types": "./src/approvalRequests.ts",
-      "default": "./src/approvalRequests.ts"
-    },
-    "./providerDisplayName": {
-      "types": "./src/providerDisplayName.ts",
-      "default": "./src/providerDisplayName.ts"
-    },
     "./relay": {
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"

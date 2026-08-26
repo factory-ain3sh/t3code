@@ -1,4 +1,3 @@
-import { memo } from "react";
 import { Path, Svg } from "react-native-svg";
 import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
 
@@ -7,7 +6,7 @@ type ProviderIconProps = {
   readonly size?: number;
 };
 
-export const ProviderIcon = memo(function ProviderIcon(props: ProviderIconProps) {
+export function ProviderIcon(props: ProviderIconProps) {
   const { themeAppearance } = useAppearancePreferences();
   const isDarkMode = themeAppearance === "dark";
   const size = props.size ?? 16;
@@ -80,4 +79,4 @@ export const ProviderIcon = memo(function ProviderIcon(props: ProviderIconProps)
       />
     </Svg>
   );
-});
+}

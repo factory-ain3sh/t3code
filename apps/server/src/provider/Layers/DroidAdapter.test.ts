@@ -10,10 +10,12 @@ import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -31,6 +33,7 @@ import { ServerConfig } from "../../config.ts";
 import {
   droidApprovalOptions,
   droidTokenUsageSnapshot,
+  forkDroidPromptConsumer,
   makeDroidAdapter,
   selectDroidPermissionOutcome,
   settleDroidNativeServerResponse,
@@ -59,6 +62,21 @@ const userInputResponseCases = [
   { label: "workspace", answers: { "1": "workspace" } },
   { label: "session", answers: { "1": "session" } },
 ] as const;
+
+it.effect("starts the Droid prompt consumer before fork returns", () =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.make();
+    const started = yield* Deferred.make<void>();
+
+    yield* forkDroidPromptConsumer(
+      Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      scope,
+    );
+
+    assert.isTrue(yield* Deferred.isDone(started));
+    yield* Scope.close(scope, Exit.void);
+  }),
+);
 
 it("derives Droid approval capabilities without escalating one-shot approval", () => {
   const options = [
@@ -405,8 +423,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       );
       assert.equal(terminal.payload.state, "completed");
       assert.equal(terminal.payload.stopReason, "completed");
-      assert.equal(terminal.sessionLease, session.sessionLease);
-      assert.isTrue(turnEvents.every((event) => event.sessionLease === session.sessionLease));
       const usage = threadEvents.find(
         (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
           event.type === "thread.token-usage.updated",
@@ -1390,12 +1406,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       yield* adapter.stopSession(threadId);
       const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const turn = yield* sendDroidTurn(adapter, threadId, "turn before canonical rollback load");
+      yield* sendDroidTurn(adapter, threadId, "turn before canonical rollback load");
       yield* waitForType(threadId, "turn.completed");
-      yield* adapter.rollbackThread(threadId, {
-        turnIds: [],
-        anchorTurnId: turn.turnId,
-      });
+      yield* adapter.rollbackThread(threadId, 1);
       const requests = (yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8")))
         .split("\n")
         .filter(Boolean)
@@ -1539,18 +1552,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { adapter } = yield* makeDroidScenario();
       const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const firstTurn = yield* sendDroidTurn(adapter, threadId, "first turn to roll back");
+      yield* sendDroidTurn(adapter, threadId, "first turn to roll back");
       yield* waitForType(threadId, "turn.completed");
-      const snapshot = yield* adapter.rollbackThread(threadId, {
-        turnIds: [],
-        anchorTurnId: firstTurn.turnId,
-      });
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
       assert.deepEqual(snapshot.turns, []);
-      const replayed = yield* adapter.rollbackThread(threadId, {
-        turnIds: [],
-        anchorTurnId: firstTurn.turnId,
-      });
-      assert.deepEqual(replayed.turns, []);
       // The live process re-anchored on the fork: the resume cursor points at
       // the rewound session and the session still takes turns.
       const nextTurn = yield* sendDroidTurn(adapter, threadId, "turn after the rewind");
@@ -1560,28 +1565,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         turnIds: [nextTurn.turnId],
       });
       yield* waitForType(threadId, "turn.completed", 2);
-      const staleAnchor = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [],
-          anchorTurnId: firstTurn.turnId,
-        })
-        .pipe(Effect.result);
-      assert.equal(staleAnchor._tag, "Failure");
-      if (staleAnchor._tag === "Failure") {
-        assert.equal(staleAnchor.failure._tag, "ProviderAdapterValidationError");
-      }
-      // Rolling back past the turns tracked in this process is refused
-      // rather than mis-anchored (rollback of the post-rewind turn is fine,
-      // two turns is not).
-      const tooDeep = yield* Effect.flip(
-        adapter.rollbackThread(threadId, {
-          turnIds: [nextTurn.turnId, TurnId.make("missing-turn")],
-        }),
-      );
-      assert.equal(tooDeep._tag, "ProviderAdapterValidationError");
-      if (tooDeep._tag === "ProviderAdapterValidationError") {
-        assert.equal(tooDeep.issue, "Rollback target does not match the current thread history.");
-      }
     }),
   );
 
@@ -1593,15 +1576,10 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       });
       const { waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const turn = yield* sendDroidTurn(adapter, threadId, "turn before failed rewind load");
+      yield* sendDroidTurn(adapter, threadId, "turn before failed rewind load");
       yield* waitForType(threadId, "turn.completed");
 
-      const result = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [],
-          anchorTurnId: turn.turnId,
-        })
-        .pipe(Effect.result);
+      const result = yield* adapter.rollbackThread(threadId, 1).pipe(Effect.result);
       assert.equal(result._tag, "Failure");
       if (result._tag === "Failure") {
         assert.equal(result.failure._tag, "ProviderAdapterSessionInvalidatedError");
@@ -1617,12 +1595,9 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
       const { adapter } = yield* makeDroidScenario();
       const { events: runtimeEvents, waitForType } = yield* collectDroidEvents(adapter);
       yield* startDroidSession(adapter, threadId, "full-access");
-      const firstTurn = yield* sendDroidTurn(adapter, threadId, "turn before straggler rewind");
+      yield* sendDroidTurn(adapter, threadId, "turn before straggler rewind");
       yield* waitForType(threadId, "turn.completed");
-      yield* adapter.rollbackThread(threadId, {
-        turnIds: [],
-        anchorTurnId: firstTurn.turnId,
-      });
+      yield* adapter.rollbackThread(threadId, 1);
       const nextTurn = yield* sendDroidTurn(adapter, threadId, "turn after straggler rewind");
       const terminal = yield* waitForType(threadId, "turn.completed", 2);
       const nextTurnEvents = eventsForThread(runtimeEvents, threadId).filter(
@@ -2178,10 +2153,7 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           turnIds: [...persistedTurnIds, persistedAnchor],
         },
       });
-      const snapshot = yield* adapter.rollbackThread(threadId, {
-        turnIds: persistedTurnIds,
-        anchorTurnId: persistedAnchor,
-      });
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
       assert.deepEqual(
         snapshot.turns.map((turn) => turn.id),
         persistedTurnIds,
@@ -2191,30 +2163,6 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,
       });
-    }),
-  );
-
-  it.effect("rejects a resumed Droid rollback prefix that differs from persisted history", () =>
-    Effect.gen(function* () {
-      const threadId = ThreadId.make("droid-resumed-rollback-mismatch");
-      const { adapter } = yield* makeDroidScenario();
-      yield* startDroidSession(adapter, threadId, "full-access", {
-        resumeCursor: {
-          schemaVersion: 2,
-          sessionId: "mock-session-known",
-          turnIds: [TurnId.make("persisted-turn-1"), TurnId.make("persisted-anchor")],
-        },
-      });
-      const error = yield* adapter
-        .rollbackThread(threadId, {
-          turnIds: [TurnId.make("bogus-turn")],
-          anchorTurnId: TurnId.make("persisted-anchor"),
-        })
-        .pipe(Effect.flip);
-      assert.equal(error._tag, "ProviderAdapterValidationError");
-      if (error._tag === "ProviderAdapterValidationError") {
-        assert.equal(error.issue, "Rollback target does not match the current thread history.");
-      }
     }),
   );
 
@@ -2235,29 +2183,14 @@ it.layer(droidAdapterTestLayer)("DroidAdapterLive", (it) => {
           turnIds: persistedTurnIds,
         },
       });
-      const resumedTurn = yield* sendDroidTurn(adapter, threadId, "turn after restart");
+      yield* sendDroidTurn(adapter, threadId, "turn after restart");
       yield* waitForType(threadId, "turn.completed");
-      const snapshot = yield* adapter.rollbackThread(threadId, {
-        turnIds: persistedTurnIds,
-        anchorTurnId: resumedTurn.turnId,
-      });
+      const snapshot = yield* adapter.rollbackThread(threadId, 1);
       assert.deepEqual(
         snapshot.turns.map((turn) => turn.id),
         persistedTurnIds,
       );
       assert.deepStrictEqual(snapshot.resumeCursor, {
-        schemaVersion: 2,
-        sessionId: "mock-session-rewound",
-        turnIds: persistedTurnIds,
-      });
-      const repeated = yield* adapter.rollbackThread(threadId, {
-        turnIds: persistedTurnIds,
-      });
-      assert.deepEqual(
-        repeated.turns.map((turn) => turn.id),
-        persistedTurnIds,
-      );
-      assert.deepStrictEqual(repeated.resumeCursor, {
         schemaVersion: 2,
         sessionId: "mock-session-rewound",
         turnIds: persistedTurnIds,

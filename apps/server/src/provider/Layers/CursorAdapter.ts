@@ -12,10 +12,10 @@ import {
   type ProviderApprovalDecision,
   type ProviderInteractionMode,
   type ProviderRuntimeEvent,
+  type ProviderSession,
   type ProviderUserInputAnswers,
   ProviderDriverKind,
   ProviderInstanceId,
-  ProviderSessionLease,
   RuntimeRequestId,
   type RuntimeMode,
   type ThreadId,
@@ -25,14 +25,17 @@ import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
-import * as Encoding from "effect/Encoding";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
@@ -41,17 +44,12 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
-  type ProviderAdapterError,
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
+  ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import {
-  mapAcpToAdapterError,
-  selectAcpPermissionOptionId,
-  selectAutoApprovedAcpPermissionOptionId,
-  acpApprovalOptions,
-} from "../acp/AcpAdapterSupport.ts";
+import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -61,10 +59,6 @@ import {
   makeAcpRequestResolvedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
-import {
-  parseVersionedSessionResumeCursor,
-  type ProviderAdapterSession,
-} from "../Services/ProviderAdapter.ts";
 import {
   type AcpSessionMode,
   type AcpSessionModeState,
@@ -81,17 +75,20 @@ import {
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
-import { makeRequireActiveProviderSession } from "../Services/ProviderAdapter.ts";
-import { makeKeyedLock } from "../internal/keyedLock.ts";
-import { encodeJsonStringForDiagnostics } from "../ProviderDiagnostics.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("cursor");
 const CURSOR_RESUME_VERSION = 1 as const;
 const ACP_PLAN_MODE_ALIASES = ["plan", "architect"];
 const ACP_IMPLEMENT_MODE_ALIASES = ["code", "agent", "default", "chat", "implement"];
 const ACP_APPROVAL_MODE_ALIASES = ["ask"];
+
+function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
+  const result = encodeUnknownJsonStringExit(input);
+  return Exit.isSuccess(result) ? result.value : undefined;
+}
 
 export interface CursorAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -119,7 +116,6 @@ export interface CursorAdapterLiveOptions {
 interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
   readonly kind: string | "unknown";
-  readonly supportedDecisions: ReadonlyArray<ProviderApprovalDecision>;
 }
 
 interface PendingUserInput {
@@ -128,7 +124,7 @@ interface PendingUserInput {
 
 interface CursorSessionContext {
   readonly threadId: ThreadId;
-  session: ProviderAdapterSession;
+  session: ProviderSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
@@ -141,7 +137,6 @@ interface CursorSessionContext {
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
-  readonly pendingPromptRegistrations: Array<Deferred.Deferred<void, ProviderAdapterError>>;
   stopped: boolean;
 }
 
@@ -171,6 +166,17 @@ function settlePendingUserInputsAsEmptyAnswers(
   );
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseCursorResume(raw: unknown): { sessionId: string } | undefined {
+  if (!isRecord(raw)) return undefined;
+  if (raw.schemaVersion !== CURSOR_RESUME_VERSION) return undefined;
+  if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
+  return { sessionId: raw.sessionId.trim() };
+}
+
 function normalizeModeSearchText(mode: AcpSessionMode): string {
   return [mode.id, mode.name, mode.description]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
@@ -178,20 +184,6 @@ function normalizeModeSearchText(mode: AcpSessionMode): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
-}
-
-interface CursorPreparedPrompt {
-  readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
-  readonly promptParts: ReadonlyArray<EffectAcpSchema.ContentBlock>;
-  readonly resolvedModel: string | undefined;
-  readonly sessionLease: ProviderSessionLease;
-  readonly sessionScope: Scope.Closeable;
-  readonly turnId: TurnId;
-  readonly turnStartResult: {
-    readonly threadId: ThreadId;
-    readonly turnId: TurnId;
-    readonly resumeCursor: ProviderAdapterSession["resumeCursor"];
-  };
 }
 
 function findModeByAliases(
@@ -302,6 +294,22 @@ function applyRequestedSessionConfiguration<E>(input: {
   });
 }
 
+function selectAutoApprovedPermissionOption(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): string | undefined {
+  const allowAlwaysOption = request.options.find((option) => option.kind === "allow_always");
+  if (typeof allowAlwaysOption?.optionId === "string" && allowAlwaysOption.optionId.trim()) {
+    return allowAlwaysOption.optionId.trim();
+  }
+
+  const allowOnceOption = request.options.find((option) => option.kind === "allow_once");
+  if (typeof allowOnceOption?.optionId === "string" && allowOnceOption.optionId.trim()) {
+    return allowOnceOption.optionId.trim();
+  }
+
+  return undefined;
+}
+
 export function makeCursorAdapter(
   cursorSettings: CursorSettings,
   options?: CursorAdapterLiveOptions,
@@ -325,7 +333,7 @@ export function makeCursorAdapter(
     const makeAcpNativeLoggers = yield* makeAcpNativeLoggerFactory();
 
     const sessions = new Map<ThreadId, CursorSessionContext>();
-    const threadLocks = yield* makeKeyedLock<ThreadId>();
+    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -356,8 +364,26 @@ export function makeCursorAdapter(
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
 
-    const withThreadLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
-      threadLocks.withLock(threadId, effect);
+    const getThreadSemaphore = (threadId: string) =>
+      SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
+        const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
+          current.get(threadId),
+        );
+        return Option.match(existing, {
+          onNone: () =>
+            Semaphore.make(1).pipe(
+              Effect.map((semaphore) => {
+                const next = new Map(current);
+                next.set(threadId, semaphore);
+                return [semaphore, next] as const;
+              }),
+            ),
+          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+        });
+      });
+
+    const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
 
     const logNative = (
       threadId: ThreadId,
@@ -406,7 +432,6 @@ export function makeCursorAdapter(
         ctx.lastPlanFingerprint = fingerprint;
         yield* offerRuntimeEvent(
           makeAcpPlanUpdatedEvent({
-            sessionLease: ctx.session.sessionLease,
             stamp: yield* makeEventStamp(),
             provider: PROVIDER,
             threadId: ctx.threadId,
@@ -419,7 +444,17 @@ export function makeCursorAdapter(
         );
       });
 
-    const requireSession = makeRequireActiveProviderSession(sessions, PROVIDER);
+    const requireSession = (
+      threadId: ThreadId,
+    ): Effect.Effect<CursorSessionContext, ProviderAdapterSessionNotFoundError> => {
+      const ctx = sessions.get(threadId);
+      if (!ctx || ctx.stopped) {
+        return Effect.fail(
+          new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }),
+        );
+      }
+      return Effect.succeed(ctx);
+    };
 
     const stopSessionInternal = (ctx: CursorSessionContext) =>
       Effect.gen(function* () {
@@ -427,26 +462,12 @@ export function makeCursorAdapter(
         ctx.stopped = true;
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-        yield* Effect.forEach(
-          ctx.pendingPromptRegistrations.splice(0),
-          (registration) =>
-            Deferred.fail(
-              registration,
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "session/prompt",
-                detail: "Cursor session stopped before the prompt was registered.",
-              }),
-            ).pipe(Effect.ignore),
-          { discard: true },
-        );
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
         sessions.delete(ctx.threadId);
         yield* offerRuntimeEvent({
-          sessionLease: ctx.session.sessionLease,
           type: "session.exited",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
@@ -491,18 +512,12 @@ export function makeCursorAdapter(
           );
           let ctx!: CursorSessionContext;
 
-          const resumeSessionId = parseVersionedSessionResumeCursor(
-            input.resumeCursor,
-            CURSOR_RESUME_VERSION,
-          );
+          const resumeSessionId = parseCursorResume(input.resumeCursor)?.sessionId;
           const acpNativeLoggers = makeAcpNativeLoggers({
             nativeEventLogger,
             provider: PROVIDER,
             threadId: input.threadId,
           });
-          const sessionLease = ProviderSessionLease.make(yield* randomUUIDv4);
-          const pendingPromptRegistrations: Array<Deferred.Deferred<void, ProviderAdapterError>> =
-            [];
 
           // Resolve the CursorSettings used to spawn the ACP child. Production
           // leaves `options.resolveSettings` undefined so we use the value
@@ -542,31 +557,6 @@ export function makeCursorAdapter(
                 }
               : {}),
             ...acpNativeLoggers,
-            protocolLogging: {
-              logIncoming: acpNativeLoggers.protocolLogging?.logIncoming ?? false,
-              logOutgoing: true,
-              logger: (event) =>
-                Effect.gen(function* () {
-                  yield* acpNativeLoggers.protocolLogging?.logger?.(event) ?? Effect.void;
-                  if (
-                    event.direction !== "outgoing" ||
-                    event.stage !== "raw" ||
-                    typeof event.payload !== "string" ||
-                    !event.payload.includes('"session/prompt"')
-                  ) {
-                    return;
-                  }
-                  const registration = pendingPromptRegistrations[0];
-                  if (!registration) {
-                    return;
-                  }
-                  yield* Deferred.succeed(registration, undefined);
-                  if (pendingPromptRegistrations[0] === registration) {
-                    pendingPromptRegistrations.shift();
-                  }
-                }),
-            },
-            requestLogger: (event) => acpNativeLoggers.requestLogger?.(event) ?? Effect.void,
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             Effect.provideService(Scope.Scope, sessionScope),
@@ -595,7 +585,6 @@ export function makeCursorAdapter(
                   const answers = yield* Deferred.make<ProviderUserInputAnswers>();
                   pendingUserInputs.set(requestId, { answers });
                   yield* offerRuntimeEvent({
-                    sessionLease,
                     type: "user-input.requested",
                     ...(yield* makeEventStamp()),
                     provider: PROVIDER,
@@ -612,7 +601,6 @@ export function makeCursorAdapter(
                   const resolved = yield* Deferred.await(answers);
                   pendingUserInputs.delete(requestId);
                   yield* offerRuntimeEvent({
-                    sessionLease,
                     type: "user-input.resolved",
                     ...(yield* makeEventStamp()),
                     provider: PROVIDER,
@@ -635,7 +623,6 @@ export function makeCursorAdapter(
                     "acp.cursor.extension",
                   );
                   yield* offerRuntimeEvent({
-                    sessionLease,
                     type: "turn.proposed.completed",
                     ...(yield* makeEventStamp()),
                     provider: PROVIDER,
@@ -686,7 +673,7 @@ export function makeCursorAdapter(
                     "acp.jsonrpc",
                   );
                   if (input.runtimeMode === "full-access") {
-                    const autoApprovedOptionId = selectAutoApprovedAcpPermissionOptionId(params);
+                    const autoApprovedOptionId = selectAutoApprovedPermissionOption(params);
                     if (autoApprovedOptionId !== undefined) {
                       return {
                         outcome: {
@@ -700,22 +687,18 @@ export function makeCursorAdapter(
                   const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                   const runtimeRequestId = RuntimeRequestId.make(requestId);
                   const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                  const approvalOptions = acpApprovalOptions(params);
                   pendingApprovals.set(requestId, {
                     decision,
                     kind: permissionRequest.kind,
-                    supportedDecisions: approvalOptions.map((option) => option.decision),
                   });
                   yield* offerRuntimeEvent(
                     makeAcpRequestOpenedEvent({
-                      sessionLease,
                       stamp: yield* makeEventStamp(),
                       provider: PROVIDER,
                       threadId: input.threadId,
                       turnId: ctx?.activeTurnId,
                       requestId: runtimeRequestId,
                       permissionRequest,
-                      options: approvalOptions,
                       detail:
                         permissionRequest.detail ??
                         encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
@@ -730,7 +713,6 @@ export function makeCursorAdapter(
                   pendingApprovals.delete(requestId);
                   yield* offerRuntimeEvent(
                     makeAcpRequestResolvedEvent({
-                      sessionLease,
                       stamp: yield* makeEventStamp(),
                       provider: PROVIDER,
                       threadId: input.threadId,
@@ -740,17 +722,14 @@ export function makeCursorAdapter(
                       decision: resolved,
                     }),
                   );
-                  const selectedOptionId =
-                    resolved === "cancel"
-                      ? undefined
-                      : selectAcpPermissionOptionId(params, resolved);
                   return {
-                    outcome: selectedOptionId
-                      ? {
-                          outcome: "selected" as const,
-                          optionId: selectedOptionId,
-                        }
-                      : ({ outcome: "cancelled" } as const),
+                    outcome:
+                      resolved === "cancel"
+                        ? ({ outcome: "cancelled" } as const)
+                        : {
+                            outcome: "selected" as const,
+                            optionId: acpPermissionOutcome(resolved),
+                          },
                   };
                 }),
               ),
@@ -772,10 +751,9 @@ export function makeCursorAdapter(
           });
 
           const now = yield* nowIso;
-          const session: ProviderAdapterSession = {
+          const session: ProviderSession = {
             provider: PROVIDER,
             providerInstanceId: boundInstanceId,
-            sessionLease,
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
@@ -801,7 +779,6 @@ export function makeCursorAdapter(
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
             promptsInFlight: 0,
-            pendingPromptRegistrations,
             stopped: false,
           };
 
@@ -817,7 +794,6 @@ export function makeCursorAdapter(
                   case "AssistantItemStarted":
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
-                        sessionLease: ctx.session.sessionLease,
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
@@ -830,7 +806,6 @@ export function makeCursorAdapter(
                   case "AssistantItemCompleted":
                     yield* offerRuntimeEvent(
                       makeAcpAssistantItemEvent({
-                        sessionLease: ctx.session.sessionLease,
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
@@ -864,7 +839,6 @@ export function makeCursorAdapter(
                     );
                     yield* offerRuntimeEvent(
                       makeAcpToolCallEvent({
-                        sessionLease: ctx.session.sessionLease,
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
@@ -883,7 +857,6 @@ export function makeCursorAdapter(
                     );
                     yield* offerRuntimeEvent(
                       makeAcpContentDeltaEvent({
-                        sessionLease: ctx.session.sessionLease,
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
@@ -915,7 +888,6 @@ export function makeCursorAdapter(
           sessionScopeTransferred = true;
 
           yield* offerRuntimeEvent({
-            sessionLease: ctx.session.sessionLease,
             type: "session.started",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
@@ -923,7 +895,6 @@ export function makeCursorAdapter(
             payload: { resume: started.initializeResult },
           });
           yield* offerRuntimeEvent({
-            sessionLease: ctx.session.sessionLease,
             type: "session.state.changed",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
@@ -931,7 +902,6 @@ export function makeCursorAdapter(
             payload: { state: "ready", reason: "Cursor ACP session ready" },
           });
           yield* offerRuntimeEvent({
-            sessionLease: ctx.session.sessionLease,
             type: "thread.started",
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
@@ -943,282 +913,170 @@ export function makeCursorAdapter(
         }).pipe(Effect.scoped),
       );
 
-    const forkCursorPrompt = (
-      threadId: ThreadId,
-      prepared: CursorPreparedPrompt,
-      registration: Deferred.Deferred<void, ProviderAdapterError>,
-    ) =>
-      prepared.acp.prompt({ prompt: prepared.promptParts }).pipe(
-        Effect.mapError((error) =>
-          mapAcpToAdapterError(PROVIDER, threadId, "session/prompt", error),
-        ),
-        Effect.matchEffect({
-          onFailure: (error) =>
-            Deferred.fail(registration, error).pipe(
-              Effect.ignore,
-              Effect.andThen(
-                withThreadLock(
-                  threadId,
-                  Effect.gen(function* () {
-                    const ctx = sessions.get(threadId);
-                    if (
-                      !ctx ||
-                      ctx.session.sessionLease !== prepared.sessionLease ||
-                      ctx.acp !== prepared.acp
-                    ) {
-                      return;
-                    }
-                    const registrationIndex = ctx.pendingPromptRegistrations.indexOf(registration);
-                    if (registrationIndex >= 0) {
-                      ctx.pendingPromptRegistrations.splice(registrationIndex, 1);
-                    }
-                    yield* prepared.acp.drainEvents;
-                    const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
-                    ctx.promptsInFlight = remainingPrompts;
-                    if (
-                      remainingPrompts > 0 ||
-                      ctx.activeTurnId !== prepared.turnId ||
-                      ctx.session.activeTurnId !== prepared.turnId
-                    ) {
-                      return;
-                    }
-                    const updatedAt = yield* nowIso;
-                    const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-                    ctx.activeTurnId = undefined;
-                    ctx.session = {
-                      ...readySession,
-                      status: "ready",
-                      updatedAt,
-                      lastError: error.message,
-                    };
-                    yield* offerRuntimeEvent({
-                      sessionLease: prepared.sessionLease,
-                      type: "turn.completed",
-                      ...(yield* makeEventStamp()),
-                      provider: PROVIDER,
-                      threadId,
-                      turnId: prepared.turnId,
-                      payload: {
-                        ...(ctx.session.resumeCursor !== undefined
-                          ? { resumeCursor: ctx.session.resumeCursor }
-                          : {}),
-                        state: "failed",
-                        errorMessage: error.message,
-                      },
-                    });
-                  }),
-                ),
-              ),
-            ),
-          onSuccess: (result) =>
-            withThreadLock(
-              threadId,
-              Effect.gen(function* () {
-                const ctx = sessions.get(threadId);
-                if (
-                  !ctx ||
-                  ctx.session.sessionLease !== prepared.sessionLease ||
-                  ctx.acp !== prepared.acp
-                ) {
-                  return;
-                }
-                const turnRecord = ctx.turns.find((turn) => turn.id === prepared.turnId);
-                if (turnRecord) {
-                  turnRecord.items.push({
-                    prompt: prepared.promptParts,
-                    result,
-                  });
-                } else {
-                  ctx.turns.push({
-                    id: prepared.turnId,
-                    items: [{ prompt: prepared.promptParts, result }],
-                  });
-                }
-                const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
-                ctx.promptsInFlight = remainingPrompts;
-                if (
-                  remainingPrompts > 0 ||
-                  ctx.activeTurnId !== prepared.turnId ||
-                  ctx.session.activeTurnId !== prepared.turnId
-                ) {
-                  return;
-                }
-                const updatedAt = yield* nowIso;
-                const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-                ctx.activeTurnId = undefined;
-                ctx.session = {
-                  ...readySession,
-                  status: "ready",
-                  updatedAt,
-                  model: prepared.resolvedModel,
-                };
-                yield* prepared.acp.drainEvents;
-                yield* offerRuntimeEvent({
-                  sessionLease: prepared.sessionLease,
-                  type: "turn.completed",
-                  ...(yield* makeEventStamp()),
-                  provider: PROVIDER,
-                  threadId,
-                  turnId: prepared.turnId,
-                  payload: {
-                    ...(ctx.session.resumeCursor !== undefined
-                      ? { resumeCursor: ctx.session.resumeCursor }
-                      : {}),
-                    state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-                    stopReason: result.stopReason ?? null,
-                  },
-                });
-              }),
-            ),
-        }),
-        Effect.catchCause((cause) =>
-          Effect.logError("Failed to settle Cursor prompt.", {
-            cause,
-            threadId,
-            turnId: prepared.turnId,
-          }),
-        ),
-        Effect.forkIn(prepared.sessionScope),
-      );
-
     const sendTurn: CursorAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        const registration = yield* Deferred.make<void, ProviderAdapterError>();
-        const prepared = yield* withThreadLock(
-          input.threadId,
-          Effect.gen(function* () {
-            const ctx = yield* requireSession(input.threadId);
-            // A sendTurn while a prompt is in flight is a steer: the agent
-            // folds the new prompt into the ongoing work, so the active turn
-            // id is reused instead of opening a new turn.
-            const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
-            const turnModelSelection =
-              input.modelSelection?.instanceId === boundInstanceId
-                ? input.modelSelection
-                : undefined;
-            const model = turnModelSelection?.model ?? ctx.session.model;
-            const resolvedModel = resolveCursorAcpBaseModelId(model);
-            yield* applyRequestedSessionConfiguration({
-              runtime: ctx.acp,
-              runtimeMode: ctx.session.runtimeMode,
-              interactionMode: input.interactionMode,
-              modelSelection:
-                model === undefined
-                  ? undefined
-                  : {
-                      model,
-                      options: turnModelSelection?.options,
-                    },
-              mapError: ({ cause, method }) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+        const ctx = yield* requireSession(input.threadId);
+        // A sendTurn while a prompt is in flight is a steer: the agent folds
+        // the new prompt into the ongoing work, so the active turn id is
+        // reused instead of opening a new turn.
+        const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+        const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
+        // Count this prompt immediately so a superseded in-flight prompt
+        // resolving from here on does not settle the turn; the matching
+        // decrement is the `ensuring` below.
+        ctx.promptsInFlight += 1;
+
+        return yield* Effect.gen(function* () {
+          const turnModelSelection =
+            input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+          const model = turnModelSelection?.model ?? ctx.session.model;
+          const resolvedModel = resolveCursorAcpBaseModelId(model);
+          yield* applyRequestedSessionConfiguration({
+            runtime: ctx.acp,
+            runtimeMode: ctx.session.runtimeMode,
+            interactionMode: input.interactionMode,
+            modelSelection:
+              model === undefined
+                ? undefined
+                : {
+                    model,
+                    options: turnModelSelection?.options,
+                  },
+            mapError: ({ cause, method }) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+          });
+          ctx.activeTurnId = turnId;
+          if (steeringTurnId === undefined) {
+            ctx.lastPlanFingerprint = undefined;
+          }
+          ctx.session = {
+            ...ctx.session,
+            activeTurnId: turnId,
+            updatedAt: yield* nowIso,
+          };
+
+          if (steeringTurnId === undefined) {
+            yield* offerRuntimeEvent({
+              type: "turn.started",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: { model: resolvedModel },
             });
-            const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
-            if (input.input?.trim()) {
-              promptParts.push({ type: "text", text: input.input.trim() });
-            }
-            if (input.attachments && input.attachments.length > 0) {
-              for (const attachment of input.attachments) {
-                const attachmentPath = resolveAttachmentPath({
-                  attachmentsDir: serverConfig.attachmentsDir,
-                  attachment,
-                });
-                if (!attachmentPath) {
-                  return yield* new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/prompt",
-                    detail: `Invalid attachment id '${attachment.id}'.`,
-                  });
-                }
-                const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "session/prompt",
-                        detail: cause.message,
-                        cause,
-                      }),
-                  ),
-                );
-                promptParts.push({
-                  type: "image",
-                  data: Encoding.encodeBase64(bytes),
-                  mimeType: attachment.mimeType,
+          }
+
+          const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
+          if (input.input?.trim()) {
+            promptParts.push({ type: "text", text: input.input.trim() });
+          }
+          if (input.attachments && input.attachments.length > 0) {
+            for (const attachment of input.attachments) {
+              const attachmentPath = resolveAttachmentPath({
+                attachmentsDir: serverConfig.attachmentsDir,
+                attachment,
+              });
+              if (!attachmentPath) {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/prompt",
+                  detail: `Invalid attachment id '${attachment.id}'.`,
                 });
               }
-            }
-
-            if (promptParts.length === 0) {
-              return yield* new ProviderAdapterValidationError({
-                provider: PROVIDER,
-                operation: "sendTurn",
-                issue: "Turn requires non-empty text or attachments.",
+              const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "session/prompt",
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+              promptParts.push({
+                type: "image",
+                data: Buffer.from(bytes).toString("base64"),
+                mimeType: attachment.mimeType,
               });
             }
+          }
 
-            ctx.activeTurnId = turnId;
-            if (steeringTurnId === undefined) {
-              ctx.lastPlanFingerprint = undefined;
-            }
-            ctx.session = {
-              ...ctx.session,
-              status: "running",
-              activeTurnId: turnId,
-              updatedAt: yield* nowIso,
-              model: resolvedModel,
-            };
-            ctx.promptsInFlight += 1;
-            if (steeringTurnId === undefined) {
-              yield* offerRuntimeEvent({
-                sessionLease: ctx.session.sessionLease,
-                type: "turn.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                turnId,
-                payload: { model: resolvedModel },
-              });
-            }
-            const prepared: CursorPreparedPrompt = {
-              acp: ctx.acp,
-              promptParts,
-              resolvedModel,
-              sessionLease: ctx.session.sessionLease,
-              sessionScope: ctx.scope,
+          if (promptParts.length === 0) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: "Turn requires non-empty text or attachments.",
+            });
+          }
+
+          const result = yield* ctx.acp
+            .prompt({
+              prompt: promptParts,
+            })
+            .pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+              ),
+            );
+
+          const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
+          if (turnRecord) {
+            turnRecord.items.push({ prompt: promptParts, result });
+          } else {
+            ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
+          }
+          ctx.session = {
+            ...ctx.session,
+            activeTurnId: turnId,
+            updatedAt: yield* nowIso,
+            model: resolvedModel,
+          };
+
+          // Only the last remaining prompt settles the turn — a steer-
+          // superseded prompt resolving (usually cancelled) while another is
+          // in flight or pending must leave the merged turn running.
+          if (ctx.promptsInFlight === 1) {
+            yield* offerRuntimeEvent({
+              type: "turn.completed",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: input.threadId,
               turnId,
-              turnStartResult: {
-                threadId: input.threadId,
-                turnId,
-                resumeCursor: ctx.session.resumeCursor,
+              payload: {
+                state: result.stopReason === "cancelled" ? "cancelled" : "completed",
+                stopReason: result.stopReason ?? null,
               },
-            };
-            ctx.pendingPromptRegistrations.push(registration);
-            yield* forkCursorPrompt(input.threadId, prepared, registration);
-            yield* Deferred.await(registration);
-            return prepared;
-          }),
-        );
+            });
+          }
 
-        return prepared.turnStartResult;
+          return {
+            threadId: input.threadId,
+            turnId,
+            resumeCursor: ctx.session.resumeCursor,
+          };
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+            }),
+          ),
+        );
       });
 
     const interruptTurn: CursorAdapterShape["interruptTurn"] = (threadId) =>
-      withThreadLock(
-        threadId,
-        Effect.gen(function* () {
-          const ctx = yield* requireSession(threadId);
-          yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
-          yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
-          yield* Effect.ignore(
-            ctx.acp.cancel.pipe(
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
-              ),
+      Effect.gen(function* () {
+        const ctx = yield* requireSession(threadId);
+        yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
+        yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
+        yield* Effect.ignore(
+          ctx.acp.cancel.pipe(
+            Effect.mapError((error) =>
+              mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
             ),
-          );
-        }),
-      );
+          ),
+        );
+      });
 
     const respondToRequest: CursorAdapterShape["respondToRequest"] = (
       threadId,
@@ -1233,13 +1091,6 @@ export function makeCursorAdapter(
             provider: PROVIDER,
             method: "session/request_permission",
             detail: `Unknown pending approval request: ${requestId}`,
-          });
-        }
-        if (!pending.supportedDecisions.includes(decision)) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "respondToRequest",
-            issue: `Approval decision '${decision}' is not supported by request '${requestId}'.`,
           });
         }
         yield* Deferred.succeed(pending.decision, decision);
@@ -1266,6 +1117,21 @@ export function makeCursorAdapter(
     const readThread: CursorAdapterShape["readThread"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        return { threadId, turns: ctx.turns };
+      });
+
+    const rollbackThread: CursorAdapterShape["rollbackThread"] = (threadId, numTurns) =>
+      Effect.gen(function* () {
+        const ctx = yield* requireSession(threadId);
+        if (!Number.isInteger(numTurns) || numTurns < 1) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "rollbackThread",
+            issue: "numTurns must be an integer >= 1.",
+          });
+        }
+        const nextLength = Math.max(0, ctx.turns.length - numTurns);
+        ctx.turns.splice(nextLength);
         return { threadId, turns: ctx.turns };
       });
 
@@ -1304,14 +1170,12 @@ export function makeCursorAdapter(
 
     return {
       provider: PROVIDER,
-      capabilities: {
-        sessionModelSwitch: "in-session",
-        conversationRollback: "unsupported",
-      },
+      capabilities: { sessionModelSwitch: "in-session" },
       startSession,
       sendTurn,
       interruptTurn,
       readThread,
+      rollbackThread,
       respondToRequest,
       respondToUserInput,
       stopSession,

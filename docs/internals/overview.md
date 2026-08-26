@@ -118,19 +118,16 @@ Each turn is bracketed by workspace checkpoints so diffs and reverts are exact. 
 captures state as hidden Git refs through the VCS driver's checkpoint operations;
 `CheckpointDiffQuery` answers turn and full-thread diff requests; `CheckpointReactor` coordinates
 baseline capture, completed-turn capture, diff projection, and reverting both the workspace and the
-provider conversation. Conversation rewind is a declared adapter capability: Codex and Droid
-currently support restart-safe rollback, while Claude, Cursor, Grok, and OpenCode reject a revert
-before persisting recovery state or changing the workspace. The storage contract is `VcsCheckpointOps` in
+provider conversation. The storage contract is `VcsCheckpointOps` in
 [`VcsDriver.ts`](../../apps/server/src/vcs/VcsDriver.ts), implemented for Git in the same directory.
 
 ## Startup
 
-[`serverRuntimeStartup.ts`][startup] runs a fixed lifecycle: start settings and parked reactor roots;
-reconcile provider sessions; wait for the HTTP listener and auxiliary roots; prepare and publish the
-welcome payload; activate parked subscribers; enqueue and fully drain persisted checkpoint-revert
-recovery; then signal command readiness (logged as `Accepting commands`) and publish ready. A socket
-can connect while startup is pending, but its commands remain behind the command gate until recovery
-has finished.
+[`serverRuntimeStartup.ts`][startup] runs a fixed lifecycle: start keybindings, settings, and
+reactors; publish welcome; signal command readiness (logged as `Accepting commands`); wait for the
+HTTP listener via `markHttpListening`; publish ready; fork the heartbeat; then either print headless
+output or open the browser. Command readiness precedes the listener, so a socket that opens can
+already dispatch.
 
 ## Related
 

@@ -12,7 +12,6 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 import {
   IsoDateTime,
   ProviderInstanceId,
-  ProviderSessionLease,
   ProviderSessionRuntimeStatus,
   RuntimeMode,
   ThreadId,
@@ -44,11 +43,6 @@ export const ProviderSessionRuntime = Schema.Struct({
    * instance id before routing.
    */
   providerInstanceId: Schema.NullOr(ProviderInstanceId),
-  /**
-   * Incarnation token for the specific live adapter session that owns the
-   * row. Rebuilding the same provider instance mints a new lease.
-   */
-  sessionLease: Schema.NullOr(ProviderSessionLease),
   adapterKey: Schema.String,
   runtimeMode: RuntimeMode,
   status: ProviderSessionRuntimeStatus,
@@ -63,26 +57,6 @@ export type GetProviderSessionRuntimeInput = typeof GetProviderSessionRuntimeInp
 
 export const DeleteProviderSessionRuntimeInput = Schema.Struct({ threadId: ThreadId });
 export type DeleteProviderSessionRuntimeInput = typeof DeleteProviderSessionRuntimeInput.Type;
-
-export const UpdateProviderSessionRuntimeResumeCursorInput = Schema.Struct({
-  threadId: ThreadId,
-  providerInstanceId: ProviderInstanceId,
-  sessionLease: ProviderSessionLease,
-  lastSeenAt: IsoDateTime,
-  resumeCursor: Schema.Unknown,
-});
-export type UpdateProviderSessionRuntimeResumeCursorInput =
-  typeof UpdateProviderSessionRuntimeResumeCursorInput.Type;
-
-export const UpdateProviderSessionRuntimePayloadInput = Schema.Struct({
-  threadId: ThreadId,
-  providerInstanceId: ProviderInstanceId,
-  sessionLease: ProviderSessionLease,
-  lastSeenAt: IsoDateTime,
-  runtimePayload: Schema.NullOr(Schema.Unknown),
-});
-export type UpdateProviderSessionRuntimePayloadInput =
-  typeof UpdateProviderSessionRuntimePayloadInput.Type;
 
 /**
  * ProviderSessionRuntimeRepository - Service tag for provider runtime persistence.
@@ -108,22 +82,6 @@ export class ProviderSessionRuntimeRepository extends Context.Service<
       Option.Option<ProviderSessionRuntime>,
       ProviderSessionRuntimeRepositoryError
     >;
-
-    /**
-     * Update the resume cursor only while the row is still owned by the
-     * expected provider instance and live session incarnation.
-     */
-    readonly updateResumeCursorIfOwned: (
-      input: UpdateProviderSessionRuntimeResumeCursorInput,
-    ) => Effect.Effect<boolean, ProviderSessionRuntimeRepositoryError>;
-
-    /**
-     * Atomically merge a runtime payload patch while the row is still owned
-     * by the expected provider instance and live session incarnation.
-     */
-    readonly updateRuntimePayloadIfOwned: (
-      input: UpdateProviderSessionRuntimePayloadInput,
-    ) => Effect.Effect<boolean, ProviderSessionRuntimeRepositoryError>;
 
     /**
      * List all provider runtime rows.
@@ -155,7 +113,6 @@ const ProviderSessionRuntimeRawDbRowSchema = Schema.Struct({
   threadId: Schema.String,
   providerName: Schema.Unknown,
   providerInstanceId: Schema.Unknown,
-  sessionLease: Schema.Unknown,
   adapterKey: Schema.Unknown,
   runtimeMode: Schema.Unknown,
   status: Schema.Unknown,
@@ -171,16 +128,6 @@ const GetRuntimeRequestSchema = Schema.Struct({
 });
 
 const DeleteRuntimeRequestSchema = GetRuntimeRequestSchema;
-const UpdateResumeCursorRequestSchema = UpdateProviderSessionRuntimeResumeCursorInput.mapFields(
-  Struct.assign({
-    resumeCursor: Schema.fromJsonString(Schema.Unknown),
-  }),
-);
-const UpdateRuntimePayloadRequestSchema = UpdateProviderSessionRuntimePayloadInput.mapFields(
-  Struct.assign({
-    runtimePayload: Schema.NullOr(Schema.fromJsonString(Schema.Unknown)),
-  }),
-);
 
 function toPersistenceSqlOrDecodeError(
   sqlOperation: string,
@@ -208,7 +155,6 @@ export const make = Effect.gen(function* () {
           thread_id,
           provider_name,
           provider_instance_id,
-          session_lease,
           adapter_key,
           runtime_mode,
           status,
@@ -220,7 +166,6 @@ export const make = Effect.gen(function* () {
           ${runtime.threadId},
           ${runtime.providerName},
           ${runtime.providerInstanceId},
-          ${runtime.sessionLease},
           ${runtime.adapterKey},
           ${runtime.runtimeMode},
           ${runtime.status},
@@ -232,7 +177,6 @@ export const make = Effect.gen(function* () {
         DO UPDATE SET
           provider_name = excluded.provider_name,
           provider_instance_id = excluded.provider_instance_id,
-          session_lease = excluded.session_lease,
           adapter_key = excluded.adapter_key,
           runtime_mode = excluded.runtime_mode,
           status = excluded.status,
@@ -251,7 +195,6 @@ export const make = Effect.gen(function* () {
           thread_id AS "threadId",
           provider_name AS "providerName",
           provider_instance_id AS "providerInstanceId",
-          session_lease AS "sessionLease",
           adapter_key AS "adapterKey",
           runtime_mode AS "runtimeMode",
           status,
@@ -272,7 +215,6 @@ export const make = Effect.gen(function* () {
           thread_id AS "threadId",
           provider_name AS "providerName",
           provider_instance_id AS "providerInstanceId",
-          session_lease AS "sessionLease",
           adapter_key AS "adapterKey",
           runtime_mode AS "runtimeMode",
           status,
@@ -293,65 +235,6 @@ export const make = Effect.gen(function* () {
       `,
   });
 
-  const updateResumeCursorIfOwnedRow = SqlSchema.findAll({
-    Request: UpdateResumeCursorRequestSchema,
-    Result: Schema.Struct({ threadId: Schema.String }),
-    execute: ({ threadId, providerInstanceId, sessionLease, lastSeenAt, resumeCursor }) =>
-      sql`
-        UPDATE provider_session_runtime
-        SET
-          last_seen_at = ${lastSeenAt},
-          resume_cursor_json = ${resumeCursor}
-        WHERE thread_id = ${threadId}
-          AND provider_instance_id = ${providerInstanceId}
-          AND session_lease = ${sessionLease}
-        RETURNING thread_id AS "threadId"
-      `,
-  });
-
-  const updateRuntimePayloadIfOwnedRow = SqlSchema.findAll({
-    Request: UpdateRuntimePayloadRequestSchema,
-    Result: Schema.Struct({ threadId: Schema.String }),
-    execute: ({ threadId, providerInstanceId, sessionLease, lastSeenAt, runtimePayload }) =>
-      sql`
-        UPDATE provider_session_runtime
-        SET
-          last_seen_at = ${lastSeenAt},
-          runtime_payload_json =
-            CASE
-              WHEN json_type(runtime_payload_json) = 'object'
-                AND json_type(${runtimePayload}) = 'object'
-              THEN (
-                SELECT json_group_object(
-                  key,
-                  CASE
-                    WHEN type IN ('object', 'array') THEN json(value)
-                    WHEN type = 'true' THEN json('true')
-                    WHEN type = 'false' THEN json('false')
-                    ELSE value
-                  END
-                )
-                FROM (
-                  SELECT key, value, type
-                  FROM json_each(provider_session_runtime.runtime_payload_json)
-                  WHERE key NOT IN (
-                    SELECT key
-                    FROM json_each(${runtimePayload})
-                  )
-                  UNION ALL
-                  SELECT key, value, type
-                  FROM json_each(${runtimePayload})
-                )
-              )
-              ELSE ${runtimePayload}
-            END
-        WHERE thread_id = ${threadId}
-          AND provider_instance_id = ${providerInstanceId}
-          AND session_lease = ${sessionLease}
-        RETURNING thread_id AS "threadId"
-      `,
-  });
-
   const upsert: ProviderSessionRuntimeRepository["Service"]["upsert"] = (runtime) =>
     upsertRuntimeRow(runtime).pipe(
       Effect.mapError(
@@ -362,32 +245,6 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-
-  const updateResumeCursorIfOwned: ProviderSessionRuntimeRepository["Service"]["updateResumeCursorIfOwned"] =
-    (input) =>
-      updateResumeCursorIfOwnedRow(input).pipe(
-        Effect.mapError(
-          toPersistenceSqlOrDecodeError(
-            "ProviderSessionRuntimeRepository.updateResumeCursorIfOwned:query",
-            "ProviderSessionRuntimeRepository.updateResumeCursorIfOwned:decodeRows",
-            { threadId: input.threadId },
-          ),
-        ),
-        Effect.map((rows) => rows.length > 0),
-      );
-
-  const updateRuntimePayloadIfOwned: ProviderSessionRuntimeRepository["Service"]["updateRuntimePayloadIfOwned"] =
-    (input) =>
-      updateRuntimePayloadIfOwnedRow(input).pipe(
-        Effect.mapError(
-          toPersistenceSqlOrDecodeError(
-            "ProviderSessionRuntimeRepository.updateRuntimePayloadIfOwned:query",
-            "ProviderSessionRuntimeRepository.updateRuntimePayloadIfOwned:decodeRows",
-            { threadId: input.threadId },
-          ),
-        ),
-        Effect.map((rows) => rows.length > 0),
-      );
 
   const getByThreadId: ProviderSessionRuntimeRepository["Service"]["getByThreadId"] = (input) =>
     getRuntimeRowByThreadId(input).pipe(
@@ -468,8 +325,6 @@ export const make = Effect.gen(function* () {
   return {
     upsert,
     getByThreadId,
-    updateResumeCursorIfOwned,
-    updateRuntimePayloadIfOwned,
     list,
     deleteByThreadId,
   } satisfies ProviderSessionRuntimeRepository["Service"];

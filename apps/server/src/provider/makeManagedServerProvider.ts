@@ -31,7 +31,6 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   readonly getSettings: Effect.Effect<Settings, ServerSettingsError>;
   readonly streamSettings: Stream.Stream<Settings>;
   readonly haveSettingsChanged: (previous: Settings, next: Settings) => boolean;
-  readonly haveEnrichmentSettingsChanged?: (previous: Settings, next: Settings) => boolean;
   readonly initialSnapshot: (settings: Settings) => Effect.Effect<ServerProvider>;
   readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
   readonly enrichSnapshot?: (input: {
@@ -119,26 +118,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     const previousSettings = yield* Ref.get(settingsRef);
     if (!forceRefresh && !input.haveSettingsChanged(previousSettings, nextSettings)) {
       yield* Ref.set(settingsRef, nextSettings);
-      const enrichmentSettingsChanged =
-        input.haveEnrichmentSettingsChanged?.(previousSettings, nextSettings) === true;
-      const currentState = yield* Ref.modify(snapshotStateRef, (state) => {
-        if (!enrichmentSettingsChanged || !input.enrichSnapshot) {
-          return [state, state] as const;
-        }
-        const nextState = {
-          ...state,
-          enrichmentGeneration: state.enrichmentGeneration + 1,
-        };
-        return [nextState, nextState] as const;
-      });
-      if (enrichmentSettingsChanged) {
-        yield* restartSnapshotEnrichment(
-          nextSettings,
-          currentState.snapshot,
-          currentState.enrichmentGeneration,
-        );
-      }
-      return currentState.snapshot;
+      return yield* Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot));
     }
 
     const nextSnapshot = yield* input.checkProvider;

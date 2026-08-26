@@ -3,7 +3,6 @@ import {
   type ServerProvider,
   type ServerProviderVersionAdvisory,
 } from "@t3tools/contracts";
-import { causeErrorTag } from "@t3tools/shared/observability";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import { resolveCommandPath } from "@t3tools/shared/shell";
 import * as Config from "effect/Config";
@@ -69,6 +68,7 @@ export interface PackageManagedProviderMaintenanceDefinition {
   readonly npmPackageName: string;
   readonly homebrewFormula: string | null;
   readonly nativeUpdate: {
+    readonly executable: string | ((resolvedCommandPath: string) => string);
     readonly args: ReadonlyArray<string>;
     readonly lockKey: string;
     readonly isCommandPath: (commandPath: string) => boolean;
@@ -207,6 +207,26 @@ function makeHomebrewProviderMaintenanceCapabilities(
   });
 }
 
+function makeNativeProviderMaintenanceCapabilities(
+  definition: PackageManagedProviderMaintenanceDefinition,
+  resolvedCommandPath: string,
+): ProviderMaintenanceCapabilities | null {
+  if (!definition.nativeUpdate) {
+    return null;
+  }
+
+  return makeProviderMaintenanceCapabilities({
+    provider: definition.provider,
+    packageName: definition.npmPackageName,
+    updateExecutable:
+      typeof definition.nativeUpdate.executable === "function"
+        ? definition.nativeUpdate.executable(resolvedCommandPath)
+        : definition.nativeUpdate.executable,
+    updateArgs: definition.nativeUpdate.args,
+    updateLockKey: definition.nativeUpdate.lockKey,
+  });
+}
+
 export function hasPathSeparator(value: string): boolean {
   return value.includes("/") || value.includes("\\");
 }
@@ -276,22 +296,14 @@ export function resolvePackageManagedProviderMaintenance(
     ];
 
     const nativeUpdate = definition.nativeUpdate;
-    if (nativeUpdate) {
-      // A native self-updating binary can live outside PATH (~/.local/bin,
-      // %USERPROFILE%\bin), so the update must invoke the resolved binary
-      // itself rather than a bare command name.
-      const nativeCommandPath = commandPaths.find((commandPath) =>
-        nativeUpdate.isCommandPath(commandPath),
+    const nativeCommandPath = nativeUpdate
+      ? commandPaths.find((commandPath) => nativeUpdate.isCommandPath(commandPath))
+      : undefined;
+    if (nativeCommandPath !== undefined) {
+      return (
+        makeNativeProviderMaintenanceCapabilities(definition, nativeCommandPath) ??
+        makeNpmGlobalProviderMaintenanceCapabilities(definition)
       );
-      if (nativeCommandPath !== undefined) {
-        return makeProviderMaintenanceCapabilities({
-          provider: definition.provider,
-          packageName: definition.npmPackageName,
-          updateExecutable: nativeCommandPath,
-          updateArgs: nativeUpdate.args,
-          updateLockKey: nativeUpdate.lockKey,
-        });
-      }
     }
     if (commandPaths.some(isVitePlusGlobalCommandPath)) {
       return makeVitePlusGlobalProviderMaintenanceCapabilities(definition);
@@ -507,27 +519,4 @@ export const enrichProviderSnapshotWithVersionAdvisory = Effect.fn(
       maintenanceCapabilities: capabilities,
     }),
   };
-});
-
-export const enrichAndPublishProviderVersionAdvisory = Effect.fn(
-  "enrichAndPublishProviderVersionAdvisory",
-)(function* (input: {
-  readonly providerLabel: string;
-  readonly snapshot: ServerProvider;
-  readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
-  readonly enableProviderUpdateChecks?: boolean;
-  readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
-  readonly httpClient: HttpClient.HttpClient;
-}) {
-  yield* enrichProviderSnapshotWithVersionAdvisory(input.snapshot, input.maintenanceCapabilities, {
-    enableProviderUpdateChecks: input.enableProviderUpdateChecks,
-  }).pipe(
-    Effect.provideService(HttpClient.HttpClient, input.httpClient),
-    Effect.flatMap(input.publishSnapshot),
-    Effect.catchCause((cause) =>
-      Effect.logWarning(`${input.providerLabel} version advisory enrichment failed`, {
-        errorTag: causeErrorTag(cause),
-      }),
-    ),
-  );
 });

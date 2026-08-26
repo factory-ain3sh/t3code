@@ -21,11 +21,7 @@ import {
   ProviderUserInputAnswers,
   RuntimeMode,
 } from "./orchestration.ts";
-import {
-  ProviderInstanceId,
-  ProviderDriverKind,
-  ProviderSessionLease,
-} from "./providerInstance.ts";
+import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
 
 const ProviderSessionStatus = Schema.Literals([
   "connecting",
@@ -97,13 +93,6 @@ export type ProviderInterruptTurnInput = typeof ProviderInterruptTurnInput.Type;
 
 export const ProviderStopSessionInput = Schema.Struct({
   threadId: ThreadId,
-  /**
-   * Ownership guard: when set, the stop only proceeds if the persisted
-   * binding still carries this lease (null = stopped/unleased). Callers that
-   * decide staleness from a snapshot (the session reaper) pass it so a
-   * replacement session started after the snapshot survives the stop.
-   */
-  expectedSessionLease: Schema.optional(Schema.NullOr(ProviderSessionLease)),
 });
 export type ProviderStopSessionInput = typeof ProviderStopSessionInput.Type;
 

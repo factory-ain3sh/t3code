@@ -1,11 +1,6 @@
 import * as Option from "effect/Option";
 import * as Arr from "effect/Array";
-import {
-  approvalRequestKindFromPayload,
-  isStalePendingRequestFailureDetail,
-  reducePendingApprovals,
-  type PendingProviderApproval,
-} from "@t3tools/client-runtime/approvalRequests";
+import * as Schema from "effect/Schema";
 import { isBackgroundTaskActivity } from "@t3tools/client-runtime/state/subagentRuntime";
 import {
   ApprovalRequestId,
@@ -13,6 +8,9 @@ import {
   type OrchestrationLatestTurn,
   type OrchestrationThreadActivity,
   type OrchestrationProposedPlanId,
+  ProviderDriverKind,
+  ProviderApprovalOption,
+  ProviderRequestKind,
   type ToolLifecycleItemType,
   type UserInputQuestion,
   type ThreadId,
@@ -27,6 +25,37 @@ import type {
   ThreadSession,
   TurnDiffSummary,
 } from "./types";
+
+export type ProviderPickerKind = ProviderDriverKind;
+
+export const PROVIDER_OPTIONS: Array<{
+  value: ProviderPickerKind;
+  label: string;
+  available: boolean;
+  /** Shown on the model picker sidebar when relevant */
+  pickerSidebarBadge?: "new" | "soon";
+}> = [
+  { value: ProviderDriverKind.make("codex"), label: "Codex", available: true },
+  { value: ProviderDriverKind.make("claudeAgent"), label: "Claude", available: true },
+  {
+    value: ProviderDriverKind.make("opencode"),
+    label: "OpenCode",
+    available: true,
+    pickerSidebarBadge: "new",
+  },
+  {
+    value: ProviderDriverKind.make("cursor"),
+    label: "Cursor",
+    available: true,
+    pickerSidebarBadge: "new",
+  },
+  {
+    value: ProviderDriverKind.make("grok"),
+    label: "Grok",
+    available: true,
+    pickerSidebarBadge: "new",
+  },
+];
 
 export type WorkLogToolLifecycleStatus =
   | "inProgress"
@@ -88,7 +117,17 @@ const derivedWorkLogEntryByActivity = new WeakMap<
   DerivedWorkLogEntry
 >();
 
-export type PendingApproval = PendingProviderApproval;
+export interface PendingApproval {
+  requestId: ApprovalRequestId;
+  requestKind: ProviderRequestKind;
+  createdAt: string;
+  detail?: string;
+  appName?: string;
+  options?: ReadonlyArray<ProviderApprovalOption>;
+}
+
+const isProviderRequestKind = Schema.is(ProviderRequestKind);
+const isProviderApprovalOption = Schema.is(ProviderApprovalOption);
 
 export interface PendingUserInput {
   requestId: ApprovalRequestId;
@@ -343,11 +382,97 @@ export function deriveActiveWorkStartedAt(
   return sendStartedAt;
 }
 
+function requestKindFromRequestType(requestType: unknown): PendingApproval["requestKind"] | null {
+  switch (requestType) {
+    case "command_execution_approval":
+    case "exec_command_approval":
+    case "dynamic_tool_call":
+      return "command";
+    case "file_read_approval":
+      return "file-read";
+    case "file_change_approval":
+    case "apply_patch_approval":
+      return "file-change";
+    case "mcp_elicitation_approval":
+      return "mcp-elicitation";
+    default:
+      return null;
+  }
+}
+
+function isStalePendingRequestFailureDetail(detail: string | undefined): boolean {
+  const normalized = detail?.toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.includes("stale pending approval request") ||
+    normalized.includes("stale pending user-input request") ||
+    normalized.includes("unknown pending approval request") ||
+    normalized.includes("unknown pending permission request") ||
+    normalized.includes("unknown pending user-input request") ||
+    normalized.includes("unknown pending user input request") ||
+    normalized.includes("unknown pending codex user input request")
+  );
+}
+
 export function derivePendingApprovals(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
 ): PendingApproval[] {
+  const openByRequestId = new Map<ApprovalRequestId, PendingApproval>();
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
-  return reducePendingApprovals(ordered);
+
+  for (const activity of ordered) {
+    const payload =
+      activity.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    const requestId =
+      payload && typeof payload.requestId === "string"
+        ? ApprovalRequestId.make(payload.requestId)
+        : null;
+    const requestKind =
+      payload && isProviderRequestKind(payload.requestKind)
+        ? payload.requestKind
+        : payload
+          ? requestKindFromRequestType(payload.requestType)
+          : null;
+    const detail = payload && typeof payload.detail === "string" ? payload.detail : undefined;
+    const appName = payload && typeof payload.appName === "string" ? payload.appName : undefined;
+    const options = Array.isArray(payload?.options)
+      ? payload.options.filter(isProviderApprovalOption)
+      : undefined;
+
+    if (activity.kind === "approval.requested" && requestId && requestKind) {
+      openByRequestId.set(requestId, {
+        requestId,
+        requestKind,
+        createdAt: activity.createdAt,
+        ...(detail ? { detail } : {}),
+        ...(appName ? { appName } : {}),
+        ...(options && options.length > 0 ? { options } : {}),
+      });
+      continue;
+    }
+
+    if (activity.kind === "approval.resolved" && requestId) {
+      openByRequestId.delete(requestId);
+      continue;
+    }
+
+    if (
+      activity.kind === "provider.approval.respond.failed" &&
+      requestId &&
+      isStalePendingRequestFailureDetail(detail)
+    ) {
+      openByRequestId.delete(requestId);
+      continue;
+    }
+  }
+
+  return [...openByRequestId.values()].toSorted((left, right) =>
+    left.createdAt.localeCompare(right.createdAt),
+  );
 }
 
 function parseUserInputQuestions(
@@ -1580,7 +1705,14 @@ function extractWorkLogItemType(
 function extractWorkLogRequestKind(
   payload: Record<string, unknown> | null,
 ): WorkLogEntry["requestKind"] | undefined {
-  return approvalRequestKindFromPayload(payload) ?? undefined;
+  if (
+    payload?.requestKind === "command" ||
+    payload?.requestKind === "file-read" ||
+    payload?.requestKind === "file-change"
+  ) {
+    return payload.requestKind;
+  }
+  return requestKindFromRequestType(payload?.requestType) ?? undefined;
 }
 
 function pushChangedFile(target: string[], seen: Set<string>, value: unknown) {

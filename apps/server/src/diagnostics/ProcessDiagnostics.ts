@@ -72,7 +72,6 @@ export const make = Effect.fn("makeProcessDiagnostics")(function* () {
             rssBytes: entry.residentBytes,
             elapsed: formatElapsed(entry.runTimeMs),
             command: entry.command || entry.name || "unknown",
-            category: entry.category,
             depth: Math.max(0, entry.depth - 1),
             childPids: entry.childPids,
           }),

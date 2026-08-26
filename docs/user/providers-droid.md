@@ -61,9 +61,8 @@ output and validates the returned object. It does not scrape JSON out of assista
 
 T3 Code reads your Droid slash commands and skills when it checks the provider, so they appear in the
 composer alongside every other provider's. Custom commands keep their argument hints, and skills keep
-their descriptions and source. Factory built-ins are labeled as system skills, automations as app
-skills, and user or project skills keep their provider-owned source. Skills Droid does not let you
-invoke directly stay out of the list.
+their descriptions and provider-owned source. Skills Droid does not let you invoke directly stay out
+of the list.
 
 Commands and skills resolve on the machine running the server against the server's working
 directory, so project-local entries are discovered alongside personal ones. Add a command or skill,
@@ -106,12 +105,8 @@ turn. Droid may fold it into the current run or process it immediately afterward
 Droid sessions resume across T3 Code server restarts. Reopen the same thread and continue where you
 left off instead of starting a new Droid conversation.
 
-Checkpoint rollback remains available after a server restart. T3 Code resumes Droid before
-rewinding and continues future messages from the rewound conversation.
-
-Conversation-aware checkpoint rollback is currently supported for Codex and Droid. Claude, Cursor,
-Grok, and OpenCode do not yet expose a restart-safe rewind that T3 Code can prove, so T3 Code rejects
-checkpoint revert requests for those providers before changing provider or workspace state.
+After reopening a resumed thread, you can still request checkpoint rollback. T3 Code starts the
+Droid session as needed, rewinds it, and continues future messages from the rewound conversation.
 
 ## Early Access
 

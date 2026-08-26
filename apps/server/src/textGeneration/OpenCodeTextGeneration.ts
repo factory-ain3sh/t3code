@@ -34,7 +34,12 @@ import * as OpenCodeRuntime from "../provider/opencodeRuntime.ts";
 
 const OPENCODE_TEXT_GENERATION_IDLE_TTL = "30 seconds";
 
-const OpenCodeTextGenerationOperation = Schema.Literals(TextGeneration.TEXT_GENERATION_OPERATIONS);
+const OpenCodeTextGenerationOperation = Schema.Literals([
+  "generateCommitMessage",
+  "generatePrContent",
+  "generateBranchName",
+  "generateThreadTitle",
+]);
 
 type OpenCodeTextGenerationOperation = typeof OpenCodeTextGenerationOperation.Type;
 
@@ -244,7 +249,11 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
 
   const acquireSharedServer = (input: {
     readonly binaryPath: string;
-    readonly operation: TextGeneration.TextGenerationOperation;
+    readonly operation:
+      | "generateCommitMessage"
+      | "generatePrContent"
+      | "generateBranchName"
+      | "generateThreadTitle";
   }) =>
     sharedServerMutex.withPermit(
       Effect.gen(function* () {
@@ -570,7 +579,6 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       const { prompt, outputSchema } = buildBranchNamePrompt({
         message: input.message,
         attachments: input.attachments,
-        policy: input.policy,
       });
       const generated = yield* runOpenCodeJson({
         operation: "generateBranchName",
@@ -592,7 +600,6 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
         message: input.message,
         previousTitle: input.previousTitle,
         attachments: input.attachments,
-        policy: input.policy,
       });
       const generated = yield* runOpenCodeJson({
         operation: "generateThreadTitle",

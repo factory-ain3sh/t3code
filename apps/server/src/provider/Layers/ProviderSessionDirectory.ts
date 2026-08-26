@@ -3,18 +3,14 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectoryPersistenceError, ProviderValidationError } from "../Errors.ts";
-import { makeKeyedLock } from "../internal/keyedLock.ts";
 import {
-  CHECKPOINT_REVERT_INTENT_KEY,
   ProviderSessionDirectory,
   type ProviderRuntimeBinding,
   type ProviderRuntimeBindingWithMetadata,
-  type ProviderSessionOwnership,
   type ProviderSessionDirectoryShape,
 } from "../Services/ProviderSessionDirectory.ts";
 const decodeProviderDriverKindValue = Schema.decodeUnknownEffect(ProviderDriverKind);
@@ -61,25 +57,6 @@ function mergeRuntimePayload(
   return next;
 }
 
-// The checkpoint reactor's persisted revert intent is thread-durable recovery
-// state, not incarnation-scoped runtime state: locked recovery replaces the
-// session incarnation mid-revert, and wiping the intent with the outgoing
-// incarnation's payload would strand a rewound provider with no startup
-// replay. Ownership belongs to the binding, so the intent carries no lease
-// and survives unchanged until the reactor explicitly clears it.
-function threadDurableRuntimePayload(existing: unknown | null): Record<string, unknown> | null {
-  if (!isRecord(existing)) {
-    return null;
-  }
-  const intent = existing[CHECKPOINT_REVERT_INTENT_KEY];
-  if (!isRecord(intent)) {
-    return null;
-  }
-  return {
-    [CHECKPOINT_REVERT_INTENT_KEY]: intent,
-  };
-}
-
 function toRuntimeBinding(
   runtime: ProviderSessionRuntime.ProviderSessionRuntime,
   operation: string,
@@ -95,7 +72,6 @@ function toRuntimeBinding(
           // persistence so hot routing code never has to infer an instance
           // from a driver kind.
           providerInstanceId: runtime.providerInstanceId ?? defaultInstanceIdForDriver(provider),
-          sessionLease: runtime.sessionLease,
           adapterKey: runtime.adapterKey,
           runtimeMode: runtime.runtimeMode,
           status: runtime.status,
@@ -109,76 +85,22 @@ function toRuntimeBinding(
 
 const makeProviderSessionDirectory = Effect.gen(function* () {
   const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-  const ownershipByThread = yield* Ref.make(new Map<ThreadId, ProviderSessionOwnership | null>());
-  const writeLocks = yield* makeKeyedLock<ThreadId>();
-
-  // upsert reads the row, merges in process, and replaces the full row in a
-  // second statement, while the ownership-CAS updates commit single
-  // statements from callers that hold no lifecycle lock (live-turn cursor
-  // persistence, the reactor's intent writes). A CAS committing inside
-  // upsert's read-to-write window would be erased by the stale snapshot, so
-  // every write to a thread's row serializes on a per-thread mutex here,
-  // where the row lives, instead of relying on caller lock discipline. The
-  // CAS predicates stay: they are ownership semantics, not race guards.
-  const withThreadWriteLock = <A, E>(
-    threadId: ThreadId,
-    effect: Effect.Effect<A, E>,
-  ): Effect.Effect<A, E> => writeLocks.withLock(threadId, effect);
-
-  const setOwnership = (
-    threadId: ThreadId,
-    ownership: ProviderSessionOwnership | null | undefined,
-  ): Effect.Effect<void> =>
-    Ref.update(ownershipByThread, (current) => {
-      const next = new Map(current);
-      if (ownership === undefined) {
-        next.delete(threadId);
-      } else {
-        next.set(threadId, ownership);
-      }
-      return next;
-    });
-
-  const ownershipFromBinding = (
-    binding: ProviderRuntimeBinding,
-  ): ProviderSessionOwnership | undefined =>
-    binding.providerInstanceId === undefined
-      ? undefined
-      : {
-          providerInstanceId: binding.providerInstanceId,
-          sessionLease: binding.sessionLease ?? null,
-        };
 
   const getBinding = (threadId: ThreadId) =>
-    withThreadWriteLock(
-      threadId,
-      repository.getByThreadId({ threadId }).pipe(
-        Effect.mapError(toPersistenceError("ProviderSessionDirectory.getBinding:getByThreadId")),
-        Effect.flatMap((runtime) =>
-          Option.match(runtime, {
-            onNone: () =>
-              setOwnership(threadId, undefined).pipe(
-                Effect.as(Option.none<ProviderRuntimeBinding>()),
-              ),
-            onSome: (value) =>
-              toRuntimeBinding(value, "ProviderSessionDirectory.getBinding").pipe(
-                Effect.tap((binding) =>
-                  Ref.get(ownershipByThread).pipe(
-                    Effect.flatMap((current) =>
-                      current.has(threadId)
-                        ? Effect.void
-                        : setOwnership(threadId, ownershipFromBinding(binding)),
-                    ),
-                  ),
-                ),
-                Effect.map(Option.some),
-              ),
-          }),
-        ),
+    repository.getByThreadId({ threadId }).pipe(
+      Effect.mapError(toPersistenceError("ProviderSessionDirectory.getBinding:getByThreadId")),
+      Effect.flatMap((runtime) =>
+        Option.match(runtime, {
+          onNone: () => Effect.succeed(Option.none<ProviderRuntimeBinding>()),
+          onSome: (value) =>
+            toRuntimeBinding(value, "ProviderSessionDirectory.getBinding").pipe(
+              Effect.map((binding) => Option.some(binding)),
+            ),
+        }),
       ),
     );
 
-  const upsertUnlocked = Effect.fn(function* (binding: ProviderRuntimeBinding) {
+  const upsert: ProviderSessionDirectoryShape["upsert"] = Effect.fn(function* (binding) {
     const existing = yield* repository
       .getByThreadId({ threadId: binding.threadId })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:getByThreadId")));
@@ -203,28 +125,11 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         issue: "providerInstanceId is required for provider session runtime bindings.",
       });
     }
-    const ownerChanged =
-      providerChanged ||
-      (existingRuntime !== undefined &&
-        (existingRuntime.providerInstanceId ?? defaultInstanceIdForDriver(binding.provider)) !==
-          providerInstanceId);
-    const sessionIncarnationChanged =
-      binding.sessionLease !== undefined &&
-      binding.sessionLease !== null &&
-      existingRuntime !== undefined &&
-      existingRuntime.sessionLease !== binding.sessionLease;
-    const resolvedSessionLease =
-      binding.sessionLease !== undefined
-        ? binding.sessionLease
-        : ownerChanged
-          ? null
-          : (existingRuntime?.sessionLease ?? null);
     yield* repository
       .upsert({
         threadId: resolvedThreadId,
         providerName: binding.provider,
         providerInstanceId,
-        sessionLease: resolvedSessionLease,
         adapterKey:
           binding.adapterKey ??
           (providerChanged ? binding.provider : (existingRuntime?.adapterKey ?? binding.provider)),
@@ -234,33 +139,14 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         resumeCursor:
           binding.resumeCursor !== undefined
             ? binding.resumeCursor
-            : ownerChanged
-              ? null
-              : (existingRuntime?.resumeCursor ?? null),
+            : (existingRuntime?.resumeCursor ?? null),
         runtimePayload: mergeRuntimePayload(
-          ownerChanged
-            ? null
-            : sessionIncarnationChanged
-              ? threadDurableRuntimePayload(existingRuntime?.runtimePayload ?? null)
-              : (existingRuntime?.runtimePayload ?? null),
+          existingRuntime?.runtimePayload ?? null,
           binding.runtimePayload,
         ),
       })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
-    return {
-      providerInstanceId,
-      sessionLease: resolvedSessionLease,
-    } satisfies ProviderSessionOwnership;
   });
-
-  const upsert: ProviderSessionDirectoryShape["upsert"] = (binding) =>
-    withThreadWriteLock(
-      binding.threadId,
-      setOwnership(binding.threadId, undefined).pipe(
-        Effect.andThen(upsertUnlocked(binding)),
-        Effect.tap((ownership) => setOwnership(binding.threadId, ownership)),
-      ),
-    ).pipe(Effect.asVoid);
 
   const getProvider: ProviderSessionDirectoryShape["getProvider"] = (threadId) =>
     getBinding(threadId).pipe(
@@ -278,60 +164,6 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       ),
     );
 
-  const invalidateOwnership: ProviderSessionDirectoryShape["invalidateOwnership"] = (threadId) =>
-    withThreadWriteLock(threadId, setOwnership(threadId, null));
-
-  const matchesOwnership: ProviderSessionDirectoryShape["matchesOwnership"] = (input) =>
-    Ref.get(ownershipByThread).pipe(
-      Effect.map((current) => {
-        const ownership = current.get(input.threadId);
-        return (
-          ownership !== null &&
-          ownership?.providerInstanceId === input.providerInstanceId &&
-          ownership.sessionLease === input.sessionLease
-        );
-      }),
-    );
-
-  const updateResumeCursorIfOwned: ProviderSessionDirectoryShape["updateResumeCursorIfOwned"] = (
-    input,
-  ) =>
-    withThreadWriteLock(
-      input.threadId,
-      DateTime.now.pipe(
-        Effect.flatMap((now) =>
-          repository.updateResumeCursorIfOwned({
-            ...input,
-            lastSeenAt: DateTime.formatIso(now),
-          }),
-        ),
-        Effect.mapError(
-          toPersistenceError(
-            "ProviderSessionDirectory.updateResumeCursorIfOwned:updateResumeCursorIfOwned",
-          ),
-        ),
-      ),
-    );
-
-  const updateRuntimePayloadIfOwned: ProviderSessionDirectoryShape["updateRuntimePayloadIfOwned"] =
-    (input) =>
-      withThreadWriteLock(
-        input.threadId,
-        DateTime.now.pipe(
-          Effect.flatMap((now) =>
-            repository.updateRuntimePayloadIfOwned({
-              ...input,
-              lastSeenAt: DateTime.formatIso(now),
-            }),
-          ),
-          Effect.mapError(
-            toPersistenceError(
-              "ProviderSessionDirectory.updateRuntimePayloadIfOwned:updateRuntimePayloadIfOwned",
-            ),
-          ),
-        ),
-      );
-
   const listThreadIds: ProviderSessionDirectoryShape["listThreadIds"] = () =>
     repository.list().pipe(
       Effect.mapError(toPersistenceError("ProviderSessionDirectory.listThreadIds:list")),
@@ -348,38 +180,12 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
           { concurrency: "unbounded" },
         ),
       ),
-      Effect.tap((bindings) =>
-        Effect.forEach(
-          bindings,
-          (binding) =>
-            withThreadWriteLock(
-              binding.threadId,
-              Ref.update(ownershipByThread, (current) => {
-                if (current.has(binding.threadId)) {
-                  return current;
-                }
-                const ownership = ownershipFromBinding(binding);
-                if (ownership === undefined) {
-                  return current;
-                }
-                const next = new Map(current);
-                next.set(binding.threadId, ownership);
-                return next;
-              }),
-            ),
-          { concurrency: "unbounded", discard: true },
-        ),
-      ),
     );
 
   return {
     upsert,
     getProvider,
     getBinding,
-    invalidateOwnership,
-    matchesOwnership,
-    updateResumeCursorIfOwned,
-    updateRuntimePayloadIfOwned,
     listThreadIds,
     listBindings,
   } satisfies ProviderSessionDirectoryShape;

@@ -170,8 +170,6 @@ export class ProviderDriverError extends Schema.TaggedErrorClass<ProviderDriverE
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
-  // Keep the wrapper stable for logs and clients; the underlying failure
-  // remains available through `cause` rather than being interpolated here.
   override get message(): string {
     return `Provider driver '${this.driver}' failed to create instance '${this.instanceId}': ${this.detail}`;
   }

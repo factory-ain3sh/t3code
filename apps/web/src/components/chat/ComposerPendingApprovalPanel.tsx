@@ -1,4 +1,3 @@
-import type { ProviderRequestKind } from "@t3tools/contracts";
 import { memo } from "react";
 
 import { type PendingApproval } from "../../session-logic";
@@ -10,39 +9,35 @@ interface ComposerPendingApprovalPanelProps {
   className?: string;
 }
 
-const REQUEST_KIND_LABELS = {
-  command: {
-    fallback: "Command approval",
-    detail: "Command",
-  },
-  "file-read": {
-    fallback: "File read approval",
-    detail: "File to read",
-  },
-  "file-change": {
-    fallback: "File change approval",
-    detail: "File change",
-  },
-  plan: {
-    fallback: "Plan approval",
-    detail: "Plan",
-  },
-  "mcp-elicitation": {
-    fallback: "App access approval",
-    detail: "App access request",
-  },
-} satisfies Record<ProviderRequestKind, { fallback: string; detail: string }>;
-
 export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprovalPanel({
   approval,
   pendingCount,
   className,
 }: ComposerPendingApprovalPanelProps) {
-  const labels = REQUEST_KIND_LABELS[approval.requestKind];
+  const fallbackLabel =
+    approval.requestKind === "mcp-elicitation"
+      ? "App access approval"
+      : approval.requestKind === "command"
+        ? "Command approval"
+        : approval.requestKind === "file-read"
+          ? "File read approval"
+          : approval.requestKind === "plan"
+            ? "Plan approval"
+            : "File change approval";
+  const detailAriaLabel =
+    approval.requestKind === "mcp-elicitation"
+      ? "App access request"
+      : approval.requestKind === "command"
+        ? "Command"
+        : approval.requestKind === "file-read"
+          ? "File to read"
+          : approval.requestKind === "plan"
+            ? "Plan"
+            : "File change";
 
   return (
     <div
-      aria-label={labels.fallback}
+      aria-label={fallbackLabel}
       className={cn("flex min-w-0 flex-1 items-center gap-2", className)}
       role="group"
     >
@@ -52,12 +47,12 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
         </span>
       ) : null}
       <code
-        aria-label={labels.detail}
+        aria-label={detailAriaLabel}
         className="block max-h-20 min-w-0 flex-1 overflow-auto whitespace-pre font-mono text-[11px] text-foreground/85 [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:h-1.5"
         data-approval-detail="complete"
         tabIndex={0}
       >
-        {approval.detail || labels.fallback}
+        {approval.detail || fallbackLabel}
       </code>
       {pendingCount > 1 ? (
         <span className="shrink-0 text-[10px] font-medium text-muted-foreground tabular-nums">

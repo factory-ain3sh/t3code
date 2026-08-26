@@ -20,7 +20,6 @@ import {
   resolveLatestProviderVersion,
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "./providerMaintenance.ts";
-import { DroidProviderMaintenanceResolver } from "./Drivers/DroidDriver.ts";
 
 const driver = (value: string) => ProviderDriverKind.make(value);
 const makeTempDir = (name: string) =>
@@ -43,9 +42,21 @@ const nativePackageToolUpdate = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "@example/native-package-tool",
   homebrewFormula: "native-package-tool",
   nativeUpdate: {
+    executable: "native-package-tool",
     args: ["update"],
     lockKey: "native-package-tool-native",
     isCommandPath: isNativeTestCommandPath("/.local/bin/native-package-tool"),
+  },
+});
+const resolvedNativePackageToolUpdate = makePackageManagedProviderMaintenanceResolver({
+  provider: driver("resolvedNativePackageTool"),
+  npmPackageName: "@example/resolved-native-package-tool",
+  homebrewFormula: null,
+  nativeUpdate: {
+    executable: (commandPath) => commandPath,
+    args: ["update"],
+    lockKey: "resolved-native-package-tool-native",
+    isCommandPath: isNativeTestCommandPath("/.local/bin/resolved-native-package-tool"),
   },
 });
 const scopedPackageToolUpdate = makePackageManagedProviderMaintenanceResolver({
@@ -53,6 +64,7 @@ const scopedPackageToolUpdate = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "@example/scoped-package-tool",
   homebrewFormula: "example/tap/scoped-package-tool",
   nativeUpdate: {
+    executable: "scoped-package-tool",
     args: ["upgrade"],
     lockKey: "scoped-package-tool-native",
     isCommandPath: isNativeTestCommandPath("/.scoped-package-tool/bin/scoped-package-tool"),
@@ -356,9 +368,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           provider: driver("nativePackageTool"),
           packageName: "@example/native-package-tool",
           update: {
-            command: `${nativePackageToolPath} update`,
+            command: "native-package-tool update",
 
-            executable: nativePackageToolPath,
+            executable: "native-package-tool",
 
             args: ["update"],
 
@@ -367,6 +379,26 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         });
       }),
   );
+
+  it("can invoke a native updater through its resolved executable path", () => {
+    const resolvedCommandPath = "/home/example/.local/bin/resolved-native-package-tool";
+
+    expect(
+      resolvedNativePackageToolUpdate.resolve({
+        binaryPath: "resolved-native-package-tool",
+        resolvedCommandPath,
+      }),
+    ).toEqual({
+      provider: driver("resolvedNativePackageTool"),
+      packageName: "@example/resolved-native-package-tool",
+      update: {
+        command: `${resolvedCommandPath} update`,
+        executable: resolvedCommandPath,
+        args: ["update"],
+        lockKey: "resolved-native-package-tool-native",
+      },
+    });
+  });
 
   it.effect(
     "switches scoped-package-tool to native upgrades when the binary resolves through the standalone installer",
@@ -393,9 +425,9 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           provider: driver("scopedPackageTool"),
           packageName: "@example/scoped-package-tool",
           update: {
-            command: `${scopedPackageToolPath} upgrade`,
+            command: "scoped-package-tool upgrade",
 
-            executable: scopedPackageToolPath,
+            executable: "scoped-package-tool",
 
             args: ["upgrade"],
 
@@ -553,6 +585,7 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       npmPackageName: "@anthropic-ai/claude-code",
       homebrewFormula: "claude-code",
       nativeUpdate: {
+        executable: "claude",
         args: ["update"],
         lockKey: "claude-native",
         isCommandPath: isNativeTestCommandPath("/.local/bin/claude"),
@@ -593,90 +626,6 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       provider: driver("packageTool"),
       packageName: "@example/package-tool",
       update: null,
-    });
-  });
-
-  it.effect("routes curl-installed Droid binaries to droid's native self-update", () =>
-    Effect.gen(function* () {
-      const tempDir = yield* makeTempDir("t3-droid-native-capabilities");
-      const droidBinDir = NodePath.join(tempDir, ".local", "bin");
-      NodeFS.mkdirSync(droidBinDir, { recursive: true });
-      const droidPath = NodePath.join(droidBinDir, "droid");
-      NodeFS.writeFileSync(droidPath, "#!/bin/sh\n");
-      NodeFS.chmodSync(droidPath, 0o755);
-
-      const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
-        DroidProviderMaintenanceResolver,
-        {
-          binaryPath: "droid",
-          env: {
-            PATH: droidBinDir,
-          },
-        },
-      ).pipe(Effect.provideService(HostProcessPlatform, "darwin"));
-
-      expect(capabilities).toEqual({
-        provider: driver("droid"),
-        packageName: "@factory/cli",
-        update: {
-          command: `${droidPath} update`,
-
-          executable: droidPath,
-
-          args: ["update"],
-
-          lockKey: "droid-native",
-        },
-      });
-    }),
-  );
-
-  it("routes Windows-installed Droid binaries to droid's native self-update", () => {
-    expect(
-      DroidProviderMaintenanceResolver.resolve({
-        binaryPath: "C:\\Users\\dev\\bin\\droid.exe",
-        env: {
-          PATH: "",
-          PATHEXT: ".COM;.EXE;.BAT;.CMD",
-        },
-      }),
-    ).toEqual({
-      provider: driver("droid"),
-      packageName: "@factory/cli",
-      update: {
-        command: "C:\\Users\\dev\\bin\\droid.exe update",
-
-        executable: "C:\\Users\\dev\\bin\\droid.exe",
-
-        args: ["update"],
-
-        lockKey: "droid-native",
-      },
-    });
-  });
-
-  it("keeps npm updates for Droid binaries inside npm's global node_modules tree", () => {
-    expect(
-      DroidProviderMaintenanceResolver.resolve({
-        binaryPath:
-          "C:\\Users\\dev\\AppData\\Roaming\\npm\\node_modules\\@factory\\cli\\bin\\droid.exe",
-        env: {
-          PATH: "",
-          PATHEXT: ".COM;.EXE;.BAT;.CMD",
-        },
-      }),
-    ).toEqual({
-      provider: driver("droid"),
-      packageName: "@factory/cli",
-      update: {
-        command: "npm install -g --allow-scripts=@factory/cli @factory/cli@latest",
-
-        executable: "npm",
-
-        args: ["install", "-g", "--allow-scripts=@factory/cli", "@factory/cli@latest"],
-
-        lockKey: "npm-global",
-      },
     });
   });
 });

@@ -35,8 +35,6 @@ import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities, ProviderThreadSnapshot } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
-export type ProviderStopSessionOutcome = "stopped" | "ownership-mismatch";
-
 /**
  * ProviderServiceShape - Service API for provider session and turn orchestration.
  */
@@ -82,7 +80,7 @@ export interface ProviderServiceShape {
    */
   readonly stopSession: (
     input: ProviderStopSessionInput,
-  ) => Effect.Effect<ProviderStopSessionOutcome, ProviderServiceError>;
+  ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
    * List active provider sessions.
@@ -90,22 +88,6 @@ export interface ProviderServiceShape {
    * Aggregates runtime session lists from all registered adapters.
    */
   readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;
-
-  /**
-   * Recover the persisted provider session bound to a thread.
-   */
-  readonly recoverSession: (
-    threadId: ThreadId,
-  ) => Effect.Effect<ProviderSession, ProviderServiceError>;
-
-  /**
-   * Serialize a session lifecycle operation with start/stop replacement for
-   * the same thread.
-   */
-  readonly withSessionLifecycleLock: <A, E, R>(
-    threadId: ThreadId,
-    effect: Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E, R>;
 
   /**
    * Read capabilities for the adapter bound to a configured provider instance.
@@ -118,15 +100,7 @@ export interface ProviderServiceShape {
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderServiceError>;
 
-  /**
-   * Roll back provider conversation state to one absolute target.
-   *
-   * The caller must already hold this thread's session lifecycle lock (via
-   * `withSessionLifecycleLock`): rollback routes with `lifecycleLockHeld` and
-   * must not race start, send, stop, or recovery. The per-thread lock is not
-   * reentrant, so this method cannot acquire it itself; a call from a fiber
-   * that does not hold the lock dies.
-   */
+  /** Roll back provider conversation state to one absolute target. */
   readonly rollbackConversation: (input: {
     readonly threadId: ThreadId;
     readonly turnIds: ReadonlyArray<TurnId>;

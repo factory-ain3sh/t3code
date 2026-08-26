@@ -162,14 +162,13 @@ export function providerRequestKindFromRequestType(
 
 export const AssistantDeliveryMode = Schema.Literals(["buffered", "streaming"]);
 export type AssistantDeliveryMode = typeof AssistantDeliveryMode.Type;
-const PROVIDER_APPROVAL_DECISIONS = [
+export const ProviderApprovalDecision = Schema.Literals([
   "accept",
   "acceptForSession",
   "acceptAlways",
   "decline",
   "cancel",
-] as const;
-export const ProviderApprovalDecision = Schema.Literals(PROVIDER_APPROVAL_DECISIONS);
+]);
 export type ProviderApprovalDecision = typeof ProviderApprovalDecision.Type;
 export const ProviderApprovalOption = Schema.Struct({
   decision: ProviderApprovalDecision,

@@ -218,42 +218,6 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
     }),
   );
 
-  it.effect("logs raw outgoing payloads only after they enter the outgoing queue", () =>
-    Effect.gen(function* () {
-      const { stdio, output } = yield* makeInMemoryStdio();
-      const rawLogStarted = yield* Deferred.make<void>();
-      const releaseRawLog = yield* Deferred.make<void>();
-      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
-        stdio,
-        serverRequestMethods: new Set(),
-        logOutgoing: true,
-        logger: (event) =>
-          event.stage === "raw"
-            ? Deferred.succeed(rawLogStarted, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseRawLog)),
-              )
-            : Effect.void,
-      });
-
-      const notifyFiber = yield* transport
-        .notify("session/cancel", { sessionId: "session-1" })
-        .pipe(Effect.forkScoped);
-      yield* Deferred.await(rawLogStarted);
-
-      const outbound = yield* Queue.take(output);
-      assert.deepEqual(yield* decodeSessionCancelNotification(outbound), {
-        jsonrpc: "2.0",
-        method: "session/cancel",
-        params: {
-          sessionId: "session-1",
-        },
-      });
-
-      yield* Deferred.succeed(releaseRawLog, undefined);
-      yield* Fiber.join(notifyFiber);
-    }),
-  );
-
   it.effect("logs decode failures without copying the cause or wire payload", () =>
     Effect.gen(function* () {
       const secret = "acp-wire-secret-sentinel";

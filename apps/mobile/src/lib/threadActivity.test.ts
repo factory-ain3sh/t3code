@@ -175,6 +175,25 @@ describe("pending approvals", () => {
       },
     ]);
   });
+
+  it("removes an app access approval after a remote client rejects it", () => {
+    const requested = makeActivity({
+      id: EventId.make("approval-safari-open"),
+      kind: "approval.requested",
+      summary: "App access approval requested",
+      createdAt: "2026-08-24T00:00:00.000Z",
+      payload: { requestId: "req-safari", requestKind: "mcp-elicitation" },
+    });
+    const resolved = makeActivity({
+      id: EventId.make("approval-safari-resolved"),
+      kind: "approval.resolved",
+      summary: "Approval resolved",
+      createdAt: "2026-08-24T00:00:01.000Z",
+      payload: { requestId: "req-safari", decision: "decline" },
+    });
+
+    expect(derivePendingApprovals([requested, resolved])).toEqual([]);
+  });
 });
 
 function makeActivity(

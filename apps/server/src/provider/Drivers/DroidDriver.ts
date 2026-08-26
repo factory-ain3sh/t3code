@@ -1,4 +1,4 @@
-import { DroidSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { DroidSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -23,17 +23,16 @@ import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
   type ProviderInstance,
-  withProviderInstanceIdentity,
 } from "../ProviderDriver.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
-  enrichAndPublishProviderVersionAdvisory,
+  enrichProviderSnapshotWithVersionAdvisory,
   makePackageManagedProviderMaintenanceResolver,
   normalizeCommandPath,
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "../providerMaintenance.ts";
+import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import {
-  haveProviderSnapshotEnrichmentSettingsChanged,
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
@@ -42,6 +41,22 @@ import {
 const decodeDroidSettings = Schema.decodeSync(DroidSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("droid");
+
+const stampDroidInstance =
+  (input: {
+    readonly instanceId: ProviderInstance["instanceId"];
+    readonly displayName: string | undefined;
+    readonly accentColor: string | undefined;
+    readonly continuationGroupKey: string;
+  }) =>
+  (snapshot: ServerProviderDraft): ServerProvider => ({
+    ...snapshot,
+    instanceId: input.instanceId,
+    driver: DRIVER_KIND,
+    ...(input.displayName ? { displayName: input.displayName } : {}),
+    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
+    continuation: { groupKey: input.continuationGroupKey },
+  });
 
 /**
  * The curl installer puts droid in ~/.local/bin; the Windows PowerShell installer puts
@@ -61,6 +76,7 @@ export const DroidProviderMaintenanceResolver = makePackageManagedProviderMainte
   npmPackageName: "@factory/cli",
   homebrewFormula: null,
   nativeUpdate: {
+    executable: (commandPath) => commandPath,
     args: ["update"],
     lockKey: "droid-native",
     isCommandPath: isDroidNativeCommandPath,
@@ -100,11 +116,11 @@ export const DroidDriver: ProviderDriver<DroidSettings, DroidDriverEnv> = {
         driverKind: DRIVER_KIND,
         instanceId,
       });
-      const stampIdentity = withProviderInstanceIdentity({
+      const stampIdentity = stampDroidInstance({
         instanceId,
-        continuationIdentity,
         displayName,
         accentColor,
+        continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies DroidSettings;
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
@@ -139,19 +155,16 @@ export const DroidDriver: ProviderDriver<DroidSettings, DroidDriverEnv> = {
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-        haveEnrichmentSettingsChanged: haveProviderSnapshotEnrichmentSettingsChanged,
         initialSnapshot: (settings) =>
           buildInitialDroidProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
-          enrichAndPublishProviderVersionAdvisory({
-            providerLabel: "Droid",
-            snapshot: currentSnapshot,
-            maintenanceCapabilities,
+          enrichProviderSnapshotWithVersionAdvisory(currentSnapshot, maintenanceCapabilities, {
             enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
-            publishSnapshot,
-            httpClient,
-          }),
+          }).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+            Effect.flatMap((enrichedSnapshot) => publishSnapshot(enrichedSnapshot)),
+          ),
       }).pipe(
         Effect.mapError(
           (cause) =>

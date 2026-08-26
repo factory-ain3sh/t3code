@@ -143,19 +143,6 @@ describe("buildBranchNamePrompt", () => {
     expect(result.prompt).toContain("image/png");
     expect(result.prompt).toContain("12345 bytes");
   });
-
-  it("includes branch naming policy instructions", () => {
-    const result = buildBranchNamePrompt({
-      message: "Fix the login timeout bug",
-      policy: {
-        kind: "custom",
-        inferRepositoryConventions: false,
-        branchInstructions: "Prefix every branch with product/.",
-      },
-    });
-
-    expect(result.prompt).toContain("Prefix every branch with product/.");
-  });
 });
 
 describe("buildThreadTitlePrompt", () => {
@@ -199,19 +186,6 @@ describe("buildThreadTitlePrompt", () => {
     expect(result.prompt).toContain("thread.png");
     expect(result.prompt).toContain("image/png");
     expect(result.prompt).toContain("67890 bytes");
-  });
-
-  it("includes thread title policy instructions", () => {
-    const result = buildThreadTitlePrompt({
-      message: "Investigate reconnect regressions",
-      policy: {
-        kind: "custom",
-        inferRepositoryConventions: false,
-        threadTitleInstructions: "Use sentence case for thread titles.",
-      },
-    });
-
-    expect(result.prompt).toContain("Use sentence case for thread titles.");
   });
 
   it("regenerates from recent thread contents and identifies the previous title", () => {

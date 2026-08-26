@@ -7,40 +7,31 @@
  *
  * @module ProviderAdapter
  */
-import {
-  TrimmedNonEmptyString,
-  type ApprovalRequestId,
-  type ProviderApprovalDecision,
-  type ProviderDriverKind,
-  type ProviderUserInputAnswers,
-  type ProviderRuntimeEvent,
-  type ProviderSendTurnInput,
-  type ProviderSession,
-  type ProviderSessionLease,
-  type ProviderSessionStartInput,
-  type ProviderUploadFeedbackInput,
-  type ProviderUploadFeedbackResult,
-  type ThreadId,
-  type ProviderTurnStartResult,
-  type TurnId,
+import type {
+  ApprovalRequestId,
+  ProviderApprovalDecision,
+  ProviderDriverKind,
+  ProviderUserInputAnswers,
+  ProviderRuntimeEvent,
+  ProviderSendTurnInput,
+  ProviderSession,
+  ProviderSessionStartInput,
+  ProviderUploadFeedbackInput,
+  ProviderUploadFeedbackResult,
+  ThreadId,
+  ProviderTurnStartResult,
+  TurnId,
 } from "@t3tools/contracts";
-import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
-import * as Schema from "effect/Schema";
+import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
-import { ProviderAdapterSessionNotFoundError } from "../Errors.ts";
-
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
-export type ProviderConversationRollbackMode = "supported" | "unsupported";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
-  /** Declares whether rollback survives provider session restart/resume. */
-  readonly conversationRollback: ProviderConversationRollbackMode;
 }
 
 export interface ProviderThreadTurnSnapshot {
@@ -54,23 +45,16 @@ export interface ProviderThreadSnapshot {
   readonly resumeCursor?: unknown;
 }
 
-export interface ProviderThreadRollbackTarget {
+interface ProviderThreadRollbackTarget {
   readonly turnIds: ReadonlyArray<TurnId>;
   readonly anchorTurnId?: TurnId;
-}
-
-export function rollbackTargetMatchesTurnPrefix(
-  turns: ReadonlyArray<Pick<ProviderThreadTurnSnapshot, "id">>,
-  target: ProviderThreadRollbackTarget,
-): boolean {
-  return target.turnIds.every((turnId, index) => turns[index]?.id === turnId);
 }
 
 export function rollbackTargetMatchesKnownHistory(
   turns: ReadonlyArray<Pick<ProviderThreadTurnSnapshot, "id">>,
   target: ProviderThreadRollbackTarget,
 ): boolean {
-  if (!rollbackTargetMatchesTurnPrefix(turns, target)) {
+  if (!target.turnIds.every((turnId, index) => turns[index]?.id === turnId)) {
     return false;
   }
   if (target.anchorTurnId === undefined) {
@@ -81,36 +65,6 @@ export function rollbackTargetMatchesKnownHistory(
   }
   return turns[target.turnIds.length]?.id === target.anchorTurnId;
 }
-
-export function parseVersionedSessionResumeCursor(
-  raw: unknown,
-  schemaVersion: number,
-): string | undefined {
-  const decode = Schema.decodeUnknownOption(
-    Schema.Struct({
-      schemaVersion: Schema.Literal(schemaVersion),
-      sessionId: TrimmedNonEmptyString,
-    }),
-  );
-  return Option.getOrUndefined(Option.map(decode(raw), (cursor) => cursor.sessionId));
-}
-
-export type ProviderAdapterSession = ProviderSession & {
-  readonly sessionLease: ProviderSessionLease;
-};
-
-export const makeRequireActiveProviderSession = <Session extends { readonly stopped: boolean }>(
-  sessions: ReadonlyMap<ThreadId, Session>,
-  provider: ProviderDriverKind,
-) => {
-  return (threadId: ThreadId): Effect.Effect<Session, ProviderAdapterSessionNotFoundError> =>
-    Effect.suspend(() => {
-      const session = sessions.get(threadId);
-      return session === undefined || session.stopped
-        ? Effect.fail(new ProviderAdapterSessionNotFoundError({ provider, threadId }))
-        : Effect.succeed(session);
-    });
-};
 
 export interface ProviderAdapterShape<TError> {
   /**
@@ -124,7 +78,7 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly startSession: (
     input: ProviderSessionStartInput,
-  ) => Effect.Effect<ProviderAdapterSession, TError>;
+  ) => Effect.Effect<ProviderSession, TError>;
 
   /**
    * Send a turn to an active provider session.
@@ -164,7 +118,7 @@ export interface ProviderAdapterShape<TError> {
   /**
    * List currently active provider sessions for this adapter.
    */
-  readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderAdapterSession>>;
+  readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;
 
   /**
    * Check whether this adapter owns an active session id.
@@ -176,12 +130,10 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
 
-  /**
-   * Roll back a provider thread to one absolute target.
-   */
-  readonly rollbackThread?: (
+  /** Roll back a provider thread by N turns. */
+  readonly rollbackThread: (
     threadId: ThreadId,
-    target: ProviderThreadRollbackTarget,
+    numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
 
   /**

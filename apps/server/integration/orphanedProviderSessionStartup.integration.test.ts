@@ -25,7 +25,6 @@ import * as ServerConfig from "../src/config.ts";
 import * as ServerEnvironment from "../src/environment/ServerEnvironment.ts";
 import * as Keybindings from "../src/keybindings.ts";
 import { OrchestrationLayerLive } from "../src/orchestration/runtimeLayer.ts";
-import * as CheckpointReactor from "../src/orchestration/Services/CheckpointReactor.ts";
 import * as OrchestrationEngine from "../src/orchestration/Services/OrchestrationEngine.ts";
 import * as OrchestrationReactor from "../src/orchestration/Services/OrchestrationReactor.ts";
 import * as ProjectionSnapshotQuery from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -41,8 +40,6 @@ import * as ServerLifecycleEvents from "../src/serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "../src/serverRuntimeStartup.ts";
 import * as ServerSettings from "../src/serverSettings.ts";
 import * as AnalyticsService from "../src/telemetry/AnalyticsService.ts";
-
-const startupSequence: Array<string> = [];
 
 const providerInstanceId = ProviderInstanceId.make("codex");
 const projectId = ProjectId.make("project-startup-orphan");
@@ -74,14 +71,6 @@ const startupDependencies = Layer.mergeAll(
   ServerSettings.layerTest(),
   Layer.succeed(OrchestrationReactor.OrchestrationReactor, {
     start: () => Effect.void,
-  }),
-  Layer.succeed(CheckpointReactor.CheckpointReactor, {
-    start: () => Effect.void,
-    recoverPersistedIntents: () =>
-      Effect.sync(() => {
-        startupSequence.push("checkpoints.recover");
-      }),
-    drain: Effect.void,
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
     start: () => Effect.void,
@@ -124,8 +113,6 @@ const startupDependencies = Layer.mergeAll(
     respondToUserInput: () => Effect.die("unused"),
     stopSession: () => Effect.die("unused"),
     listSessions: () => Effect.succeed([]),
-    recoverSession: () => Effect.die("unused"),
-    withSessionLifecycleLock: (_threadId, effect) => effect,
     getCapabilities: () => Effect.die("unused"),
     getInstanceInfo: () => Effect.die("unused"),
     rollbackConversation: () => Effect.die("unused"),
@@ -263,11 +250,10 @@ it.effect(
       }).pipe(Effect.provide(firstRuntime));
 
       const secondRuntime = makePersistedRuntimeLayer(config.dbPath);
-      const startupLayer = ServerRuntimeStartup.layerWithOptions({
-        activate: Effect.sync(() => {
-          startupSequence.push("activate");
-        }),
-      }).pipe(Layer.provideMerge(secondRuntime), Layer.provideMerge(startupDependencies));
+      const startupLayer = ServerRuntimeStartup.layer.pipe(
+        Layer.provideMerge(secondRuntime),
+        Layer.provideMerge(startupDependencies),
+      );
 
       const result = yield* Effect.gen(function* () {
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
@@ -341,7 +327,6 @@ it.effect(
           stoppedBindingStatus: stoppedBinding.status,
           stoppedBindingResumeCursor: stoppedBinding.resumeCursor,
           stoppedBindingRuntimePayload: stoppedBinding.runtimePayload,
-          startupSequence: [...startupSequence],
         };
       }).pipe(Effect.provide(startupLayer));
 
@@ -363,11 +348,6 @@ it.effect(
           activeTurnId: null,
           unrelated: "also-preserve-me",
         },
-        // Recovery must run after activation, so the provider-runtime events
-        // its replay emits reach ingestion subscriptions that fork parked at
-        // the activation boundary instead of vanishing into an unsubscribed
-        // PubSub.
-        startupSequence: ["activate", "checkpoints.recover"],
       });
     }).pipe(
       Effect.provide(

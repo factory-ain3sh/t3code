@@ -12,7 +12,7 @@
  *
  * @module provider/Drivers/ClaudeDriver
  */
-import { ClaudeSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { ClaudeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
@@ -40,8 +40,8 @@ import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
   type ProviderInstance,
-  withProviderInstanceIdentity,
 } from "../ProviderDriver.ts";
+import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
   enrichProviderSnapshotWithVersionAdvisory,
@@ -50,7 +50,6 @@ import {
   resolveProviderMaintenanceCapabilitiesEffect,
 } from "../providerMaintenance.ts";
 import {
-  haveProviderSnapshotEnrichmentSettingsChanged,
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
@@ -75,6 +74,7 @@ const UPDATE = makePackageManagedProviderMaintenanceResolver({
   npmPackageName: "@anthropic-ai/claude-code",
   homebrewFormula: "claude-code",
   nativeUpdate: {
+    executable: "claude",
     args: ["update"],
     lockKey: "claude-native",
     isCommandPath: isClaudeNativeCommandPath,
@@ -91,6 +91,22 @@ export type ClaudeDriverEnv =
   | ProviderEventLoggers
   | ServerConfig
   | ServerSettingsService;
+
+const withInstanceIdentity =
+  (input: {
+    readonly instanceId: ProviderInstance["instanceId"];
+    readonly displayName: string | undefined;
+    readonly accentColor: string | undefined;
+    readonly continuationGroupKey: string;
+  }) =>
+  (snapshot: ServerProviderDraft): ServerProvider => ({
+    ...snapshot,
+    instanceId: input.instanceId,
+    driver: DRIVER_KIND,
+    ...(input.displayName ? { displayName: input.displayName } : {}),
+    ...(input.accentColor ? { accentColor: input.accentColor } : {}),
+    continuation: { groupKey: input.continuationGroupKey },
+  });
 
 export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
   driverKind: DRIVER_KIND,
@@ -120,15 +136,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         env: processEnv,
       });
       const continuationGroupKey = yield* makeClaudeContinuationGroupKey(effectiveConfig);
-      const continuationIdentity = {
-        ...fallbackContinuationIdentity,
-        continuationKey: continuationGroupKey,
-      };
-      const stampIdentity = withProviderInstanceIdentity({
+      const stampIdentity = withInstanceIdentity({
         instanceId,
-        continuationIdentity,
         displayName,
         accentColor,
+        continuationGroupKey,
       });
 
       const adapterOptions = {
@@ -169,7 +181,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-        haveEnrichmentSettingsChanged: haveProviderSnapshotEnrichmentSettingsChanged,
         initialSnapshot: (settings) =>
           makePendingClaudeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,
@@ -186,7 +197,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: "Failed to build Claude snapshot.",
+              detail: `Failed to build Claude snapshot: ${cause.message ?? String(cause)}`,
               cause,
             }),
         ),
@@ -195,7 +206,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       return {
         instanceId,
         driverKind: DRIVER_KIND,
-        continuationIdentity,
+        continuationIdentity: {
+          ...fallbackContinuationIdentity,
+          continuationKey: continuationGroupKey,
+        },
         displayName,
         accentColor,
         enabled,

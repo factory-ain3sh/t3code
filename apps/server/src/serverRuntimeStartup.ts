@@ -29,7 +29,6 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationReactor from "./orchestration/Services/OrchestrationReactor.ts";
-import * as CheckpointReactor from "./orchestration/Services/CheckpointReactor.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -388,7 +387,6 @@ export const make = (options?: StartupOptions) =>
     const serverConfig = yield* ServerConfig.ServerConfig;
     const keybindings = yield* Keybindings.Keybindings;
     const orchestrationReactor = yield* OrchestrationReactor.OrchestrationReactor;
-    const checkpointReactor = yield* CheckpointReactor.CheckpointReactor;
     const providerSessionReaper = yield* ProviderSessionReaper.ProviderSessionReaper;
     const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -532,13 +530,6 @@ export const make = (options?: StartupOptions) =>
         }),
       );
       yield* options?.activate ?? Effect.void;
-
-      // Sequenced after provider-sessions.reconcile so the replay's fresh
-      // leases cannot be stomped by the orphan sweep's stale liveness
-      // snapshot, and after activation so the provider-runtime events the
-      // replay emits reach ingestion subscriptions instead of publishing into
-      // a PubSub whose subscribers are still parked.
-      yield* runStartupPhase("checkpoints.recover", checkpointReactor.recoverPersistedIntents());
 
       yield* Effect.logDebug("Accepting commands");
       yield* commandGate.signalCommandReady;

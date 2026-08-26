@@ -13,11 +13,7 @@ import {
   TrimmedNonEmptyString,
   TurnId,
 } from "./baseSchemas.ts";
-import {
-  ProviderInstanceId,
-  ProviderDriverKind,
-  ProviderSessionLease,
-} from "./providerInstance.ts";
+import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
 import { ProviderApprovalOption } from "./orchestration.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
@@ -263,7 +259,6 @@ const ProviderRuntimeEventBase = Schema.Struct({
   // for the routing-key-vs-driver-id distinction. Once every emitter
   // populates it (post-slice-4), routing flips to instance-id-only.
   providerInstanceId: Schema.optional(ProviderInstanceId),
-  sessionLease: ProviderSessionLease,
   threadId: ThreadId,
   createdAt: IsoDateTime,
   turnId: Schema.optional(TurnId),
@@ -376,9 +371,8 @@ const TurnCompletedPayload = Schema.Struct({
   state: RuntimeTurnState,
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   /**
-   * The provider's resume cursor as of this completion. Every adapter emits
-   * it when a cursor exists, including adapters whose cursor is static for
-   * the session; ingestion persists it under the event's session lease.
+   * The provider's resume cursor as of this completion. Adapters emit it when
+   * the provider advances durable conversation identity.
    */
   resumeCursor: Schema.optional(Schema.Unknown),
   usage: Schema.optional(Schema.Unknown),
