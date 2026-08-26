@@ -975,53 +975,36 @@ export const makeDroidRpcProtocol = (
       backlogState: Ref.Ref<LosslessBacklogState>,
       backlogMutex: Semaphore.Semaphore,
     ) => {
-      const takeDeliveries: Effect.Effect<
-        Arr.NonEmptyReadonlyArray<QueuedDelivery<A>>,
-        Cause.Done<void>
-      > = Effect.suspend(() =>
+      const takeDelivery: Effect.Effect<QueuedDelivery<A>, Cause.Done<void>> = Effect.suspend(() =>
         Queue.peek(queue).pipe(
           Effect.andThen(
             backlogMutex.withPermits(1)(
               Effect.uninterruptible(
-                Queue.clear(queue).pipe(
-                  Effect.flatMap((deliveries) => {
-                    const first = deliveries[0];
-                    if (first === undefined) {
-                      return Effect.succeed(
-                        Option.none<Arr.NonEmptyReadonlyArray<QueuedDelivery<A>>>(),
-                      );
-                    }
-                    const batch: Arr.NonEmptyArray<QueuedDelivery<A>> = [
-                      first,
-                      ...deliveries.slice(1),
-                    ];
-                    const releasedBytes = batch.reduce(
-                      (total, delivery) => total + delivery.encodedBytes,
-                      0,
-                    );
-                    return Ref.update(backlogState, (current) => ({
-                      items: Math.max(0, current.items - batch.length),
-                      bytes: Math.max(0, current.bytes - releasedBytes),
-                    })).pipe(Effect.as(Option.some(batch)));
-                  }),
+                Queue.poll(queue).pipe(
+                  Effect.flatMap(
+                    Option.match({
+                      onNone: () => Effect.succeed(Option.none<QueuedDelivery<A>>()),
+                      onSome: (delivery) =>
+                        Ref.update(backlogState, (current) => ({
+                          items: Math.max(0, current.items - 1),
+                          bytes: Math.max(0, current.bytes - delivery.encodedBytes),
+                        })).pipe(Effect.as(Option.some(delivery))),
+                    }),
+                  ),
                 ),
               ),
             ),
           ),
           Effect.flatMap(
             Option.match({
-              onNone: () => takeDeliveries,
+              onNone: () => takeDelivery,
               onSome: Effect.succeed,
             }),
           ),
         ),
       );
       return Stream.fromPull(
-        Effect.succeed(
-          takeDeliveries.pipe(
-            Effect.map((deliveries) => Arr.map(deliveries, (item) => item.value)),
-          ),
-        ),
+        Effect.succeed(takeDelivery.pipe(Effect.map((delivery) => Arr.of(delivery.value)))),
       );
     };
 

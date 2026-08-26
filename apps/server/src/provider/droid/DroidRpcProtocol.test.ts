@@ -361,6 +361,25 @@ describe("DroidRpcProtocol", () => {
     }),
   );
 
+  it.effect("keeps prefetched lossless deliveries inside the backlog limit", () =>
+    Effect.gen(function* () {
+      const protocol = yield* makeDroidRpcProtocol({ maxBacklogItems: 2 });
+      const frames = ["first", "second", "third", "fourth"].map((id) =>
+        notification(assistantDelta(id, "x")),
+      );
+
+      yield* protocol.acceptChunk(`${frames[0]}\n${frames[1]}\n`);
+      assert.equal((yield* take(protocol.notifications)).notification.type, "assistant_text_delta");
+      yield* protocol.acceptChunk(`${frames[2]}\n`);
+
+      const overflow = yield* Effect.result(protocol.acceptChunk(`${frames[3]}\n`));
+      assert.equal(overflow._tag, "Failure");
+      if (overflow._tag === "Failure") {
+        assert.equal(overflow.failure.kind, "backlog-overflow");
+      }
+    }),
+  );
+
   it.effect("bounds UTF-8 remainders and outbound encoded frames", () =>
     Effect.gen(function* () {
       const inbound = yield* makeDroidRpcProtocol({ maxMessageBytes: 8 });
