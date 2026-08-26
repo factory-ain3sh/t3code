@@ -69,6 +69,7 @@ import {
   type DroidRpcClient,
   type DroidServerRequest,
 } from "../droid/DroidRpcClient.ts";
+import { logDroidError, logDroidWarning } from "../droid/DroidDiagnostics.ts";
 import { type DroidAdapterShape } from "../Services/DroidAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
@@ -644,10 +645,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
         );
       }).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("Failed to write native Droid notification log.", {
+          logDroidWarning("Failed to write native Droid notification log.", {
             cause,
-            threadId,
-            method,
+            details: { threadId, method },
           }),
         ),
       );
@@ -1604,9 +1604,9 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
       // approvals and user-input prompts cannot grow without bound.
       return handler.pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("Droid server request handling failed.", {
+          logDroidWarning("Droid server request handling failed.", {
             cause,
-            method: request.method,
+            details: { method: request.method },
           }).pipe(
             Effect.andThen(
               request.fail(-32603, "t3-code failed to process the request.").pipe(Effect.ignore),
@@ -2002,8 +2002,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
               }),
             ),
           ).pipe(
-            Effect.catch((cause) =>
-              Effect.logError("Failed to process Droid runtime notification.", { cause }),
+            Effect.catch((error) =>
+              logDroidError("Failed to process Droid runtime notification.", { error }),
             ),
             // Fork into the session scope, not the calling fiber: children of
             // startSession are interrupted when it returns (see the Grok
@@ -2066,8 +2066,8 @@ export function makeDroidAdapter(droidSettings: DroidSettings, options?: DroidAd
                 }),
               ),
             ),
-            Effect.catch((cause) =>
-              Effect.logError("Failed to process Droid process exit.", { cause }),
+            Effect.catch((error) =>
+              logDroidError("Failed to process Droid process exit.", { error }),
             ),
             Effect.forkIn(ctx.scope),
           );

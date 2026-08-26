@@ -741,12 +741,16 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    const targetCheckpoint =
+      event.payload.turnCount === 0
+        ? undefined
+        : orderedCheckpoints.find(
+            (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
+          );
     const targetCheckpointRef =
       event.payload.turnCount === 0
         ? checkpointRefForThreadTurn(event.payload.threadId, 0)
-        : orderedCheckpoints.find(
-            (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
-          )?.checkpointRef;
+        : targetCheckpoint?.checkpointRef;
 
     if (!targetCheckpointRef) {
       yield* appendRevertFailureActivity({
@@ -758,23 +762,10 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const retainedTurnIds = orderedCheckpoints
-      .filter((checkpoint) => checkpoint.checkpointTurnCount <= event.payload.turnCount)
-      .map((checkpoint) => checkpoint.turnId);
-    const firstStaleTurnId = orderedCheckpoints.find(
-      (checkpoint) => checkpoint.checkpointTurnCount > event.payload.turnCount,
-    )?.turnId;
-    const rollbackTarget =
-      firstStaleTurnId === undefined
-        ? undefined
-        : {
-            threadId: sessionRuntime.value.threadId,
-            turnIds: retainedTurnIds,
-            anchorTurnId: firstStaleTurnId,
-          };
-    if (rollbackTarget !== undefined) {
-      yield* providerService.validateConversationRollback(rollbackTarget);
-    }
+    const rollbackTarget = yield* providerService.prepareConversationRollback({
+      threadId: sessionRuntime.value.threadId,
+      ...(targetCheckpoint === undefined ? {} : { retainedThroughTurnId: targetCheckpoint.turnId }),
+    });
 
     const restored = yield* checkpointStore.restoreCheckpoint({
       cwd: sessionRuntime.value.cwd,
@@ -795,7 +786,7 @@ const make = Effect.gen(function* () {
     // reflects the reverted filesystem state.
     yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
 
-    if (rollbackTarget !== undefined) {
+    if (rollbackTarget.anchorTurnId !== undefined) {
       yield* providerService.rollbackConversation(rollbackTarget);
     }
 

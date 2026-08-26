@@ -5,7 +5,6 @@ import {
   type ModelCapabilities,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import { causeErrorTag } from "@t3tools/shared/observability";
 import { createModelCapabilities, trimOrNull } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as DateTime from "effect/DateTime";
@@ -26,6 +25,7 @@ import {
   type DroidModelInfo,
   type DroidSkillInfo,
 } from "../droid/DroidProtocol.ts";
+import { logDroidWarning } from "../droid/DroidDiagnostics.ts";
 import { makeDroidExecRpcClient } from "../droid/DroidRpcClient.ts";
 import {
   buildSelectOptionDescriptor,
@@ -245,8 +245,8 @@ const discoverDroidInventory = (
         Effect.exit,
       );
       if (Exit.isFailure(exit)) {
-        yield* Effect.logWarning(`Droid ${label} inventory discovery failed.`, {
-          errorTag: causeErrorTag(exit.cause),
+        yield* logDroidWarning(`Droid ${label} inventory discovery failed.`, {
+          cause: exit.cause,
         });
         return { value: undefined, warning };
       }
@@ -372,9 +372,7 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
 
   if (Result.isFailure(versionResult)) {
     const error = versionResult.failure;
-    yield* Effect.logWarning("Droid CLI health check failed.", {
-      errorTag: error._tag,
-    });
+    yield* logDroidWarning("Droid CLI health check failed.", { error });
     const missing = isCommandMissingCause(error);
     return errorSnapshot(
       missing
@@ -406,8 +404,8 @@ export const checkDroidProviderStatus = Effect.fn("checkDroidProviderStatus")(fu
   const inventory = Exit.isSuccess(discoveryExit) ? discoveryExit.value : undefined;
   let inventoryWarnings: ReadonlyArray<string> = inventory?.warnings ?? [];
   if (Exit.isFailure(discoveryExit)) {
-    yield* Effect.logWarning("Droid inventory discovery failed.", {
-      errorTag: causeErrorTag(discoveryExit.cause),
+    yield* logDroidWarning("Droid inventory discovery failed.", {
+      cause: discoveryExit.cause,
     });
     inventoryWarnings = [
       "Droid inventory discovery failed. Using fallback models; slash commands and skills are unavailable.",

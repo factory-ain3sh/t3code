@@ -1036,6 +1036,39 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("derives rollback targets from complete provider history", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const session = yield* provider.startSession(asThreadId("thread-rollback-prepare"), {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-rollback-prepare"),
+        runtimeMode: "full-access",
+      });
+      routing.codex.readThread.mockReturnValueOnce(
+        Effect.succeed({
+          threadId: session.threadId,
+          turns: [
+            { id: asTurnId("turn-without-checkpoint"), items: [] },
+            { id: asTurnId("turn-with-checkpoint"), items: [] },
+            { id: asTurnId("turn-after-checkpoint"), items: [] },
+          ],
+        }),
+      );
+
+      const target = yield* provider.prepareConversationRollback({
+        threadId: session.threadId,
+        retainedThroughTurnId: asTurnId("turn-with-checkpoint"),
+      });
+
+      assert.deepStrictEqual(target, {
+        threadId: session.threadId,
+        turnIds: [asTurnId("turn-without-checkpoint"), asTurnId("turn-with-checkpoint")],
+        anchorTurnId: asTurnId("turn-after-checkpoint"),
+      });
+    }),
+  );
+
   it.effect("routes feedback to the Codex adapter and returns its feedback ID", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

@@ -11,8 +11,6 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
-import { errorTag } from "@t3tools/shared/observability";
-
 import {
   DroidAskUserRequest,
   DroidPermissionRequest,
@@ -22,6 +20,7 @@ import {
   type DroidPermissionRequest as DroidPermissionRequestType,
   type DroidSessionNotification as DroidSessionNotificationType,
 } from "./DroidProtocol.ts";
+import { logDroidWarning } from "./DroidDiagnostics.ts";
 
 export const DROID_SESSION_REQUEST_TIMEOUT_MS = 75_000;
 export const DROID_SERVER_REQUEST_CONCURRENCY = 16;
@@ -35,7 +34,6 @@ const losslessBacklogHardLimitBytes = maxJsonRpcMessageBytes;
 const factoryApiVersion = "1.0.0";
 const factoryProtocolVersion = "1.187.0";
 const timedOutRequestRetentionLimit = 256;
-const diagnosticTextLimit = 2000;
 const outgoingQueueCapacity = 2;
 const notificationQueueCapacity = 64;
 const lossyNotificationQueueLimit = notificationQueueCapacity - 1;
@@ -257,18 +255,6 @@ const decodeNotification = Schema.decodeUnknownEffect(DroidSessionNotification);
 const decodePermissionRequest = Schema.decodeUnknownEffect(DroidPermissionRequest);
 const decodeAskUserRequest = Schema.decodeUnknownEffect(DroidAskUserRequest);
 const encodeJsonRpcMessage = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
-
-const publishDiagnostic = (
-  message: string,
-  options?: {
-    readonly lineBytes?: number;
-    readonly cause?: unknown;
-  },
-) =>
-  Effect.logWarning(message.slice(0, diagnosticTextLimit), {
-    ...(options?.lineBytes === undefined ? {} : { lineBytes: options.lineBytes }),
-    ...(options?.cause === undefined ? {} : { errorTag: errorTag(options.cause) }),
-  });
 
 function markRequestTimedOut(
   pending: ReadonlyMap<string, RequestState>,
@@ -532,7 +518,7 @@ export const makeDroidRpcProtocol = (
           });
         }
         if (backlog === warningCount) {
-          yield* publishDiagnostic(
+          yield* logDroidWarning(
             `Droid ${queueName} backlog exceeded ${warningCount}; the consumer is falling behind`,
           );
         }
@@ -556,7 +542,7 @@ export const makeDroidRpcProtocol = (
           return [found, { ...state, pending: next }] as const;
         });
         if (!requestState) {
-          yield* publishDiagnostic(`Ignoring response for unknown Droid request ${requestId}`);
+          yield* logDroidWarning(`Ignoring response for unknown Droid request ${requestId}`);
           return;
         }
         if (requestState._tag === "TimedOut") {
@@ -565,7 +551,7 @@ export const makeDroidRpcProtocol = (
             method: requestState.method,
             requestId,
           });
-          yield* publishDiagnostic(error.message, { cause: error });
+          yield* logDroidWarning(error.message, { error });
           return;
         }
         if ("error" in message) {
@@ -594,8 +580,8 @@ export const makeDroidRpcProtocol = (
         if (message.method === "droid.request_permission") {
           const decoded = yield* decodePermissionRequest(message.params).pipe(Effect.result);
           if (decoded._tag === "Failure") {
-            yield* publishDiagnostic("Unable to decode droid.request_permission params", {
-              cause: decoded.failure,
+            yield* logDroidWarning("Unable to decode droid.request_permission params", {
+              error: decoded.failure,
             });
             yield* sendResponse(message.id, {
               _tag: "Failure",
@@ -630,8 +616,8 @@ export const makeDroidRpcProtocol = (
         if (message.method === "droid.ask_user") {
           const decoded = yield* decodeAskUserRequest(message.params).pipe(Effect.result);
           if (decoded._tag === "Failure") {
-            yield* publishDiagnostic("Unable to decode droid.ask_user params", {
-              cause: decoded.failure,
+            yield* logDroidWarning("Unable to decode droid.ask_user params", {
+              error: decoded.failure,
             });
             yield* sendResponse(message.id, {
               _tag: "Failure",
@@ -662,7 +648,7 @@ export const makeDroidRpcProtocol = (
           );
           return;
         }
-        yield* publishDiagnostic(
+        yield* logDroidWarning(
           `Ignoring unsupported server-initiated Droid request ${message.method}`,
         );
         yield* sendResponse(message.id, {
@@ -679,24 +665,24 @@ export const makeDroidRpcProtocol = (
       Effect.gen(function* () {
         if (message.method !== "droid.session_notification") return;
         if (!Predicate.isObject(message.params)) {
-          yield* publishDiagnostic("Ignoring Droid session notification with invalid params");
+          yield* logDroidWarning("Ignoring Droid session notification with invalid params");
           return;
         }
         const rawNotification = message.params.notification;
         if (!Predicate.isObject(rawNotification) || typeof rawNotification.type !== "string") {
-          yield* publishDiagnostic("Ignoring Droid session notification without a string type");
+          yield* logDroidWarning("Ignoring Droid session notification without a string type");
           return;
         }
         if (!knownDroidSessionNotificationTypes.has(rawNotification.type)) {
-          yield* publishDiagnostic(
+          yield* logDroidWarning(
             `Ignoring unknown Droid session notification ${rawNotification.type}`,
           );
           return;
         }
         const decoded = yield* decodeNotification(rawNotification).pipe(Effect.result);
         if (decoded._tag === "Failure") {
-          yield* publishDiagnostic("Unable to decode Droid session notification", {
-            cause: decoded.failure,
+          yield* logDroidWarning("Unable to decode Droid session notification", {
+            error: decoded.failure,
           });
           return;
         }
@@ -723,7 +709,7 @@ export const makeDroidRpcProtocol = (
             (count) => count + 1,
           );
           if (droppedCount === 1 || droppedCount % notificationQueueCapacity === 0) {
-            yield* publishDiagnostic(
+            yield* logDroidWarning(
               `Dropped ${droppedCount} lossy Droid session notifications because the delivery queue is saturated`,
             );
           }
@@ -754,9 +740,9 @@ export const makeDroidRpcProtocol = (
       return decodeJsonRpcMessage(framed.line).pipe(
         Effect.matchEffect({
           onFailure: (cause) =>
-            publishDiagnostic("Unable to parse Droid JSON-RPC line", {
-              lineBytes: framed.bytes,
-              cause,
+            logDroidWarning("Unable to parse Droid JSON-RPC line", {
+              error: cause,
+              details: { lineBytes: framed.bytes },
             }),
           onSuccess: (message) => handleMessage(message, framed.bytes),
         }),

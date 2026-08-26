@@ -95,7 +95,25 @@ function createProviderServiceHarness(
         turns: input.turnIds.map((id) => ({ id, items: [] })),
       }),
   );
-  const validateConversationRollback = vi.fn(() => Effect.void);
+  const providerTurnIds =
+    providerName === ProviderDriverKind.make("claudeAgent")
+      ? [asTurnId("turn-claude-1"), asTurnId("turn-claude-2")]
+      : [asTurnId("turn-1"), asTurnId("turn-2")];
+  const prepareConversationRollback = vi.fn(
+    (input: { readonly threadId: ThreadId; readonly retainedThroughTurnId?: TurnId }) => {
+      const retainedTurnCount =
+        input.retainedThroughTurnId === undefined
+          ? 0
+          : providerTurnIds.findIndex((turnId) => turnId === input.retainedThroughTurnId) + 1;
+      const turnIds = providerTurnIds.slice(0, retainedTurnCount);
+      const anchorTurnId = providerTurnIds[retainedTurnCount];
+      return Effect.succeed({
+        threadId: input.threadId,
+        turnIds,
+        ...(anchorTurnId !== undefined ? { anchorTurnId } : {}),
+      });
+    },
+  );
 
   const unsupported = <A>() =>
     Effect.die(new Error("Unsupported provider call in test")) as Effect.Effect<A, never>;
@@ -133,7 +151,7 @@ function createProviderServiceHarness(
           continuationKey: `${providerName}:instance:${instanceId}`,
         },
       }),
-    validateConversationRollback,
+    prepareConversationRollback,
     rollbackConversation,
     uploadFeedback: () => unsupported(),
     get streamEvents() {
@@ -147,7 +165,7 @@ function createProviderServiceHarness(
 
   return {
     service,
-    validateConversationRollback,
+    prepareConversationRollback,
     rollbackConversation,
     emit,
   };
@@ -1017,12 +1035,17 @@ describe("CheckpointReactor", () => {
     const harness = await createHarness();
     const createdAt = "2026-01-01T00:00:00.000Z";
     let filesystemAtValidation: string | undefined;
-    harness.provider.validateConversationRollback.mockImplementation(() =>
+    harness.provider.prepareConversationRollback.mockImplementation((input) =>
       Effect.sync(() => {
         filesystemAtValidation = NodeFS.readFileSync(
           NodePath.join(harness.cwd, "README.md"),
           "utf8",
         );
+        return {
+          threadId: input.threadId,
+          turnIds: [asTurnId("turn-1")],
+          anchorTurnId: asTurnId("turn-2"),
+        };
       }),
     );
 
@@ -1093,10 +1116,9 @@ describe("CheckpointReactor", () => {
     expect(thread.checkpoints).toHaveLength(1);
     expect(thread.checkpoints[0]?.checkpointTurnCount).toBe(1);
     expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
-    expect(harness.provider.validateConversationRollback).toHaveBeenCalledWith({
+    expect(harness.provider.prepareConversationRollback).toHaveBeenCalledWith({
       threadId: ThreadId.make("thread-1"),
-      turnIds: [asTurnId("turn-1")],
-      anchorTurnId: asTurnId("turn-2"),
+      retainedThroughTurnId: asTurnId("turn-1"),
     });
     expect(filesystemAtValidation).toBe("v3\n");
     expect(harness.provider.rollbackConversation).toHaveBeenCalledWith({

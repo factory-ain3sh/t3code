@@ -1134,14 +1134,32 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     return { current, routed };
   });
 
-  const validateConversationRollback: ProviderServiceMethod<"validateConversationRollback"> =
-    Effect.fn("validateConversationRollback")(function* (rawInput) {
-      const input = yield* decodeInputOrValidationError({
-        operation: "ProviderService.validateConversationRollback",
-        schema: ProviderRollbackConversationInput,
-        payload: rawInput,
+  const prepareConversationRollback: ProviderServiceMethod<"prepareConversationRollback"> =
+    Effect.fn("prepareConversationRollback")(function* (input) {
+      const operation = "ProviderService.prepareConversationRollback";
+      const routed = yield* resolveRoutableSession({
+        threadId: input.threadId,
+        operation,
+        allowRecovery: true,
       });
-      yield* validateRollbackTarget(input, "ProviderService.validateConversationRollback");
+      const current = yield* routed.adapter.readThread(routed.threadId);
+      const retainedTurnCount =
+        input.retainedThroughTurnId === undefined
+          ? 0
+          : current.turns.findIndex((turn) => turn.id === input.retainedThroughTurnId) + 1;
+      if (input.retainedThroughTurnId !== undefined && retainedTurnCount === 0) {
+        return yield* toValidationError(
+          operation,
+          "Retained rollback turn does not exist in the current thread history.",
+        );
+      }
+      const turnIds = current.turns.slice(0, retainedTurnCount).map((turn) => turn.id);
+      const anchorTurnId = current.turns[retainedTurnCount]?.id;
+      return {
+        threadId: input.threadId,
+        turnIds,
+        ...(anchorTurnId !== undefined ? { anchorTurnId } : {}),
+      };
     });
 
   const rollbackConversation: ProviderServiceMethod<"rollbackConversation"> = Effect.fn(
@@ -1295,7 +1313,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     listSessions,
     getCapabilities,
     getInstanceInfo,
-    validateConversationRollback,
+    prepareConversationRollback,
     rollbackConversation,
     uploadFeedback,
     // Each access creates a fresh PubSub subscription so that multiple
