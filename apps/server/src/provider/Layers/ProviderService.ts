@@ -1105,6 +1105,45 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getInstanceInfo: ProviderServiceMethod<"getInstanceInfo"> = (instanceId) =>
     registry.getInstanceInfo(instanceId);
 
+  const validateRollbackTarget = Effect.fn("validateRollbackTarget")(function* (
+    input: Schema.Schema.Type<typeof ProviderRollbackConversationInput>,
+    operation: string,
+  ) {
+    if (input.turnIds.length === 0 && input.anchorTurnId === undefined) {
+      return yield* toValidationError(
+        operation,
+        "Rollback target must include at least one turn ID or an anchor turn ID.",
+      );
+    }
+    const routed = yield* resolveRoutableSession({
+      threadId: input.threadId,
+      operation,
+      allowRecovery: true,
+    });
+    const current = yield* routed.adapter.readThread(routed.threadId);
+    const target = {
+      turnIds: input.turnIds,
+      ...(input.anchorTurnId !== undefined ? { anchorTurnId: input.anchorTurnId } : {}),
+    };
+    if (!rollbackTargetMatchesKnownHistory(current.turns, target)) {
+      return yield* toValidationError(
+        operation,
+        "Rollback target does not match the current thread history.",
+      );
+    }
+    return { current, routed };
+  });
+
+  const validateConversationRollback: ProviderServiceMethod<"validateConversationRollback"> =
+    Effect.fn("validateConversationRollback")(function* (rawInput) {
+      const input = yield* decodeInputOrValidationError({
+        operation: "ProviderService.validateConversationRollback",
+        schema: ProviderRollbackConversationInput,
+        payload: rawInput,
+      });
+      yield* validateRollbackTarget(input, "ProviderService.validateConversationRollback");
+    });
+
   const rollbackConversation: ProviderServiceMethod<"rollbackConversation"> = Effect.fn(
     "rollbackConversation",
   )(function* (rawInput) {
@@ -1113,19 +1152,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       schema: ProviderRollbackConversationInput,
       payload: rawInput,
     });
-    if (input.turnIds.length === 0 && input.anchorTurnId === undefined) {
-      return yield* toValidationError(
-        "ProviderService.rollbackConversation",
-        "Rollback target must include at least one turn ID or an anchor turn ID.",
-      );
-    }
     let metricProvider = "unknown";
     return yield* Effect.gen(function* () {
-      const routed = yield* resolveRoutableSession({
-        threadId: input.threadId,
-        operation: "ProviderService.rollbackConversation",
-        allowRecovery: true,
-      });
+      const { current, routed } = yield* validateRollbackTarget(
+        input,
+        "ProviderService.rollbackConversation",
+      );
       metricProvider = routed.adapter.provider;
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "rollback-conversation",
@@ -1133,17 +1165,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": input.threadId,
         "provider.rollback_target_turn_count": input.turnIds.length,
       });
-      const current = yield* routed.adapter.readThread(routed.threadId);
-      const target = {
-        turnIds: input.turnIds,
-        ...(input.anchorTurnId !== undefined ? { anchorTurnId: input.anchorTurnId } : {}),
-      };
-      if (!rollbackTargetMatchesKnownHistory(current.turns, target)) {
-        return yield* toValidationError(
-          "ProviderService.rollbackConversation",
-          "Rollback target does not match the current thread history.",
-        );
-      }
       const numTurns = current.turns.length - input.turnIds.length;
       const snapshot =
         numTurns === 0 ? current : yield* routed.adapter.rollbackThread(routed.threadId, numTurns);
@@ -1274,6 +1295,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     listSessions,
     getCapabilities,
     getInstanceInfo,
+    validateConversationRollback,
     rollbackConversation,
     uploadFeedback,
     // Each access creates a fresh PubSub subscription so that multiple

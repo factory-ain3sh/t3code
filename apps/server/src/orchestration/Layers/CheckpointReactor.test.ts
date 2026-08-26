@@ -95,6 +95,7 @@ function createProviderServiceHarness(
         turns: input.turnIds.map((id) => ({ id, items: [] })),
       }),
   );
+  const validateConversationRollback = vi.fn(() => Effect.void);
 
   const unsupported = <A>() =>
     Effect.die(new Error("Unsupported provider call in test")) as Effect.Effect<A, never>;
@@ -132,6 +133,7 @@ function createProviderServiceHarness(
           continuationKey: `${providerName}:instance:${instanceId}`,
         },
       }),
+    validateConversationRollback,
     rollbackConversation,
     uploadFeedback: () => unsupported(),
     get streamEvents() {
@@ -145,6 +147,7 @@ function createProviderServiceHarness(
 
   return {
     service,
+    validateConversationRollback,
     rollbackConversation,
     emit,
   };
@@ -1013,6 +1016,15 @@ describe("CheckpointReactor", () => {
   it("executes provider revert and emits thread.reverted for checkpoint revert requests", async () => {
     const harness = await createHarness();
     const createdAt = "2026-01-01T00:00:00.000Z";
+    let filesystemAtValidation: string | undefined;
+    harness.provider.validateConversationRollback.mockImplementation(() =>
+      Effect.sync(() => {
+        filesystemAtValidation = NodeFS.readFileSync(
+          NodePath.join(harness.cwd, "README.md"),
+          "utf8",
+        );
+      }),
+    );
 
     await Effect.runPromise(
       harness.engine.dispatch({
@@ -1081,6 +1093,12 @@ describe("CheckpointReactor", () => {
     expect(thread.checkpoints).toHaveLength(1);
     expect(thread.checkpoints[0]?.checkpointTurnCount).toBe(1);
     expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(1);
+    expect(harness.provider.validateConversationRollback).toHaveBeenCalledWith({
+      threadId: ThreadId.make("thread-1"),
+      turnIds: [asTurnId("turn-1")],
+      anchorTurnId: asTurnId("turn-2"),
+    });
+    expect(filesystemAtValidation).toBe("v3\n");
     expect(harness.provider.rollbackConversation).toHaveBeenCalledWith({
       threadId: ThreadId.make("thread-1"),
       turnIds: [asTurnId("turn-1")],

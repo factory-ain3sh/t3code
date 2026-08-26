@@ -100,6 +100,13 @@ export interface ProviderServiceShape {
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderServiceError>;
 
+  /** Validate a provider conversation rollback target without mutating it. */
+  readonly validateConversationRollback: (input: {
+    readonly threadId: ThreadId;
+    readonly turnIds: ReadonlyArray<TurnId>;
+    readonly anchorTurnId?: TurnId;
+  }) => Effect.Effect<void, ProviderServiceError>;
+
   /** Roll back provider conversation state to one absolute target. */
   readonly rollbackConversation: (input: {
     readonly threadId: ThreadId;

@@ -758,6 +758,24 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    const retainedTurnIds = orderedCheckpoints
+      .filter((checkpoint) => checkpoint.checkpointTurnCount <= event.payload.turnCount)
+      .map((checkpoint) => checkpoint.turnId);
+    const firstStaleTurnId = orderedCheckpoints.find(
+      (checkpoint) => checkpoint.checkpointTurnCount > event.payload.turnCount,
+    )?.turnId;
+    const rollbackTarget =
+      firstStaleTurnId === undefined
+        ? undefined
+        : {
+            threadId: sessionRuntime.value.threadId,
+            turnIds: retainedTurnIds,
+            anchorTurnId: firstStaleTurnId,
+          };
+    if (rollbackTarget !== undefined) {
+      yield* providerService.validateConversationRollback(rollbackTarget);
+    }
+
     const restored = yield* checkpointStore.restoreCheckpoint({
       cwd: sessionRuntime.value.cwd,
       checkpointRef: targetCheckpointRef,
@@ -777,18 +795,8 @@ const make = Effect.gen(function* () {
     // reflects the reverted filesystem state.
     yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
 
-    const retainedTurnIds = orderedCheckpoints
-      .filter((checkpoint) => checkpoint.checkpointTurnCount <= event.payload.turnCount)
-      .map((checkpoint) => checkpoint.turnId);
-    const firstStaleTurnId = orderedCheckpoints.find(
-      (checkpoint) => checkpoint.checkpointTurnCount > event.payload.turnCount,
-    )?.turnId;
-    if (firstStaleTurnId !== undefined) {
-      yield* providerService.rollbackConversation({
-        threadId: sessionRuntime.value.threadId,
-        turnIds: retainedTurnIds,
-        anchorTurnId: firstStaleTurnId,
-      });
+    if (rollbackTarget !== undefined) {
+      yield* providerService.rollbackConversation(rollbackTarget);
     }
 
     const staleCheckpointRefs: Array<CheckpointRef> = [];

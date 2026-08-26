@@ -124,6 +124,7 @@ function createProviderServiceHarness() {
         },
       });
     },
+    validateConversationRollback: () => unsupported(),
     rollbackConversation: () => unsupported(),
     uploadFeedback: () => unsupported(),
     get streamEvents() {
