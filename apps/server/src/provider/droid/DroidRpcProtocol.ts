@@ -11,6 +11,8 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
+import { errorTag } from "@t3tools/shared/observability";
+
 import {
   DroidAskUserRequest,
   DroidPermissionRequest,
@@ -259,15 +261,13 @@ const encodeJsonRpcMessage = Schema.encodeUnknownEffect(Schema.fromJsonString(Sc
 const publishDiagnostic = (
   message: string,
   options?: {
-    readonly line?: string;
+    readonly lineBytes?: number;
     readonly cause?: unknown;
   },
 ) =>
   Effect.logWarning(message.slice(0, diagnosticTextLimit), {
-    ...(options?.line === undefined ? {} : { line: options.line.slice(0, diagnosticTextLimit) }),
-    ...(options?.cause === undefined
-      ? {}
-      : { cause: String(options.cause).slice(0, diagnosticTextLimit) }),
+    ...(options?.lineBytes === undefined ? {} : { lineBytes: options.lineBytes }),
+    ...(options?.cause === undefined ? {} : { errorTag: errorTag(options.cause) }),
   });
 
 function markRequestTimedOut(
@@ -755,7 +755,7 @@ export const makeDroidRpcProtocol = (
         Effect.matchEffect({
           onFailure: (cause) =>
             publishDiagnostic("Unable to parse Droid JSON-RPC line", {
-              line: framed.line,
+              lineBytes: framed.bytes,
               cause,
             }),
           onSuccess: (message) => handleMessage(message, framed.bytes),

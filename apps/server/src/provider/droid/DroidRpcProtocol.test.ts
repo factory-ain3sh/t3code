@@ -129,6 +129,46 @@ describe("DroidRpcProtocol", () => {
     }),
   );
 
+  it.effect("logs structural diagnostics for malformed Droid frames", () => {
+    const logs: Array<{
+      readonly message: string;
+      readonly details: object;
+    }> = [];
+    const logger = Logger.make(({ message }) => {
+      const parts = Array.isArray(message) ? message : [message];
+      const details = typeof parts[1] === "object" && parts[1] !== null ? parts[1] : {};
+      logs.push({
+        message: String(parts[0]),
+        details,
+      });
+    });
+    return Effect.gen(function* () {
+      const protocol = yield* makeDroidRpcProtocol();
+      const secretFrame = "not-json credential=secret-value";
+
+      yield* protocol.acceptChunk(`${secretFrame}\n`);
+
+      const diagnostic = logs.find(
+        (entry) => entry.message === "Unable to parse Droid JSON-RPC line",
+      );
+      assert.isDefined(diagnostic);
+      assert.deepInclude(diagnostic?.details, {
+        lineBytes: new TextEncoder().encode(secretFrame).byteLength,
+        errorTag: "SchemaError",
+      });
+      assert.notProperty(diagnostic?.details, "line");
+      assert.notProperty(diagnostic?.details, "cause");
+      const loggedText = [
+        diagnostic?.message,
+        ...Object.values(diagnostic?.details ?? {}).filter(
+          (value): value is string => typeof value === "string",
+        ),
+      ].join(" ");
+      assert.notInclude(loggedText, secretFrame);
+      assert.notInclude(loggedText, "secret-value");
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
   it.effect("decodes strict failure responses", () =>
     Effect.gen(function* () {
       const { fiber, protocol, request } = yield* pendingRequest();
