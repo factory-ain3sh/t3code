@@ -915,6 +915,23 @@ describe("workEntryIndicatesToolFailure", () => {
 });
 
 describe("deriveWorkLogEntries", () => {
+  it("preserves canonical plan approval kinds", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        id: "plan-approval",
+        kind: "approval.requested",
+        summary: "Plan approval requested",
+        tone: "approval",
+        payload: {
+          requestId: "req-plan",
+          requestKind: "plan",
+        },
+      }),
+    ]);
+
+    expect(entries).toMatchObject([{ id: "plan-approval", requestKind: "plan" }]);
+  });
+
   it("omits tool started entries and keeps completed entries", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
