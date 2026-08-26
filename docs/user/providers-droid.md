@@ -14,7 +14,10 @@ Install Factory Droid.
 macOS and Linux:
 
 ```bash
-curl -fsSL https://app.factory.ai/cli | sh
+curl -fsSL https://app.factory.ai/cli -o install-droid.sh
+# Review the downloaded script, then run it:
+sh install-droid.sh
+rm install-droid.sh
 ```
 
 Windows:
