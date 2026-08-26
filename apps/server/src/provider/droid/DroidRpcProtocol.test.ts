@@ -342,6 +342,25 @@ describe("DroidRpcProtocol", () => {
     }),
   );
 
+  it.effect("releases lossless item and byte reservations when delivery begins", () =>
+    Effect.gen(function* () {
+      const first = notification(assistantDelta("first", "x".repeat(200)));
+      const second = notification(assistantDelta("second", "y".repeat(200)));
+      const protocol = yield* makeDroidRpcProtocol({
+        maxBacklogItems: 1,
+        maxBacklogBytes: Math.max(
+          Buffer.byteLength(first, "utf8"),
+          Buffer.byteLength(second, "utf8"),
+        ),
+      });
+
+      yield* protocol.acceptChunk(`${first}\n`);
+      assert.equal((yield* take(protocol.notifications)).notification.type, "assistant_text_delta");
+      yield* protocol.acceptChunk(`${second}\n`);
+      assert.equal((yield* take(protocol.notifications)).notification.type, "assistant_text_delta");
+    }),
+  );
+
   it.effect("bounds UTF-8 remainders and outbound encoded frames", () =>
     Effect.gen(function* () {
       const inbound = yield* makeDroidRpcProtocol({ maxMessageBytes: 8 });

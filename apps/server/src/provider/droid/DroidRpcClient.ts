@@ -34,6 +34,7 @@ export type {
 
 const gracefulShutdownTimeout = Duration.seconds(2);
 const stdoutExitObservationGrace = Duration.millis(100);
+const stdoutDrainAfterProcessExitGrace = Duration.millis(250);
 
 export interface DroidRpcSpawnInput {
   readonly command: string;
@@ -231,8 +232,15 @@ export const makeDroidRpcClient = (
         Effect.gen(function* () {
           yield* protocol.beginShutdown(exit);
           yield* protocol.closeOutgoing;
+          const stdoutDrained = yield* Fiber.join(stdoutFiber).pipe(
+            Effect.as(true),
+            Effect.timeoutOption(stdoutDrainAfterProcessExitGrace),
+            Effect.map(Option.getOrElse(() => false)),
+          );
+          if (!stdoutDrained) {
+            yield* Fiber.interrupt(stdoutFiber);
+          }
           yield* finalizeExit(exit);
-          yield* Fiber.interrupt(stdoutFiber);
           yield* Fiber.interrupt(stderrFiber);
         }),
       ),

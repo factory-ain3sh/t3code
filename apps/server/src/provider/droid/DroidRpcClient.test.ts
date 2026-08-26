@@ -148,6 +148,49 @@ describe("DroidRpcClient", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
   );
 
+  it.effect("drains a final stdout response before publishing process exit", () =>
+    Effect.gen(function* () {
+      const client = yield* makeDroidRpcClient({
+        command: process.execPath,
+        args: [
+          "-e",
+          [
+            'let buffer = "";',
+            'process.stdin.setEncoding("utf8");',
+            'process.stdin.on("data", (chunk) => {',
+            "  buffer += chunk;",
+            '  const newline = buffer.indexOf("\\n");',
+            "  if (newline < 0) return;",
+            "  const request = JSON.parse(buffer.slice(0, newline));",
+            "  const response = `${JSON.stringify({",
+            "    jsonrpc: request.jsonrpc,",
+            "    factoryApiVersion: request.factoryApiVersion,",
+            "    factoryProtocolVersion: request.factoryProtocolVersion,",
+            '    type: "response",',
+            "    id: request.id,",
+            '    result: { text: "after-exit" },',
+            "  })}\\n`;",
+            "  require('node:child_process').spawn(",
+            "    process.execPath,",
+            "    ['-e', 'setTimeout(() => process.stdout.write(process.argv[1]), 20)', response],",
+            "    { stdio: ['ignore', 'inherit', 'inherit'] },",
+            "  );",
+            "  process.exit(0);",
+            "});",
+          ].join("\n"),
+        ],
+      });
+
+      const result = (yield* client.request(
+        "droid.final_response",
+        {},
+        { timeoutMs: undefined },
+      )) as { readonly text: string };
+      assert.equal(result.text, "after-exit");
+      assert.equal((yield* within(client.exits, "process exit was not detected")).code, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer), TestClock.withLive),
+  );
+
   it.effect("settles pending requests before interrupting inherited process pipes", () => {
     const markerDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "droid-rpc-pipes-"));
     const pidPath = NodePath.join(markerDir, "descendant-pid");

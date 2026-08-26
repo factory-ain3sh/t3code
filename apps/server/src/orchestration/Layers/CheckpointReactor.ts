@@ -786,9 +786,7 @@ const make = Effect.gen(function* () {
     // reflects the reverted filesystem state.
     yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
 
-    if (rollbackTarget.anchorTurnId !== undefined) {
-      yield* providerService.rollbackConversation(rollbackTarget);
-    }
+    yield* providerService.rollbackConversation(rollbackTarget);
 
     const staleCheckpointRefs: Array<CheckpointRef> = [];
     for (const checkpoint of orderedCheckpoints) {

@@ -1,3 +1,4 @@
+import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -8,6 +9,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
@@ -238,6 +240,22 @@ interface QueuedDelivery<A> {
   readonly encodedBytes: number;
 }
 
+interface LosslessBacklogState {
+  readonly items: number;
+  readonly bytes: number;
+}
+
+type LosslessBacklogReservation =
+  | {
+      readonly _tag: "Overflow";
+      readonly actualBytes: number;
+      readonly backlog: number;
+    }
+  | {
+      readonly _tag: "Reserved";
+      readonly warn: boolean;
+    };
+
 type OutgoingFrame =
   | {
       readonly _tag: "Request";
@@ -380,8 +398,16 @@ export const makeDroidRpcProtocol = (
       QueuedDelivery<DroidServerRequest>,
       Cause.Done<void>
     >();
-    const notificationBacklogBytes = yield* Ref.make(0);
-    const serverRequestBacklogBytes = yield* Ref.make(0);
+    const notificationBacklog = yield* Ref.make<LosslessBacklogState>({
+      items: 0,
+      bytes: 0,
+    });
+    const serverRequestBacklog = yield* Ref.make<LosslessBacklogState>({
+      items: 0,
+      bytes: 0,
+    });
+    const notificationBacklogMutex = yield* Semaphore.make(1);
+    const serverRequestBacklogMutex = yield* Semaphore.make(1);
     const lifecycle = yield* SynchronizedRef.make<DroidRpcLifecycle>({
       _tag: "Running",
       pending: new Map(),
@@ -494,37 +520,54 @@ export const makeDroidRpcProtocol = (
     const offerLossless = <A>(
       queueName: "notifications" | "server-requests",
       queue: Queue.Queue<QueuedDelivery<A>, Cause.Done<void>>,
-      backlogBytes: Ref.Ref<number>,
+      backlogState: Ref.Ref<LosslessBacklogState>,
+      backlogMutex: Semaphore.Semaphore,
       item: QueuedDelivery<A>,
       warningCount: number,
     ) =>
       Effect.gen(function* () {
-        const backlog = Queue.sizeUnsafe(queue);
-        const nextBytes = yield* Ref.updateAndGet(
-          backlogBytes,
-          (bytes) => bytes + item.encodedBytes,
+        const reservation = yield* backlogMutex.withPermits(1)(
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              const current = yield* Ref.get(backlogState);
+              const next = {
+                items: current.items + 1,
+                bytes: current.bytes + item.encodedBytes,
+              };
+              if (current.items >= maxBacklogItems || next.bytes > maxBacklogBytes) {
+                return {
+                  _tag: "Overflow",
+                  actualBytes: next.bytes,
+                  backlog: current.items,
+                } satisfies LosslessBacklogReservation;
+              }
+              const offered = yield* Queue.offer(queue, item);
+              if (offered) {
+                yield* Ref.set(backlogState, next);
+              }
+              return {
+                _tag: "Reserved",
+                warn: offered && current.items === warningCount,
+              } satisfies LosslessBacklogReservation;
+            }),
+          ),
         );
-        if (backlog >= maxBacklogItems || nextBytes > maxBacklogBytes) {
-          yield* Ref.update(backlogBytes, (bytes) => Math.max(0, bytes - item.encodedBytes));
+        if (reservation._tag === "Overflow") {
           return yield* new DroidRpcError({
             kind: "backlog-overflow",
-            actualBytes: nextBytes,
+            actualBytes: reservation.actualBytes,
             limitBytes: maxBacklogBytes,
             data: {
               queue: queueName,
-              backlog,
+              backlog: reservation.backlog,
               limit: maxBacklogItems,
             },
           });
         }
-        if (backlog === warningCount) {
+        if (reservation.warn) {
           yield* logDroidWarning(
             `Droid ${queueName} backlog exceeded ${warningCount}; the consumer is falling behind`,
           );
-        }
-        const offered = yield* Queue.offer(queue, item);
-        if (!offered) {
-          yield* Ref.update(backlogBytes, (bytes) => Math.max(0, bytes - item.encodedBytes));
         }
       });
 
@@ -599,7 +642,8 @@ export const makeDroidRpcProtocol = (
           yield* offerLossless(
             "server-requests",
             serverRequests,
-            serverRequestBacklogBytes,
+            serverRequestBacklog,
+            serverRequestBacklogMutex,
             {
               encodedBytes,
               value: {
@@ -635,7 +679,8 @@ export const makeDroidRpcProtocol = (
           yield* offerLossless(
             "server-requests",
             serverRequests,
-            serverRequestBacklogBytes,
+            serverRequestBacklog,
+            serverRequestBacklogMutex,
             {
               encodedBytes,
               value: {
@@ -718,7 +763,8 @@ export const makeDroidRpcProtocol = (
         yield* offerLossless(
           "notifications",
           notifications,
-          notificationBacklogBytes,
+          notificationBacklog,
+          notificationBacklogMutex,
           { encodedBytes, value: envelope },
           notificationQueueCapacity,
         );
@@ -926,19 +972,67 @@ export const makeDroidRpcProtocol = (
 
     const deliveryStream = <A>(
       queue: Queue.Queue<QueuedDelivery<A>, Cause.Done<void>>,
-      backlogBytes: Ref.Ref<number>,
-    ) =>
-      Stream.fromQueue(queue).pipe(
-        Stream.tap((delivery) =>
-          Ref.update(backlogBytes, (bytes) => Math.max(0, bytes - delivery.encodedBytes)),
+      backlogState: Ref.Ref<LosslessBacklogState>,
+      backlogMutex: Semaphore.Semaphore,
+    ) => {
+      const takeDeliveries: Effect.Effect<
+        Arr.NonEmptyReadonlyArray<QueuedDelivery<A>>,
+        Cause.Done<void>
+      > = Effect.suspend(() =>
+        Queue.peek(queue).pipe(
+          Effect.andThen(
+            backlogMutex.withPermits(1)(
+              Effect.uninterruptible(
+                Queue.clear(queue).pipe(
+                  Effect.flatMap((deliveries) => {
+                    const first = deliveries[0];
+                    if (first === undefined) {
+                      return Effect.succeed(
+                        Option.none<Arr.NonEmptyReadonlyArray<QueuedDelivery<A>>>(),
+                      );
+                    }
+                    const batch: Arr.NonEmptyArray<QueuedDelivery<A>> = [
+                      first,
+                      ...deliveries.slice(1),
+                    ];
+                    const releasedBytes = batch.reduce(
+                      (total, delivery) => total + delivery.encodedBytes,
+                      0,
+                    );
+                    return Ref.update(backlogState, (current) => ({
+                      items: Math.max(0, current.items - batch.length),
+                      bytes: Math.max(0, current.bytes - releasedBytes),
+                    })).pipe(Effect.as(Option.some(batch)));
+                  }),
+                ),
+              ),
+            ),
+          ),
+          Effect.flatMap(
+            Option.match({
+              onNone: () => takeDeliveries,
+              onSome: Effect.succeed,
+            }),
+          ),
         ),
-        Stream.map((delivery) => delivery.value),
       );
+      return Stream.fromPull(
+        Effect.succeed(
+          takeDeliveries.pipe(
+            Effect.map((deliveries) => Arr.map(deliveries, (item) => item.value)),
+          ),
+        ),
+      );
+    };
 
     return {
       request,
-      notifications: deliveryStream(notifications, notificationBacklogBytes),
-      serverRequests: deliveryStream(serverRequests, serverRequestBacklogBytes),
+      notifications: deliveryStream(notifications, notificationBacklog, notificationBacklogMutex),
+      serverRequests: deliveryStream(
+        serverRequests,
+        serverRequestBacklog,
+        serverRequestBacklogMutex,
+      ),
       latestServerRequestSequence: Ref.get(nextServerRequestSequence),
       outgoing: Stream.fromQueue(outgoing).pipe(
         Stream.filterMapEffect((frame): Effect.Effect<Result.Result<string, void>> => {

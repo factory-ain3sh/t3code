@@ -1256,9 +1256,9 @@ describe("CheckpointReactor", () => {
     await Effect.runPromise(
       harness.engine.dispatch({
         type: "thread.checkpoint.revert",
-        commandId: CommandId.make("cmd-sequenced-revert-request-1"),
+        commandId: CommandId.make("cmd-sequenced-revert-request-2"),
         threadId: ThreadId.make("thread-1"),
-        turnCount: 1,
+        turnCount: 2,
         createdAt,
       }),
     );
@@ -1277,8 +1277,7 @@ describe("CheckpointReactor", () => {
     expect(harness.provider.rollbackConversation).toHaveBeenCalledTimes(2);
     expect(harness.provider.rollbackConversation.mock.calls[0]?.[0]).toEqual({
       threadId: ThreadId.make("thread-1"),
-      turnIds: [asTurnId("turn-1")],
-      anchorTurnId: asTurnId("turn-2"),
+      turnIds: [asTurnId("turn-1"), asTurnId("turn-2")],
     });
     expect(harness.provider.rollbackConversation.mock.calls[1]?.[0]).toEqual({
       threadId: ThreadId.make("thread-1"),
