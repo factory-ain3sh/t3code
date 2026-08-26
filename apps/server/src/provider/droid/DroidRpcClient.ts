@@ -9,6 +9,7 @@ import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import { errorTag } from "@t3tools/shared/observability";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 import {
@@ -87,14 +88,13 @@ export const makeDroidRpcClient = (
       message: string,
       options?: {
         readonly cause?: unknown;
+        readonly stderrBytes?: number;
       },
     ) =>
-      Effect.logWarning(
-        message.slice(0, diagnosticTextLimit),
-        options?.cause === undefined
-          ? {}
-          : { cause: String(options.cause).slice(0, diagnosticTextLimit) },
-      );
+      Effect.logWarning(message.slice(0, diagnosticTextLimit), {
+        ...(options?.cause === undefined ? {} : { errorTag: errorTag(options.cause) }),
+        ...(options?.stderrBytes === undefined ? {} : { stderrBytes: options.stderrBytes }),
+      });
 
     const spawnCommand = yield* resolveSpawnCommand(
       input.command,
@@ -127,10 +127,10 @@ export const makeDroidRpcClient = (
     const observeChildExit = yield* Effect.cached(
       child.exitCode.pipe(
         Effect.match({
-          onFailure: (cause) =>
+          onFailure: () =>
             ({
               code: null,
-              description: `Droid process exit status was unavailable: ${String(cause)}`,
+              description: "Droid process exit status was unavailable",
             }) satisfies DroidProcessExit,
           onSuccess: (code) =>
             ({
@@ -190,7 +190,7 @@ export const makeDroidRpcClient = (
             Effect.andThen(
               terminateTransport({
                 code: null,
-                description: `Droid stdout stream failed: ${String(cause)}`,
+                description: "Droid stdout stream failed",
               }),
             ),
           ),
@@ -202,7 +202,7 @@ export const makeDroidRpcClient = (
                   Effect.andThen(
                     terminateTransport({
                       code: null,
-                      description: `Droid stdout stream failed: ${String(cause)}`,
+                      description: "Droid stdout stream failed",
                     }),
                   ),
                 ),
@@ -231,7 +231,9 @@ export const makeDroidRpcClient = (
       Stream.runForEach((output) =>
         output.trim().length === 0
           ? Effect.void
-          : publishDiagnostic(`Droid stderr: ${output.trim()}`),
+          : publishDiagnostic("Droid stderr received", {
+              stderrBytes: new TextEncoder().encode(output).byteLength,
+            }),
       ),
       Effect.catch(() => Effect.void),
       Effect.forkIn(runtimeScope),

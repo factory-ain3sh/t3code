@@ -295,10 +295,14 @@ describe("DroidRpcClient", () => {
     );
   });
 
-  it.effect("bounds stderr diagnostics", () => {
-    const logs: string[] = [];
+  it.effect("logs stderr byte counts without payload text", () => {
+    const logs: Array<{ readonly message: string; readonly details: object }> = [];
     const logger = Logger.make(({ message }) => {
-      logs.push(String(Array.isArray(message) ? message[0] : message));
+      const parts = Array.isArray(message) ? message : [message];
+      logs.push({
+        message: String(parts[0]),
+        details: typeof parts[1] === "object" && parts[1] !== null ? parts[1] : {},
+      });
     });
     return Effect.gen(function* () {
       const client = yield* makeDroidRpcClient({
@@ -306,7 +310,14 @@ describe("DroidRpcClient", () => {
         args: ["-e", 'process.stderr.write("y".repeat(2500)); process.exit(0)'],
       });
       yield* within(client.exits, "process exit was not detected");
-      assert.equal(logs.find((message) => message.startsWith("Droid stderr:"))?.length, 2000);
+      const diagnostic = logs.find((entry) => entry.message === "Droid stderr received");
+      assert.deepEqual(diagnostic?.details, { stderrBytes: 2500 });
+      assert.notInclude(
+        Object.values(diagnostic?.details ?? {})
+          .filter((value): value is string => typeof value === "string")
+          .join(" "),
+        "yyyy",
+      );
     }).pipe(
       Effect.scoped,
       Effect.provide(
