@@ -1044,6 +1044,29 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("rejects an anchor when the retained turns already cover provider history", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const session = yield* provider.startSession(asThreadId("thread-rollback-full-history"), {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-rollback-full-history"),
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* provider
+        .rollbackConversation({
+          threadId: session.threadId,
+          turnIds: [asTurnId("turn-1")],
+          anchorTurnId: asTurnId("stale-anchor"),
+        })
+        .pipe(Effect.flip);
+
+      assert.equal(error._tag, "ProviderValidationError");
+      assert.equal(routing.codex.rollbackThread.mock.calls.length, 0);
+    }),
+  );
+
   it.effect("derives rollback targets from complete provider history", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
