@@ -38,6 +38,8 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
@@ -51,6 +53,8 @@ import { DroidDriver } from "../Drivers/DroidDriver.ts";
 import { GrokDriver } from "../Drivers/GrokDriver.ts";
 import { OpenCodeDriver } from "../Drivers/OpenCodeDriver.ts";
 import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
+import { ProviderDriverError } from "../Errors.ts";
+import type { AnyProviderDriver } from "../ProviderDriver.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
 import { makeProviderInstanceRegistry } from "./ProviderInstanceRegistryLive.ts";
 
@@ -299,6 +303,58 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
         expect(ghost.unavailableReason).toMatch(/ghostDriver/);
       }).pipe(Effect.provide(testLayer)),
   );
+
+  it.effect("logs a normalized error tag when provider creation fails", () => {
+    const logs: Array<{ readonly message: string; readonly details: object }> = [];
+    const logger = Logger.make(({ message }) => {
+      const parts = Array.isArray(message) ? message : [message];
+      logs.push({
+        message: String(parts[0]),
+        details: typeof parts[1] === "object" && parts[1] !== null ? parts[1] : {},
+      });
+    });
+    const secret = "raw-provider-driver-cause";
+    const driverKind = ProviderDriverKind.make("failing-driver");
+    const instanceId = ProviderInstanceId.make("failing-instance");
+    const driver = {
+      driverKind,
+      metadata: { displayName: "Failing driver" },
+      configSchema: Schema.Struct({ enabled: Schema.Boolean }),
+      defaultConfig: () => ({ enabled: true }),
+      create: () =>
+        Effect.fail(
+          new ProviderDriverError({
+            driver: driverKind,
+            instanceId,
+            detail: "Driver creation failed.",
+            cause: new Error(secret),
+          }),
+        ),
+    } satisfies AnyProviderDriver;
+
+    return Effect.gen(function* () {
+      yield* makeProviderInstanceRegistry({
+        drivers: [driver],
+        configMap: {
+          [instanceId]: {
+            driver: driverKind,
+            enabled: true,
+            config: { enabled: true },
+          },
+        },
+      });
+
+      const diagnostic = logs.find(
+        (entry) => entry.message === "Failed to create provider instance",
+      );
+      expect(diagnostic?.details).toEqual({
+        instanceId,
+        driver: driverKind,
+        detail: "Driver creation failed.",
+        errorTag: "Error",
+      });
+    }).pipe(Effect.scoped, Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
 });
 
 describe("ProviderInstanceRegistryLive — all drivers slice", () => {

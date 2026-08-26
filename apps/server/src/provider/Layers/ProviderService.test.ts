@@ -25,6 +25,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, describe, vi } from "@effect/vitest";
 
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -93,6 +94,7 @@ type LegacyProviderRuntimeEvent = {
 function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const streamSubscribed = Deferred.makeUnsafe<void>();
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
@@ -230,7 +232,12 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
-      return Stream.fromPubSub(runtimeEventPubSub);
+      return Stream.unwrap(
+        PubSub.subscribe(runtimeEventPubSub).pipe(
+          Effect.tap(() => Deferred.succeed(streamSubscribed, undefined)),
+          Effect.map((subscription) => Stream.fromSubscription(subscription)),
+        ),
+      );
     },
   };
 
@@ -265,6 +272,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     rollbackThread,
     uploadFeedback,
     stopAll,
+    streamSubscribed: Deferred.await(streamSubscribed),
   };
 }
 
@@ -1783,12 +1791,6 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         runtimeMode: "full-access",
       });
 
-      const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
-      const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
-        Ref.update(eventsRef, (current) => [...current, event]),
-      ).pipe(Effect.forkChild);
-      yield* advanceTestClock(50);
-
       const resumeCursor = { threadId: "provider-thread-1", turnIds: ["turn-1"] };
       const completedEvent: LegacyProviderRuntimeEvent = {
         type: "turn.completed",
@@ -1802,9 +1804,21 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           resumeCursor,
         },
       };
+      const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+      const completionObserved = yield* Deferred.make<void>();
+      const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        Ref.update(eventsRef, (current) => [...current, event]).pipe(
+          Effect.andThen(
+            event.eventId === completedEvent.eventId
+              ? Deferred.succeed(completionObserved, undefined)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild({ startImmediately: true }));
 
+      yield* fanout.codex.streamSubscribed;
       fanout.codex.emit(completedEvent);
-      yield* advanceTestClock(50);
+      yield* Deferred.await(completionObserved);
 
       const events = yield* Ref.get(eventsRef);
       const binding = yield* directory.getBinding(session.threadId);
