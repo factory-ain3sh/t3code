@@ -58,7 +58,7 @@ export function rollbackTargetMatchesKnownHistory(
     return false;
   }
   if (target.anchorTurnId === undefined) {
-    return true;
+    return turns.length === target.turnIds.length;
   }
   return turns[target.turnIds.length]?.id === target.anchorTurnId;
 }

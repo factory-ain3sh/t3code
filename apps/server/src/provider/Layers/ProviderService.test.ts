@@ -42,6 +42,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
+  ProviderSessionDirectoryPersistenceError,
   ProviderUnsupportedError,
   ProviderValidationError,
   type ProviderAdapterError,
@@ -1068,6 +1069,46 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("rejects a full-history rollback target after another turn is appended", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const session = yield* provider.startSession(asThreadId("thread-rollback-stale-full"), {
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-rollback-stale-full"),
+        runtimeMode: "full-access",
+      });
+      const retainedTurn = { id: asTurnId("turn-retained"), items: [] as const };
+      routing.codex.readThread
+        .mockReturnValueOnce(
+          Effect.succeed({
+            threadId: session.threadId,
+            turns: [retainedTurn],
+          }),
+        )
+        .mockReturnValueOnce(
+          Effect.succeed({
+            threadId: session.threadId,
+            turns: [retainedTurn, { id: asTurnId("turn-appended"), items: [] as const }],
+          }),
+        );
+      routing.codex.rollbackThread.mockClear();
+
+      const target = yield* provider.prepareConversationRollback({
+        threadId: session.threadId,
+        retainedThroughTurnId: retainedTurn.id,
+      });
+      const error = yield* provider.rollbackConversation(target).pipe(Effect.flip);
+
+      assert.deepStrictEqual(target, {
+        threadId: session.threadId,
+        turnIds: [retainedTurn.id],
+      });
+      assert.equal(error._tag, "ProviderValidationError");
+      assert.equal(routing.codex.rollbackThread.mock.calls.length, 0);
+    }),
+  );
+
   it.effect("derives rollback targets from complete provider history", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1948,6 +1989,84 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         true,
       );
       assert.deepEqual(Option.getOrUndefined(binding)?.resumeCursor, resumeCursor);
+    }),
+  );
+
+  it.effect("surfaces a failed resume cursor write without stopping adapter event delivery", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(asThreadId("thread-cursor-write-failure"), {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-cursor-write-failure"),
+        runtimeMode: "full-access",
+      });
+      const originalUpsert = directory.upsert;
+      const upsertSpy = vi.spyOn(directory, "upsert").mockImplementation((binding) =>
+        binding.resumeCursor !== undefined
+          ? Effect.fail(
+              new ProviderSessionDirectoryPersistenceError({
+                operation: "ProviderSessionDirectory.upsert",
+                detail: "Injected resume cursor write failure.",
+              }),
+            )
+          : originalUpsert(binding),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => upsertSpy.mockRestore()));
+
+      const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
+      const persistenceFailureObserved = yield* Deferred.make<void>();
+      const followUpObserved = yield* Deferred.make<void>();
+      const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
+        Ref.update(eventsRef, (current) => [...current, event]).pipe(
+          Effect.andThen(
+            event.eventId === asEventId("evt-cursor-write-failure")
+              ? Deferred.succeed(persistenceFailureObserved, undefined)
+              : event.eventId === asEventId("evt-after-cursor-write-failure")
+                ? Deferred.succeed(followUpObserved, undefined)
+                : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* fanout.codex.streamSubscribed;
+      fanout.codex.emit({
+        type: "turn.completed",
+        eventId: asEventId("evt-cursor-write-failure"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-cursor-write-failure"),
+        payload: {
+          state: "completed",
+          resumeCursor: { threadId: "provider-thread-after-fork" },
+        },
+      });
+      yield* Deferred.await(persistenceFailureObserved);
+
+      upsertSpy.mockRestore();
+      fanout.codex.emit({
+        type: "tool.completed",
+        eventId: asEventId("evt-after-cursor-write-failure"),
+        provider: CODEX_DRIVER,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId: session.threadId,
+        turnId: asTurnId("turn-cursor-write-failure"),
+        toolKind: "command",
+        title: "Ran command",
+      });
+      yield* Deferred.await(followUpObserved);
+
+      const events = yield* Ref.get(eventsRef);
+      yield* Fiber.interrupt(consumer);
+      assert.deepEqual(
+        events.map((event) => [event.eventId, event.type]),
+        [
+          [asEventId("evt-cursor-write-failure"), "runtime.error"],
+          [asEventId("evt-after-cursor-write-failure"), "tool.completed"],
+        ],
+      );
     }),
   );
 

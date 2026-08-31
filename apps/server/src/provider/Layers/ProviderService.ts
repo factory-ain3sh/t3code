@@ -350,9 +350,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   ): Effect.Effect<void> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
-        (canonicalEvent.type === "turn.completed" &&
-        canonicalEvent.payload?.resumeCursor !== undefined
-          ? directory
+        Effect.gen(function* () {
+          let eventToPublish = canonicalEvent;
+          if (
+            canonicalEvent.type === "turn.completed" &&
+            canonicalEvent.payload?.resumeCursor !== undefined
+          ) {
+            const cursorPersisted = yield* directory
               .upsert({
                 threadId: canonicalEvent.threadId,
                 provider: canonicalEvent.provider,
@@ -360,24 +364,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 resumeCursor: canonicalEvent.payload.resumeCursor,
               })
               .pipe(
+                Effect.as(true),
                 Effect.catch((error) =>
                   Effect.logWarning("Failed to persist provider resume cursor.", {
                     threadId: canonicalEvent.threadId,
                     provider: canonicalEvent.provider,
                     cause: error,
-                  }),
+                  }).pipe(Effect.as(false)),
                 ),
-              )
-          : Effect.void
-        ).pipe(
-          Effect.andThen(
-            increment(providerRuntimeEventsTotal, {
-              provider: canonicalEvent.provider,
-              eventType: canonicalEvent.type,
-            }),
-          ),
-          Effect.andThen(publishRuntimeEvent(canonicalEvent)),
-        ),
+              );
+            if (!cursorPersisted) {
+              eventToPublish = {
+                type: "runtime.error",
+                eventId: canonicalEvent.eventId,
+                provider: canonicalEvent.provider,
+                providerInstanceId: source.instanceId,
+                threadId: canonicalEvent.threadId,
+                createdAt: canonicalEvent.createdAt,
+                payload: {
+                  message:
+                    "Failed to persist provider resume state. Restarting this thread may resume stale provider history.",
+                  class: "unknown",
+                },
+              };
+            }
+          }
+          yield* increment(providerRuntimeEventsTotal, {
+            provider: eventToPublish.provider,
+            eventType: eventToPublish.type,
+          });
+          yield* publishRuntimeEvent(eventToPublish);
+        }),
       ),
     );
 
