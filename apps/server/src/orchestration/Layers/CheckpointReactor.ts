@@ -762,10 +762,28 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    if (
+      event.payload.turnCount > 0 &&
+      !(yield* checkpointStore.hasCheckpointRef({
+        cwd: sessionRuntime.value.cwd,
+        checkpointRef: targetCheckpointRef,
+      }))
+    ) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: event.payload.turnCount,
+        detail: `Filesystem checkpoint is unavailable for turn ${event.payload.turnCount}.`,
+        createdAt: now,
+      }).pipe(Effect.catch(() => Effect.void));
+      return;
+    }
+
     const rollbackTarget = yield* providerService.prepareConversationRollback({
       threadId: sessionRuntime.value.threadId,
       ...(targetCheckpoint === undefined ? {} : { retainedThroughTurnId: targetCheckpoint.turnId }),
     });
+
+    yield* providerService.rollbackConversation(rollbackTarget);
 
     const restored = yield* checkpointStore.restoreCheckpoint({
       cwd: sessionRuntime.value.cwd,
@@ -785,8 +803,6 @@ const make = Effect.gen(function* () {
     // Refresh the workspace entry index so the @-mention file picker
     // reflects the reverted filesystem state.
     yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
-
-    yield* providerService.rollbackConversation(rollbackTarget);
 
     const staleCheckpointRefs: Array<CheckpointRef> = [];
     for (const checkpoint of orderedCheckpoints) {

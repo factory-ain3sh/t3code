@@ -198,8 +198,10 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     (
       threadId: ThreadId,
       _numTurns: number,
-    ): Effect.Effect<{ threadId: ThreadId; turns: readonly [] }, ProviderAdapterError> =>
-      Effect.succeed({ threadId, turns: [] }),
+    ): Effect.Effect<
+      { threadId: ThreadId; turns: readonly []; resumeCursor?: unknown },
+      ProviderAdapterError
+    > => Effect.succeed({ threadId, turns: [] }),
   );
 
   const uploadFeedback = vi.fn(
@@ -1106,6 +1108,76 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
       assert.equal(error._tag, "ProviderValidationError");
       assert.equal(routing.codex.rollbackThread.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("persists the resume cursor returned by a provider rollback", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(asThreadId("thread-rollback-cursor"), {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-rollback-cursor"),
+        runtimeMode: "full-access",
+      });
+      const resumeCursor = { threadId: "provider-thread-rewound", turnIds: [] };
+      routing.codex.rollbackThread.mockReturnValueOnce(
+        Effect.succeed({
+          threadId: session.threadId,
+          turns: [],
+          resumeCursor,
+        }),
+      );
+
+      yield* provider.rollbackConversation({
+        threadId: session.threadId,
+        turnIds: [],
+        anchorTurnId: asTurnId("turn-1"),
+      });
+
+      const binding = yield* directory.getBinding(session.threadId);
+      assert.deepEqual(Option.getOrUndefined(binding)?.resumeCursor, resumeCursor);
+    }),
+  );
+
+  it.effect("completes rollback when persisting its resume cursor fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const session = yield* provider.startSession(asThreadId("thread-rollback-cursor-failure"), {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId: asThreadId("thread-rollback-cursor-failure"),
+        runtimeMode: "full-access",
+      });
+      const resumeCursor = { threadId: "provider-thread-rewound", turnIds: [] };
+      routing.codex.rollbackThread.mockReturnValueOnce(
+        Effect.succeed({
+          threadId: session.threadId,
+          turns: [],
+          resumeCursor,
+        }),
+      );
+      routing.codex.rollbackThread.mockClear();
+      const upsertSpy = vi.spyOn(directory, "upsert").mockReturnValue(
+        Effect.fail(
+          new ProviderSessionDirectoryPersistenceError({
+            operation: "ProviderSessionDirectory.upsert",
+            detail: "Injected rollback cursor write failure.",
+          }),
+        ),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => upsertSpy.mockRestore()));
+
+      const snapshot = yield* provider.rollbackConversation({
+        threadId: session.threadId,
+        turnIds: [],
+        anchorTurnId: asTurnId("turn-1"),
+      });
+
+      assert.deepEqual(snapshot.resumeCursor, resumeCursor);
+      assert.equal(routing.codex.rollbackThread.mock.calls.length, 1);
     }),
   );
 
@@ -2016,16 +2088,20 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       yield* Effect.addFinalizer(() => Effect.sync(() => upsertSpy.mockRestore()));
 
       const eventsRef = yield* Ref.make<Array<ProviderRuntimeEvent>>([]);
-      const persistenceFailureObserved = yield* Deferred.make<void>();
+      const completionObserved = yield* Deferred.make<void>();
+      const persistenceWarningObserved = yield* Deferred.make<void>();
       const followUpObserved = yield* Deferred.make<void>();
       const consumer = yield* Stream.runForEach(provider.streamEvents, (event) =>
         Ref.update(eventsRef, (current) => [...current, event]).pipe(
           Effect.andThen(
             event.eventId === asEventId("evt-cursor-write-failure")
-              ? Deferred.succeed(persistenceFailureObserved, undefined)
-              : event.eventId === asEventId("evt-after-cursor-write-failure")
-                ? Deferred.succeed(followUpObserved, undefined)
-                : Effect.void,
+              ? Deferred.succeed(completionObserved, undefined)
+              : event.eventId ===
+                  asEventId("evt-cursor-write-failure:resume-cursor-persistence-failed")
+                ? Deferred.succeed(persistenceWarningObserved, undefined)
+                : event.eventId === asEventId("evt-after-cursor-write-failure")
+                  ? Deferred.succeed(followUpObserved, undefined)
+                  : Effect.void,
           ),
         ),
       ).pipe(Effect.forkChild({ startImmediately: true }));
@@ -2043,7 +2119,8 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           resumeCursor: { threadId: "provider-thread-after-fork" },
         },
       });
-      yield* Deferred.await(persistenceFailureObserved);
+      yield* Deferred.await(completionObserved);
+      yield* Deferred.await(persistenceWarningObserved);
 
       upsertSpy.mockRestore();
       fanout.codex.emit({
@@ -2063,7 +2140,11 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
       assert.deepEqual(
         events.map((event) => [event.eventId, event.type]),
         [
-          [asEventId("evt-cursor-write-failure"), "runtime.error"],
+          [asEventId("evt-cursor-write-failure"), "turn.completed"],
+          [
+            asEventId("evt-cursor-write-failure:resume-cursor-persistence-failed"),
+            "runtime.warning",
+          ],
           [asEventId("evt-after-cursor-write-failure"), "tool.completed"],
         ],
       );

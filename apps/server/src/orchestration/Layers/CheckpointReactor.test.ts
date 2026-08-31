@@ -1035,6 +1035,7 @@ describe("CheckpointReactor", () => {
     const harness = await createHarness();
     const createdAt = "2026-01-01T00:00:00.000Z";
     let filesystemAtValidation: string | undefined;
+    let filesystemAtRollback: string | undefined;
     harness.provider.prepareConversationRollback.mockImplementation((input) =>
       Effect.sync(() => {
         filesystemAtValidation = NodeFS.readFileSync(
@@ -1045,6 +1046,15 @@ describe("CheckpointReactor", () => {
           threadId: input.threadId,
           turnIds: [asTurnId("turn-1")],
           anchorTurnId: asTurnId("turn-2"),
+        };
+      }),
+    );
+    harness.provider.rollbackConversation.mockImplementation((input) =>
+      Effect.sync(() => {
+        filesystemAtRollback = NodeFS.readFileSync(NodePath.join(harness.cwd, "README.md"), "utf8");
+        return {
+          threadId: input.threadId,
+          turns: input.turnIds.map((id) => ({ id, items: [] })),
         };
       }),
     );
@@ -1121,6 +1131,7 @@ describe("CheckpointReactor", () => {
       retainedThroughTurnId: asTurnId("turn-1"),
     });
     expect(filesystemAtValidation).toBe("v3\n");
+    expect(filesystemAtRollback).toBe("v3\n");
     expect(harness.provider.rollbackConversation).toHaveBeenCalledWith({
       threadId: ThreadId.make("thread-1"),
       turnIds: [asTurnId("turn-1")],

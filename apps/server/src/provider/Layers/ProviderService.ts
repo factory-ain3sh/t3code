@@ -10,6 +10,7 @@
  * @module ProviderServiceLive
  */
 import {
+  EventId,
   ModelSelection,
   ThreadId,
   TurnId,
@@ -288,14 +289,32 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
 
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
-    Effect.succeed(event).pipe(
-      Effect.tap((canonicalEvent) =>
-        canonicalEventLogger
-          ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
-          : Effect.void,
+    increment(providerRuntimeEventsTotal, {
+      provider: event.provider,
+      eventType: event.type,
+    }).pipe(
+      Effect.andThen(
+        canonicalEventLogger ? canonicalEventLogger.write(event, event.threadId) : Effect.void,
       ),
-      Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
+      Effect.andThen(PubSub.publish(runtimeEventPubSub, event)),
       Effect.asVoid,
+    );
+
+  const persistResumeCursor = (input: {
+    readonly threadId: ThreadId;
+    readonly provider: ProviderDriverKind;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly resumeCursor: unknown;
+  }) =>
+    directory.upsert(input).pipe(
+      Effect.as(true),
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to persist provider resume cursor.", {
+          threadId: input.threadId,
+          provider: input.provider,
+          cause: error,
+        }).pipe(Effect.as(false)),
+      ),
     );
 
   const requireBindingInstanceId = (
@@ -351,49 +370,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
         Effect.gen(function* () {
-          let eventToPublish = canonicalEvent;
+          let persistenceWarning: ProviderRuntimeEvent | undefined;
           if (
             canonicalEvent.type === "turn.completed" &&
             canonicalEvent.payload?.resumeCursor !== undefined
           ) {
-            const cursorPersisted = yield* directory
-              .upsert({
-                threadId: canonicalEvent.threadId,
-                provider: canonicalEvent.provider,
-                providerInstanceId: source.instanceId,
-                resumeCursor: canonicalEvent.payload.resumeCursor,
-              })
-              .pipe(
-                Effect.as(true),
-                Effect.catch((error) =>
-                  Effect.logWarning("Failed to persist provider resume cursor.", {
-                    threadId: canonicalEvent.threadId,
-                    provider: canonicalEvent.provider,
-                    cause: error,
-                  }).pipe(Effect.as(false)),
-                ),
-              );
+            const cursorPersisted = yield* persistResumeCursor({
+              threadId: canonicalEvent.threadId,
+              provider: canonicalEvent.provider,
+              providerInstanceId: source.instanceId,
+              resumeCursor: canonicalEvent.payload.resumeCursor,
+            });
             if (!cursorPersisted) {
-              eventToPublish = {
-                type: "runtime.error",
-                eventId: canonicalEvent.eventId,
+              persistenceWarning = {
+                type: "runtime.warning",
+                eventId: EventId.make(`${canonicalEvent.eventId}:resume-cursor-persistence-failed`),
                 provider: canonicalEvent.provider,
                 providerInstanceId: source.instanceId,
                 threadId: canonicalEvent.threadId,
+                ...(canonicalEvent.turnId !== undefined ? { turnId: canonicalEvent.turnId } : {}),
                 createdAt: canonicalEvent.createdAt,
                 payload: {
                   message:
                     "Failed to persist provider resume state. Restarting this thread may resume stale provider history.",
-                  class: "unknown",
                 },
               };
             }
           }
-          yield* increment(providerRuntimeEventsTotal, {
-            provider: eventToPublish.provider,
-            eventType: eventToPublish.type,
-          });
-          yield* publishRuntimeEvent(eventToPublish);
+          yield* publishRuntimeEvent(canonicalEvent);
+          if (persistenceWarning !== undefined) {
+            yield* publishRuntimeEvent(persistenceWarning);
+          }
         }),
       ),
     );
@@ -1201,6 +1208,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const numTurns = current.turns.length - input.turnIds.length;
       const snapshot =
         numTurns === 0 ? current : yield* routed.adapter.rollbackThread(routed.threadId, numTurns);
+      if (numTurns > 0 && snapshot.resumeCursor !== undefined) {
+        yield* persistResumeCursor({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          resumeCursor: snapshot.resumeCursor,
+        });
+      }
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         targetTurnCount: input.turnIds.length,
